@@ -1,0 +1,14 @@
+[Unit]
+Description=dyn-sandbox infrastructure: kernel module + DNS proxy
+After=network.target
+
+[Service]
+Type=notify
+ExecStartPre=/sbin/modprobe dyn_sandbox
+ExecStart=/usr/bin/dyn-sandbox-dns
+ExecStopPost=-/sbin/rmmod dyn_sandbox
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
