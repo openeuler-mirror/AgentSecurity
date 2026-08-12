@@ -355,7 +355,11 @@ static struct sandbox_net_env *net_alloc_env(struct sandbox_net_create *args,
 	       SANDBOX_DOMAIN_MAX_LEN * args->ndomains);
 	memcpy(env->cidrs, args->cidrs,
 	       sizeof(struct sandbox_cidr) * args->ncidrs);
-	memcpy(env->veth_host, args->veth_host, SANDBOX_IFNAME_SZ);
+
+	/* veth 名由内核基于唯一的 env->id 生成（而非用户态传入），保证接口名
+	 * 合法且不含 shell 元字符——这些名字会拼进 run_cmd 的 bash 命令 */
+	snprintf(env->veth_host, sizeof(env->veth_host), "vp-h-%d", env->id);
+	snprintf(env->veth_child, sizeof(env->veth_child), "vp-c-%d", env->id);
 
 	snprintf(env->ns_path, sizeof(env->ns_path), "%s/%s%d",
 		 SANDBOX_NS_DIR, SANDBOX_PREFIX, env->id);
@@ -378,7 +382,7 @@ static int net_setup_veth(struct sandbox_net_env *env,
 	int ret;
 
 	/* Pre-cleanup any stale state */
-	run_cmd("ip link delete %s 2>/dev/null; true", args->veth_host);
+	run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
 	run_cmd_ns(env->ns_path, "nft delete table netpolicy 2>/dev/null; true");
 	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
 		env->ns_path, env->ns_path);
@@ -405,10 +409,10 @@ static int net_setup_veth(struct sandbox_net_env *env,
 		"ip link set %s up",
 		SANDBOX_NS_DIR, env->ns_path,
 		task_tgid_nr(current), env->ns_path,
-		args->veth_host, args->veth_child,
-		args->veth_child, ns_name,
-		&hip, args->prefix, args->veth_host,
-		args->veth_host);
+		env->veth_host, env->veth_child,
+		env->veth_child, ns_name,
+		&hip, args->prefix, env->veth_host,
+		env->veth_host);
 	if (ret) {
 		pr_err("dyn-sandbox: persist+veth setup failed: %d\n", ret);
 		return ret;
@@ -422,58 +426,108 @@ static int net_setup_veth(struct sandbox_net_env *env,
  * @env: network env whose ns_path receives the ruleset
  */
 
+/*
+ * nft_append - Append a formatted segment to the nft ruleset script
+ * @script: PAGE_SIZE ruleset buffer
+ * @slen: in/out accumulated would-be length
+ * @fmt: kernel printf format (supports %pI4 etc.)
+ *
+ * snprintf()/vsnprintf() return the number of bytes they would have written
+ * even when the size argument truncates them, so the accumulated @slen can
+ * grow past PAGE_SIZE.  Re-feeding that as "PAGE_SIZE - *slen" makes a
+ * negative count which, promoted to size_t, becomes huge and lets the next
+ * write run past @script.  We therefore (1) refuse to append once *slen has
+ * reached PAGE_SIZE, and (2) report -ENOSPC if the segment was truncated, so
+ * a caller with a 0 return always has a complete, in-bounds script.
+ *
+ * Return: 0 on success, -EINVAL on format error, -ENOSPC if the ruleset
+ *         would exceed PAGE_SIZE
+ */
+static int nft_append(char *script, int *slen, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (*slen < 0 || *slen >= PAGE_SIZE)
+		return -ENOSPC;
+
+	va_start(ap, fmt);
+	n = vsnprintf(script + *slen, PAGE_SIZE - *slen, fmt, ap);
+	va_end(ap);
+
+	if (n < 0)
+		return -EINVAL;
+	*slen += n;
+	if (*slen >= PAGE_SIZE)
+		return -ENOSPC;
+	return 0;
+}
+
 static int net_deploy_nftables(struct sandbox_net_env *env)
 {
 	char *script;
-	int slen, ret;
+	int slen = 0, ret;
 
 	script = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!script)
 		return -ENOMEM;
 
-	slen = snprintf(script, PAGE_SIZE,
+	ret = nft_append(script, &slen,
 		"nsenter --net=%s -- nft -f - <<'RULESET'\n"
 		"add table ip netpolicy\n"
 		"add set netpolicy allowed { type ipv4_addr; flags interval; }\n",
 		env->ns_path);
+	if (ret)
+		goto too_large;
 
 	for (int i = 0; i < env->ncidrs; i++) {
 		__be32 addr = env->cidrs[i].addr & env->cidrs[i].mask;
 		int pfx = mask_to_prefix(env->cidrs[i].mask);
-		slen += snprintf(script + slen, PAGE_SIZE - slen,
+		ret = nft_append(script, &slen,
 			"add element netpolicy allowed { %pI4/%d }\n", &addr, pfx);
+		if (ret)
+			goto too_large;
 	}
 
-	slen += snprintf(script + slen, PAGE_SIZE - slen,
+	ret = nft_append(script, &slen,
 		"add element netpolicy allowed { %pI4/32 }\n", &env->child_ip);
+	if (ret)
+		goto too_large;
 
-	slen += snprintf(script + slen, PAGE_SIZE - slen,
+	ret = nft_append(script, &slen,
 		"add chain netpolicy output { type filter hook output priority filter; }\n"
 		"add rule netpolicy output ip daddr @allowed accept\n");
+	if (ret)
+		goto too_large;
 
-	if (dns_proxy_port) {
-		slen += snprintf(script + slen, PAGE_SIZE - slen,
+	/* 快照一次，避免 check 与 dnat 规则读到不同的 port（daemon 重启换端口） */
+	__be16 dns_port = READ_ONCE(dns_proxy_port);
+	if (dns_port) {
+		ret = nft_append(script, &slen,
 			"add chain netpolicy dns_nat { type nat hook output priority -100; policy accept; }\n"
 			"add rule netpolicy dns_nat udp dport 53 dnat to %pI4:%d\n"
 			"add rule netpolicy output ip daddr %pI4 accept\n",
-			&env->host_ip, be16_to_cpu(dns_proxy_port), &env->host_ip);
+			&env->host_ip, be16_to_cpu(dns_port), &env->host_ip);
+		if (ret)
+			goto too_large;
 	}
 
-	slen += snprintf(script + slen, PAGE_SIZE - slen,
+	ret = nft_append(script, &slen,
 		"add rule netpolicy output reject\n"
 		"RULESET\n");
-
-	if (slen >= PAGE_SIZE) {
-		pr_err("dyn-sandbox: nft ruleset too large\n");
-		kfree(script);
-		return -ENOSPC;
-	}
+	if (ret)
+		goto too_large;
 
 	ret = run_cmd("%s", script);
 	kfree(script);
 	if (ret)
 		pr_err("dyn-sandbox: nftables setup failed: %d\n", ret);
 	return ret;
+
+too_large:
+	pr_err("dyn-sandbox: nft ruleset too large\n");
+	kfree(script);
+	return -ENOSPC;
 }
 
 /**
@@ -531,6 +585,9 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	pr_info("dyn-sandbox: CREATE env=%d host=%pI4 child=%pI4\n",
 		env->id, &args->host_ip, &args->child_ip);
 	args->env_id = env->id;
+	/* 回写内核生成的 veth 名——用户态子进程需用 veth_child 配 IP */
+	strscpy(args->veth_host, env->veth_host, sizeof(args->veth_host));
+	strscpy(args->veth_child, env->veth_child, sizeof(args->veth_child));
 	if (args->ndomains > 0 && !dns_proxy_port) {
 		pr_err("dyn-sandbox: dyn-sandbox-dns not registered, but domains configured\n");
 		ret = -EAGAIN;
@@ -556,7 +613,7 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	return 0;
 
 err_del_veth:
-	run_cmd("ip link delete %s 2>/dev/null; true", args->veth_host);
+	run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
 	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
 		env->ns_path, env->ns_path);
 err_free_env:

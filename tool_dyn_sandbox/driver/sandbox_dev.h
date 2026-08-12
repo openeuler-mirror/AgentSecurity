@@ -70,9 +70,6 @@ struct sandbox_net_create {
 	__u32 flags;
 #define SANDBOX_NET_F_NO_VETH  1   /* isolated mode, no network */
 
-	char  veth_host[SANDBOX_IFNAME_SZ];
-	char  veth_child[SANDBOX_IFNAME_SZ];
-
 	char  domains[SANDBOX_MAX_DOMAINS][SANDBOX_DOMAIN_MAX_LEN];
 	int   ndomains;
 	struct sandbox_cidr cidrs[SANDBOX_MAX_CIDRS];
@@ -80,6 +77,8 @@ struct sandbox_net_create {
 
 	/* output fields */
 	int   env_id;
+	char  veth_host[SANDBOX_IFNAME_SZ];   /* host-side veth name, kernel-generated */
+	char  veth_child[SANDBOX_IFNAME_SZ];  /* child-side veth name, kernel-generated */
 	__u32 host_ip;       /* host-side veth IP */
 	__u32 child_ip;      /* child-side veth IP */
 	__u32 gateway;

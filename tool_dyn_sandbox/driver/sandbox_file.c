@@ -773,7 +773,8 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
  * Copies the blocked filename and resolved absolute path from the instance
  * to userspace after a kretprobe handler has SIGSTOP'd the child.
  *
- * Return: 0 on success, -EBADFD if inst is NULL, -EFAULT on copy_to_user failure
+ * Return: 0 on success, -EBADFD if inst is NULL, -ENOENT if blocked_list is
+ *         empty (spurious wake / already consumed), -EFAULT on copy_to_user failure
  */
 int sandbox_file_handle_get_blocked(struct sandbox_instance *inst, void __user *uarg)
 {
@@ -795,6 +796,9 @@ int sandbox_file_handle_get_blocked(struct sandbox_instance *inst, void __user *
 			sizeof(info.resolved) - 1);
 	}
 	spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
+
+	if (!entry)
+		return -ENOENT;
 
 	if (copy_to_user(uarg, &info, sizeof(info)))
 		return -EFAULT;

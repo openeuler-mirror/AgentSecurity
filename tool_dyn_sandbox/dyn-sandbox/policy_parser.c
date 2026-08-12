@@ -215,7 +215,8 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 {
 	FILE *fh;
 	yaml_parser_t parser;
-	yaml_event_t event;
+	yaml_event_t event = {0};   /* 零初始化: 未解析/已 delete 的 event 在 out: 处
+				      再调 yaml_event_delete 是幂等 no-op */
 
 	int saved_dump = cfg->dump_config;
 	memset(cfg, 0, sizeof(*cfg));
@@ -374,6 +375,10 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 	ret = 0;
 
 out:
+	/* 循环内 goto out 时（handler 返回 -1、嵌套过深、mode 互斥）当前已解析
+	 * 的 event 尚未 delete, 在此统一释放; 对从未解析/已 delete 的 event
+	 * (type == YAML_NO_EVENT) 是幂等 no-op */
+	yaml_event_delete(&event);
 	yaml_parser_delete(&parser);
 	fclose(fh);
 	return ret;

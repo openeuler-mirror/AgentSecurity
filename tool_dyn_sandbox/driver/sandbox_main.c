@@ -222,12 +222,19 @@ static __poll_t sandbox_poll(struct file *filp, poll_table *wait)
 {
 	struct sandbox_instance *inst = filp->private_data;
 	__poll_t mask = 0;
+	unsigned long flags;
 	if (!inst)
 		return 0;
 
 	poll_wait(filp, &inst->blocked_wait, wait);
+
+	/* blocked_list 由 kretprobe(list_add_tail) / DECISION(list_del)
+	 * 在 blocked_lock 下并发修改，poll 必须同锁读，避免数据竞争 */
+	spin_lock_irqsave(&inst->state.blocked_lock, flags);
 	if (!list_empty(&inst->state.blocked_list))
 		mask |= EPOLLIN | EPOLLRDNORM;
+	spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
+
 	return mask;
 }
 

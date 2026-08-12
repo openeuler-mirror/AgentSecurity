@@ -457,7 +457,10 @@ static int setup_virtual_fs(struct sandbox_config *cfg)
 		fprintf(stderr, "dyn-sandbox: warning: mkdir /dev/pts: %s\n", strerror(errno));
 	if (mkdir("/dev/shm", 0755) < 0 && errno != EEXIST)
 		fprintf(stderr, "dyn-sandbox: warning: mkdir /dev/shm: %s\n", strerror(errno));
-	mount("tmpfs", "/dev/shm", "tmpfs", 0, NULL);
+	if (mount("tmpfs", "/dev/shm", "tmpfs", 0, NULL) < 0) {
+		fprintf(stderr, "mount /dev/shm: %s\n", strerror(errno));
+		return -1;
+	}
 
 	/* /tmp — 独立 tmpfs */
 	if (mkdir("/tmp", 0777) < 0 && errno != EEXIST) {
@@ -467,7 +470,10 @@ static int setup_virtual_fs(struct sandbox_config *cfg)
 	unsigned long tmpfs_sz = cfg->tmpfs_size_mb > 0 ? cfg->tmpfs_size_mb : 256;
 	char tmpfs_opt[64];
 	snprintf(tmpfs_opt, sizeof(tmpfs_opt), "mode=0777,size=%luM", tmpfs_sz);
-	mount("tmpfs", "/tmp", "tmpfs", 0, tmpfs_opt);
+	if (mount("tmpfs", "/tmp", "tmpfs", 0, tmpfs_opt) < 0) {
+		fprintf(stderr, "mount /tmp: %s\n", strerror(errno));
+		return -1;
+	}
 	return 0;
 }
 
@@ -961,7 +967,7 @@ static void child_setup_stdio(void)
 
 /* 阶段 2: 网络隔离 — veth pair + nftables
  * 仅白名单模式进入; isolate 无网络, --share-net 共享宿主网络 */
-static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
+static void child_setup_network(struct sandbox_config *cfg)
 {
 	if (cfg->network_mode != NET_MODE_WHITELIST)
 		return;
@@ -969,7 +975,6 @@ static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
 	struct sandbox_net_create req;
 	memset(&req, 0, sizeof(req));
 	req.flags = 0;
-	snprintf(req.veth_host, sizeof(req.veth_host), "vp-h-%d", (int)my_pid);
 	req.ndomains = cfg->ndomains;
 	for (int di = 0; di < cfg->ndomains; di++)
 		strncpy(req.domains[di], cfg->domains[di],
@@ -977,7 +982,6 @@ static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
 	req.ncidrs = cfg->ncidrs;
 	for (int ci = 0; ci < cfg->ncidrs; ci++)
 		req.cidrs[ci] = cfg->cidrs[ci];
-	snprintf(req.veth_child, sizeof(req.veth_child), "vp-c-%d", (int)my_pid);
 
 	if (ioctl(sandbox_fd, SANDBOX_NET_CREATE, &req) < 0)
 		CHILD_FAIL_EXIT(EXIT_NET_ERR, "SANDBOX_NET_CREATE: %s",
@@ -1074,10 +1078,10 @@ static void child_finalize(struct sandbox_config *cfg,
 }
 
 /* ------------------------------------------------------------------ */
-static void run_child(struct sandbox_config *cfg, pid_t my_pid)
+static void run_child(struct sandbox_config *cfg)
 {
 	child_setup_stdio();
-	child_setup_network(cfg, my_pid);
+	child_setup_network(cfg);
 
 	int landlock_fd;
 	struct sock_fprog seccomp_prog;
@@ -1127,9 +1131,9 @@ int main(int argc, char **argv)
 	 *   net   — 网络隔离 (默认完全空 netns, 有 --domain/--cidr 时才配置 veth)
 	 *   user  — 非 root 时自动创建 (parent 写 uid_map) */
 	/* 创建三路 pipe: parent 控制 child 的 stdio */
-	pipe2(child_stdin,  O_CLOEXEC);
-	pipe2(child_stdout, O_CLOEXEC);
-	pipe2(child_stderr, O_CLOEXEC);
+	(void)pipe2(child_stdin,  O_CLOEXEC);
+	(void)pipe2(child_stdout, O_CLOEXEC);
+	(void)pipe2(child_stderr, O_CLOEXEC);
 	int clone_flags = SIGCHLD | CLONE_NEWNS | CLONE_NEWPID |
 			  CLONE_NEWIPC | CLONE_NEWUTS;
 	/* isolate / whitelist 隔离网络; --share-net 复用宿主网络 */
@@ -1137,8 +1141,6 @@ int main(int argc, char **argv)
 		clone_flags |= CLONE_NEWNET;
 	if (getuid() != 0)
 		clone_flags |= CLONE_NEWUSER;
-
-	pid_t my_pid = getpid();
 
 	pid_t child_pid = raw_clone_wrapper(clone_flags);
 	if (child_pid < 0) {
@@ -1149,7 +1151,7 @@ int main(int argc, char **argv)
 	if (child_pid > 0)
 		run_parent(child_pid, &cfg);
 	else
-		run_child(&cfg, my_pid);
+		run_child(&cfg);
 
 	return EXIT_TOOL_FAIL; /* unreached */
 }

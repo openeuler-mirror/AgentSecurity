@@ -50,13 +50,27 @@ struct dns_header {
 #define MAX_PENDING 256
 #define PENDING_TIMEOUT 5 /* seconds */
 
+/*
+ * Monotonic clock — timeouts must never go backwards when NTP steps the
+ * wall clock (clock_gettime(CLOCK_REALTIME) would make `now - timestamp`
+ * negative, yielding a bogus huge poll() timeout).  All timestamps are
+ * monotonic milliseconds since an arbitrary epoch.
+ */
+static int64_t mono_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 struct pending_query {
 	uint16_t orig_id;                /* original client DNS ID, restored on reply */
 	uint16_t new_id;                 /* dyn-sandbox-dns assigned ID, matches upstream */
 	ldns_rr_type qtype;              /* query type (A, AAAA, ...) */
 	struct sockaddr_in client;       /* client address for reply + ioctl source */
 	char domain[256];                /* query domain, for logging + ioctl */
-	time_t timestamp;                /* when sent, for timeout cleanup */
+	int64_t timestamp_ms;            /* monotonic ms when sent, for timeout cleanup */
 	int in_use;                      /* slot occupancy flag */
 };
 
@@ -229,13 +243,13 @@ static void pending_free(int idx)
 }
 
 /* Clean up timed-out entries, returns count of entries freed */
-static int pending_cleanup(time_t now)
+static int pending_cleanup(int64_t now_ms)
 {
 	int count = 0;
 	for (int i = 0; i < MAX_PENDING; i++) {
 		if (!pending[i].in_use)
 			continue;
-		if (now - pending[i].timestamp > PENDING_TIMEOUT) {
+		if (now_ms - pending[i].timestamp_ms > PENDING_TIMEOUT * 1000) {
 			printf("[dyn-sandbox-dns] timeout: %s [id=%d] dropped\n",
 			       pending[i].domain, pending[i].new_id);
 			pending[i].in_use = 0;
@@ -248,17 +262,17 @@ static int pending_cleanup(time_t now)
 /* Calculate poll timeout (ms), -1 = wait indefinitely */
 static int calc_timeout(void)
 {
-	time_t now = time(NULL);
+	int64_t now_ms = mono_now_ms();
 	int min_remaining_ms = -1;
 
 	for (int i = 0; i < MAX_PENDING; i++) {
 		if (!pending[i].in_use)
 			continue;
-		int elapsed = now - pending[i].timestamp;
-		int remaining = PENDING_TIMEOUT - elapsed;
+		int64_t elapsed = now_ms - pending[i].timestamp_ms;
+		int64_t remaining = (int64_t)PENDING_TIMEOUT * 1000 - elapsed;
 		if (remaining <= 0)
 			return 0;
-		int remaining_ms = remaining * 1000;
+		int remaining_ms = (int)remaining;
 		if (min_remaining_ms == -1 || remaining_ms < min_remaining_ms)
 			min_remaining_ms = remaining_ms;
 	}
@@ -388,7 +402,7 @@ static void handle_new_query(void)
 	pending[idx].qtype = qtype;
 	pending[idx].client = client;
 	snprintf(pending[idx].domain, sizeof(pending[idx].domain), "%s", domain);
-	pending[idx].timestamp = time(NULL);
+	pending[idx].timestamp_ms = mono_now_ms();
 	pending[idx].in_use = 1;
 
 	/* Replace DNS ID and forward to upstream */
@@ -554,7 +568,7 @@ int main(int argc, char **argv)
 		if (fds[1].revents & POLLIN)
 			handle_upstream_reply();
 
-		pending_cleanup(time(NULL));
+		pending_cleanup(mono_now_ms());
 	}
 
 	close(upstream_fd);

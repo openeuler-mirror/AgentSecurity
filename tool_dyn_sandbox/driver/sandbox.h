@@ -120,6 +120,7 @@ struct sandbox_net_env {
 	int                  ncidrs;
 	char                 ns_path[128];
 	char                 veth_host[SANDBOX_IFNAME_SZ];
+	char                 veth_child[SANDBOX_IFNAME_SZ];
 	__be32               child_ip;
 	__be32               host_ip;
 };
