@@ -1,19 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox.h
  *
  * Kernel-side internal header for dyn_sandbox.ko
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+
  */
 #ifndef _SANDBOX_H
 #define _SANDBOX_H
@@ -23,6 +15,7 @@
 #include <linux/path.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/kref.h>
 
 #include "sandbox_dev.h"
 
@@ -79,6 +72,19 @@ enum op_type {
 	OP_FTRUNCATE = 6,
 };
 
+/* Owned object captured from an LSM hook in the child's context: the
+ * hook's arg0 is exactly the object Landlock denied on.  Snapshot without a
+ * reference at entry; the reference is taken in the hook ret handler only on
+ * -EACCES (atomic-safe), transferred via the per-task blocked_state, and
+ * released with the entry (path_put may sleep).  BLOCKED_CAP_FILE additionally
+ * carries a path ref on cap_path because do_dentry_open() zeroes f->f_path on
+ * denial (cleanup_all); every consumer reads cap_path instead. */
+enum blocked_cap_kind {
+	BLOCKED_CAP_NONE = 0,
+	BLOCKED_CAP_PATH,
+	BLOCKED_CAP_FILE,
+};
+
 /**
  * struct blocked_entry - One blocked file authorization request
  *
@@ -92,10 +98,13 @@ struct blocked_entry {
 	pid_t            pid;               /* PID of the blocked task */
 	char             blocked_file[SANDBOX_PATH_MAX];
 	char             blocked_resolved[SANDBOX_PATH_MAX];
-	struct path      blocked_path;
 	u16              request_access;
-	struct file     *blocked_file_ptr;   /* for hook_file_truncate */
-	enum op_type     type;              /* matches probe_data.type */
+	struct file     *blocked_file_ptr;   /* hook_file_truncate: owned file ref */
+	enum blocked_cap_kind cap_kind;      /* which owned object is present */
+	struct path      cap_path;           /* owned path; for BLOCKED_CAP_FILE, the file's f_path (see enum above) */
+	struct file     *cap_file;           /* owned file (open) */
+	u64              open_flags;         /* OP_OPEN only; O_CREAT picks parent dir as grant target */
+	enum op_type     type;               /* matches probe_data.type */
 };
 
 /**
@@ -112,6 +121,7 @@ struct sandbox_state {
  * struct sandbox_net_env - Network environment (one per net instance)
  */
 struct sandbox_net_env {
+	struct kref         ref;	 /* refcount: inst->net owns one; REPORT_DNS may hold transient */
 	int                  id;
 	bool                 used;
 	char                 domains[SANDBOX_MAX_DOMAINS][SANDBOX_DOMAIN_MAX_LEN];
@@ -131,6 +141,7 @@ struct sandbox_net_env {
 struct sandbox_instance {
 	struct list_head list_node;	 /* in inst_list (kprobe PID lookup) */
 	struct list_head net_node;	 /* in net_inst_list (REPORT_DNS by child_ip) */
+	struct kref      ref;		 /* refcount: sandbox_release owns one; kprobe handlers hold transient */
 	pid_t            registered_pid;
 	bool             in_inst_list;
 	bool             in_net_inst_list;
@@ -139,5 +150,14 @@ struct sandbox_instance {
 	const struct pid_namespace *sandbox_pid_ns;  /* set at SET_PID, for fork child lookup */
 	wait_queue_head_t blocked_wait;              /* poll wait queue for blocked event notification */
 };
+
+/* inst_release - kref release callback.  May run in atomic kprobe context, so
+ * only atomic-safe teardown here: sandbox_file_drain_blocks() then kfree(inst).
+ * Sleeping cleanup (net_destroy, SIGKILL) runs earlier in sandbox_release().
+ */
+void inst_release(struct kref *kref);
+
+/* Atomic-safe teardown of per-instance blocked lists.  Called from inst_release(). */
+void sandbox_file_drain_blocks(struct sandbox_instance *inst);
 
 #endif /* _SANDBOX_H */

@@ -1,19 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox_main.c
  *
  * Sandbox char device + init/exit
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+
  */
 
 #include <linux/module.h>
@@ -180,6 +172,7 @@ static int sandbox_open(struct inode *inode, struct file *filp)
 	if (!inst)
 		return -ENOMEM;
 
+	kref_init(&inst->ref); /* root reference owned by sandbox_release */
 	INIT_LIST_HEAD(&inst->net_node);
 	INIT_LIST_HEAD(&inst->state.blocked_list);
 	INIT_LIST_HEAD(&inst->state.blocked_flag_list);
@@ -192,14 +185,21 @@ static int sandbox_open(struct inode *inode, struct file *filp)
 }
 
 /**
- * sandbox_release - Teardown per-open instance on device close
- * @inode: inode of /dev/dyn-sandbox
- * @filp:  file pointer whose private_data holds the instance
- *
- * Cleans up file auth state (inst_list, blocked_path) and network env,
- * then frees the instance.
- *
- * Return: 0
+ * inst_release - kref release callback.  May run in atomic kprobe context
+ * (a handler can drop the last transient reference), so only atomic-safe
+ * teardown here: sandbox_file_drain_blocks() then kfree(inst).
+ */
+void inst_release(struct kref *kref)
+{
+	struct sandbox_instance *inst = container_of(kref, struct sandbox_instance, ref);
+
+	sandbox_file_drain_blocks(inst);
+	kfree(inst);
+}
+
+/**
+ * sandbox_release - Clean up file auth state + network env, then drop the
+ * instance's root reference (drain + kfree happen in inst_release()).
  */
 static int sandbox_release(struct inode *inode, struct file *filp)
 {
@@ -213,7 +213,7 @@ static int sandbox_release(struct inode *inode, struct file *filp)
 	if (inst->net)
 		net_destroy(inst);
 
-	kfree(inst);
+	kref_put(&inst->ref, inst_release);
 	filp->private_data = NULL;
 	return 0;
 }
@@ -228,8 +228,7 @@ static __poll_t sandbox_poll(struct file *filp, poll_table *wait)
 
 	poll_wait(filp, &inst->blocked_wait, wait);
 
-	/* blocked_list 由 kretprobe(list_add_tail) / DECISION(list_del)
-	 * 在 blocked_lock 下并发修改，poll 必须同锁读，避免数据竞争 */
+	/* blocked_list is mutated by kretprobe/DECISION concurrently; read under the same lock */
 	spin_lock_irqsave(&inst->state.blocked_lock, flags);
 	if (!list_empty(&inst->state.blocked_list))
 		mask |= EPOLLIN | EPOLLRDNORM;

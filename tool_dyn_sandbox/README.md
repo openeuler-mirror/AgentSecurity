@@ -108,3 +108,10 @@ make
 
 - [使用指南](docs/usage-guide.md) — CLI 参数参考、YAML 策略格式、场景示例
 - [默认沙箱策略](docs/default-landlock-permissions.md) — 根文件系统布局、Landlock 默认权限集
+
+## License
+
+- 内核模块（`driver/`）— [GPL-2.0-only](LICENSES/GPL-2.0-only.txt)
+- 用户态（`dyn-sandbox/`、`dyn-sandbox-dns/`）— [Mulan PSL v2](LICENSES/MulanPSL-2.0.txt)
+
+Copyright (c) 2026 Huawei Technologies Co., Ltd.

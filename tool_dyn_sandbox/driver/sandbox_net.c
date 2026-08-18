@@ -1,19 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox_net.c
  *
  * Network isolation - veth + netns + nftables
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -290,19 +281,30 @@ int net_init(void)
 static LIST_HEAD(net_inst_list);
 static DEFINE_SPINLOCK(net_inst_lock);
 
-static struct sandbox_instance *inst_find_by_child_ip(__be32 child_ip)
+/**
+ * env_find_by_child_ip - Look up a net env by child IP, taking a reference
+ * @child_ip: the instance's child-side veth IP
+ *
+ * Returns an env with its refcount incremented (caller must kref_put), or
+ * NULL.  The kref_get is done under net_inst_lock so the env cannot be
+ * freed by a concurrent net_destroy() between lookup and acquisition.
+ */
+static struct sandbox_net_env *env_find_by_child_ip(__be32 child_ip)
 {
 	struct sandbox_instance *inst;
+	struct sandbox_net_env *env = NULL;
 	unsigned long flags;
+
 	spin_lock_irqsave(&net_inst_lock, flags);
 	list_for_each_entry(inst, &net_inst_list, net_node) {
 		if (inst->net && inst->net->child_ip == child_ip) {
-			spin_unlock_irqrestore(&net_inst_lock, flags);
-			return inst;
+			env = inst->net;
+			kref_get(&env->ref);
+			break;
 		}
 	}
 	spin_unlock_irqrestore(&net_inst_lock, flags);
-	return NULL;
+	return env;
 }
 
 static bool domain_allowed(struct sandbox_net_env *env, const char *domain)
@@ -348,6 +350,7 @@ static struct sandbox_net_env *net_alloc_env(struct sandbox_net_create *args,
 	__set_bit(__id, env_id_bitmap);
 	spin_unlock(&env_id_lock);
 	env->id = __id;
+	kref_init(&env->ref);	 /* inst->net owns the initial reference */
 
 	env->ndomains = args->ndomains;
 	env->ncidrs = args->ncidrs;
@@ -356,8 +359,7 @@ static struct sandbox_net_env *net_alloc_env(struct sandbox_net_create *args,
 	memcpy(env->cidrs, args->cidrs,
 	       sizeof(struct sandbox_cidr) * args->ncidrs);
 
-	/* veth 名由内核基于唯一的 env->id 生成（而非用户态传入），保证接口名
-	 * 合法且不含 shell 元字符——这些名字会拼进 run_cmd 的 bash 命令 */
+	/* veth names are kernel-generated, keeping user input out of run_cmd's shell */
 	snprintf(env->veth_host, sizeof(env->veth_host), "vp-h-%d", env->id);
 	snprintf(env->veth_child, sizeof(env->veth_child), "vp-c-%d", env->id);
 
@@ -366,6 +368,39 @@ static struct sandbox_net_env *net_alloc_env(struct sandbox_net_create *args,
 
 	inst->net = env;
 	return env;
+}
+
+/**
+ * net_env_release - kref release callback for sandbox_net_env
+ * @kref: the embedded kref of the env being released
+ *
+ * Tears down all env resources (nftables table, netns mount, veth, env_id)
+ * and kfree's the env.  Runs when the last reference is dropped — i.e. only
+ * after every net_report_dns() that found this env has finished — so no
+ * concurrent nft mutation or ns_path use can race with the teardown.  In
+ * particular the env_id is only freed here: a stale in-flight report cannot
+ * write into a reused ns_path of a new sandbox that took over the same id.
+ *
+ * This callback SLEEPS (run_cmd* -> call_usermodehelper).  Unlike inst/st,
+ * env is only ever referenced from ioctl / release paths (NET_CREATE,
+ * NET_REPORT_DNS, net_destroy), all process context, so the last kref_put
+ * can never land in an atomic context.  Constraint: env must never be
+ * referenced from a kprobe/atomic context.
+ */
+static void net_env_release(struct kref *kref)
+{
+	struct sandbox_net_env *env = container_of(kref, struct sandbox_net_env, ref);
+
+	if (env->veth_host[0])
+		run_cmd_ns(env->ns_path, "nft delete table netpolicy 2>/dev/null; true");
+	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
+		env->ns_path, env->ns_path);
+	if (env->veth_host[0])
+		run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
+	spin_lock(&env_id_lock);
+	__clear_bit(env->id, env_id_bitmap);
+	spin_unlock(&env_id_lock);
+	kfree(env);
 }
 
 /**
@@ -422,23 +457,14 @@ static int net_setup_veth(struct sandbox_net_env *env,
 }
 
 /**
- * net_deploy_nftables - Deploy the nftables ruleset into the child netns
- * @env: network env whose ns_path receives the ruleset
- */
-
-/*
  * nft_append - Append a formatted segment to the nft ruleset script
- * @script: PAGE_SIZE ruleset buffer
- * @slen: in/out accumulated would-be length
- * @fmt: kernel printf format (supports %pI4 etc.)
+ * @script: ruleset buffer (PAGE_SIZE)
+ * @slen: in/out accumulated length
+ * @fmt: kernel printf format (e.g. %pI4)
  *
- * snprintf()/vsnprintf() return the number of bytes they would have written
- * even when the size argument truncates them, so the accumulated @slen can
- * grow past PAGE_SIZE.  Re-feeding that as "PAGE_SIZE - *slen" makes a
- * negative count which, promoted to size_t, becomes huge and lets the next
- * write run past @script.  We therefore (1) refuse to append once *slen has
- * reached PAGE_SIZE, and (2) report -ENOSPC if the segment was truncated, so
- * a caller with a 0 return always has a complete, in-bounds script.
+ * vsnprintf() reports the would-be length even when truncated, so @slen can
+ * exceed PAGE_SIZE; re-feeding "PAGE_SIZE - *slen" would then underflow to a
+ * huge size_t.  Bail out once full; a 0 return always means complete/in-bounds.
  *
  * Return: 0 on success, -EINVAL on format error, -ENOSPC if the ruleset
  *         would exceed PAGE_SIZE
@@ -462,6 +488,11 @@ static int nft_append(char *script, int *slen, const char *fmt, ...)
 		return -ENOSPC;
 	return 0;
 }
+
+/**
+ * net_deploy_nftables - Deploy the nftables ruleset into the child netns
+ * @env: network env whose ns_path receives the ruleset
+ */
 
 static int net_deploy_nftables(struct sandbox_net_env *env)
 {
@@ -500,7 +531,7 @@ static int net_deploy_nftables(struct sandbox_net_env *env)
 	if (ret)
 		goto too_large;
 
-	/* 快照一次，避免 check 与 dnat 规则读到不同的 port（daemon 重启换端口） */
+	/* Snapshot the port so the check and the dnat see one value (the daemon may restart and change it) */
 	__be16 dns_port = READ_ONCE(dns_proxy_port);
 	if (dns_port) {
 		ret = nft_append(script, &slen,
@@ -579,19 +610,19 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	/* Phase 4: deploy nftables ruleset in child netns */
 	ret = net_deploy_nftables(env);
 	if (ret)
-		goto err_del_veth;
+		goto err_free_env;
 
 	/* Phase 5: writeback results to userspace */
 	pr_info("dyn-sandbox: CREATE env=%d host=%pI4 child=%pI4\n",
 		env->id, &args->host_ip, &args->child_ip);
 	args->env_id = env->id;
-	/* 回写内核生成的 veth 名——用户态子进程需用 veth_child 配 IP */
+	/* Write back the kernel-generated veth names; the child needs veth_child to configure its IP */
 	strscpy(args->veth_host, env->veth_host, sizeof(args->veth_host));
 	strscpy(args->veth_child, env->veth_child, sizeof(args->veth_child));
 	if (args->ndomains > 0 && !dns_proxy_port) {
 		pr_err("dyn-sandbox: dyn-sandbox-dns not registered, but domains configured\n");
 		ret = -EAGAIN;
-		goto err_del_veth;
+		goto err_free_env;
 	}
 	args->dns_port = dns_proxy_port ?
 			 be16_to_cpu(dns_proxy_port) : 53;
@@ -612,18 +643,11 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	kfree(args);
 	return 0;
 
-err_del_veth:
-	run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
-	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
-		env->ns_path, env->ns_path);
 err_free_env:
-	{
-		int __id = env->id;
-		spin_lock(&env_id_lock);
-		__clear_bit(__id, env_id_bitmap);
-		spin_unlock(&env_id_lock);
-	}
-	kfree(env);
+	/* env was never published to net_inst_list (or setup failed partway), so
+	 * this kref_put is the last reference and net_env_release() tears down
+	 * any partially-created resources (commands are idempotent) and frees env. */
+	kref_put(&env->ref, net_env_release);
 	inst->net = NULL;
 	kfree(args);
 	return ret;
@@ -650,18 +674,16 @@ int net_report_dns(struct sandbox_dns_report __user *uarg)
 	if (report.domain[0] == '\0')
 		return -EINVAL;
 
-	{
-		struct sandbox_instance *inst = inst_find_by_child_ip(report.src_ip);
-		if (!inst || !inst->net) {
-			pr_info("dyn-sandbox: no env found for src_ip %pI4\n", &report.src_ip);
-			return -ENOENT;
-		}
-		env = inst->net;
+	env = env_find_by_child_ip(report.src_ip);
+	if (!env) {
+		pr_info("dyn-sandbox: no env found for src_ip %pI4\n", &report.src_ip);
+		return -ENOENT;
 	}
 
 	if (!domain_allowed(env, report.domain)) {
 		pr_info("dyn-sandbox: domain '%s' not in whitelist for env=%d\n",
 			report.domain, env->id);
+		kref_put(&env->ref, net_env_release);
 		return -EACCES;
 	}
 
@@ -677,6 +699,7 @@ int net_report_dns(struct sandbox_dns_report __user *uarg)
 
 	pr_info("dyn-sandbox: env=%d domain='%s' added %d IP(s) to allowed set\n",
 		 env->id, report.domain, report.ip_count);
+	kref_put(&env->ref, net_env_release);
 	return 0;
 }
 
@@ -702,44 +725,42 @@ int net_set_dns_port(struct sandbox_dns_port __user *uarg)
 /**
  * net_destroy - Tear down the sandbox network environment
  * @inst: sandbox instance whose network env is freed
+ *
+ * Detaches the env from inst and net_inst_list, then drops the reference
+ * inst->net owned.  The actual resource teardown (nftables, netns mount,
+ * veth, env_id) is deferred to net_env_release(), which runs when the last
+ * reference is dropped — a concurrent net_report_dns() that already took a
+ * kref keeps env alive (and its nft/ns_path mutations unraced) until it is
+ * done.  With no report in flight, the kref_put below hits zero immediately
+ * and net_env_release() runs inline here, so teardown timing is unchanged.
  */
 
 int net_destroy(struct sandbox_instance *inst)
 {
 	struct sandbox_net_env *env;
+	unsigned long __flags;
 
 	if (!inst)
 		return -EINVAL;
 
-	env = inst->net;
-	if (!env)
-		return -ENOENT;
-
-	if (env->veth_host[0])
-		run_cmd_ns(env->ns_path, "nft delete table netpolicy 2>/dev/null; true");
-
-	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
-		env->ns_path, env->ns_path);
-
-	if (env->veth_host[0])
-		run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
-
-	spin_lock(&env_id_lock);
-	__clear_bit(env->id, env_id_bitmap);
-	spin_unlock(&env_id_lock);
-
-	kfree(env);
-	inst->net = NULL;
-
-	/* Remove from net_inst_list */
+	/* Remove from net_inst_list + detach from inst under lock first, so no
+	 * new env_find_by_child_ip() can find this env.  A concurrent
+	 * net_report_dns() that already took a kref keeps env alive until it
+	 * finishes; inst->net is NULLed here so nothing can reach env via inst. */
+	spin_lock_irqsave(&net_inst_lock, __flags);
 	if (inst->in_net_inst_list) {
-		unsigned long __flags;
-		spin_lock_irqsave(&net_inst_lock, __flags);
 		list_del(&inst->net_node);
-		spin_unlock_irqrestore(&net_inst_lock, __flags);
 		inst->in_net_inst_list = false;
 	}
 
+	env = inst->net;
+	inst->net = NULL;
+	spin_unlock_irqrestore(&net_inst_lock, __flags);
+
+	if (!env)
+		return -ENOENT;
+
+	kref_put(&env->ref, net_env_release);
 	return 0;
 }
 

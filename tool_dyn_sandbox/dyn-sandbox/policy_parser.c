@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * policy_parser.c — YAML policy file parser using libyaml
  */
@@ -215,8 +229,7 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 {
 	FILE *fh;
 	yaml_parser_t parser;
-	yaml_event_t event = {0};   /* 零初始化: 未解析/已 delete 的 event 在 out: 处
-				      再调 yaml_event_delete 是幂等 no-op */
+	yaml_event_t event = {0};   /* 零初始化，out: 处 yaml_event_delete 幂等 */
 
 	int saved_dump = cfg->dump_config;
 	memset(cfg, 0, sizeof(*cfg));
@@ -375,9 +388,7 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 	ret = 0;
 
 out:
-	/* 循环内 goto out 时（handler 返回 -1、嵌套过深、mode 互斥）当前已解析
-	 * 的 event 尚未 delete, 在此统一释放; 对从未解析/已 delete 的 event
-	 * (type == YAML_NO_EVENT) 是幂等 no-op */
+	/* 统一释放尚未 delete 的 event（幂等 no-op） */
 	yaml_event_delete(&event);
 	yaml_parser_delete(&parser);
 	fclose(fh);

@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * dyn-sandbox-dns.c — DNS proxy for sandbox network isolation
  *
@@ -50,12 +64,7 @@ struct dns_header {
 #define MAX_PENDING 256
 #define PENDING_TIMEOUT 5 /* seconds */
 
-/*
- * Monotonic clock — timeouts must never go backwards when NTP steps the
- * wall clock (clock_gettime(CLOCK_REALTIME) would make `now - timestamp`
- * negative, yielding a bogus huge poll() timeout).  All timestamps are
- * monotonic milliseconds since an arbitrary epoch.
- */
+/* Monotonic ms — NTP wall-clock steps must not rewind timeouts */
 static int64_t mono_now_ms(void)
 {
 	struct timespec ts;

@@ -1,19 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox_landlock.c
  *
  * Landlock runtime authorization helpers
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+
  */
 
 /*
@@ -133,7 +125,7 @@ int sandbox_landlock_allow_path(struct path *path, void *dom_ptr, u16 access_mas
 	struct inode *inode;
 	struct ll_object *obj;
 	struct ll_rule *rule;
-	bool owns_obj = false;   /* obj 由本次新建、尚未被 rule/blob 收养 */
+	bool owns_obj = false;   /* obj was created here, not yet adopted by a rule/blob */
 	bool locked   = false;
 	int ret = -ENOMEM;
 
@@ -183,12 +175,13 @@ int sandbox_landlock_allow_path(struct path *path, void *dom_ptr, u16 access_mas
 			inode->i_ino, access_mask);
 		rule = rule_alloc_init(obj, dom->num_layers, access_mask);
 		if (!rule)
-			goto err;      /* mutex 由 err 统一释放 */
-		/* 新建 obj 的 usage=1 即本 rule 的引用(与 create_rule 交接语义一致),
-		 * 仅当 obj 来自 inode blob(已被其他 rule 引用)时才为新 rule 取 +1。 */
+			goto err;      /* err releases the mutex */
+		/* A newly created obj has usage=1 as this rule's reference (same handoff as
+		 * create_rule); take +1 only when obj came from the inode blob (already
+		 * referenced by another rule). */
 		if (!owns_obj)
 			refcount_inc(&obj->usage);
-		owns_obj = false;  /* rule 已持有 obj 引用，不再由本函数负责 */
+		owns_obj = false;  /* rule holds the obj reference now, not this function */
 		rb_add(&rule->node, LL_RULESET_ROOT(dom), rb_rule_less);
 		dom->num_rules++;
 	}
@@ -269,7 +262,7 @@ bool sandbox_landlock_probe(void)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	/*
-	 * kernel >= 7.0 (B2): the global lsm_names symbol is gone; /sys/kernel/security/lsm
+	 * kernel >= 7.0: the global lsm_names symbol is gone; /sys/kernel/security/lsm
 	 * is now filled by security/inode.c:lsm_read() from lsm_idlist[MAX_LSM_COUNT] +
 	 * lsm_active_cnt (security/security.c). Match "landlock" by walking the active list.
 	 */
