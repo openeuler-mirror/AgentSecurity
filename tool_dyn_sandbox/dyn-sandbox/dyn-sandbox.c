@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * sandbox-run.c — AI Agent Tool 执行沙箱
  *
@@ -583,8 +597,9 @@ static int setup_filesystem(struct sandbox_config *cfg)
 
 /* ------------------------------------------------------------------ */
 /*  forward_fd — 从 src fd 读到 buf, 全部写入 dst fd                    */
+/*  返回 1 = 继续转发; 0 = src 已 EOF/出错或写失败, 调用方收敛该 fd      */
 /* ------------------------------------------------------------------ */
-static void forward_fd(int src, int dst)
+static int forward_fd(int src, int dst)
 {
 	char buf[4096];
 	ssize_t n = read(src, buf, sizeof(buf));
@@ -592,10 +607,12 @@ static void forward_fd(int src, int dst)
 		ssize_t off = 0;
 		while (off < n) {
 			ssize_t w = write(dst, buf + off, n - off);
-			if (w < 0) return;
+			if (w < 0) return 0;      /* 对端已关(EPIPE), 停止转发 */
 			off += w;
 		}
+		return 1;
 	}
+	return n < 0 && errno == EINTR;   /* EINTR 重试; 其余(含 EOF)收敛该 fd */
 }
 
 /* ------------------------------------------------------------------ */
@@ -637,6 +654,10 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 	close(child_stdin[0]);   child_stdin[0]  = -1;
 	close(child_stdout[1]);  child_stdout[1] = -1;
 	close(child_stderr[1]);  child_stderr[1] = -1;
+
+	/* 父进程忽略 SIGPIPE: 向已死子进程写 stdin 不再自杀, 由 forward_fd
+	 * 以 EPIPE 返回并收敛该 fd。须在 clone 之后设置, 避免传给 exec 的工具。 */
+	signal(SIGPIPE, SIG_IGN);
 
 	/* 先阻塞 SIGCHLD 再唤醒子进程: 若子进程在 signalfd 建好前退出,
 	 * 未阻塞的 SIGCHLD 会被默认处置直接丢弃, 父进程将永远感知不到
@@ -683,6 +704,9 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 		cleanup_exit(1);
 	}
 
+	/* stdin 转发状态: 初始为 fd0, EOF 后置 -1 摘出 poll 集合 (poll 忽略负 fd) */
+	int stdin_fd = 0;
+
 	/* ── poll 事件循环: I/O 转发 + 信号 ── */
 	while (1) {
 		struct pollfd fds[5];
@@ -704,7 +728,7 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 		fds[nfds].events = POLLIN;
 		nfds++;
 
-		fds[nfds].fd = 0;
+		fds[nfds].fd = stdin_fd;
 		fds[nfds].events = POLLIN;
 		nfds++;
 
@@ -717,12 +741,12 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 		}
 
 		/* ── 转发: child stdout → 父进程 stdout ── */
-		if (fds[1].revents & POLLIN)
-			forward_fd(child_stdout[0], 1);
+		if (fds[1].revents & (POLLIN | POLLHUP) && !forward_fd(child_stdout[0], 1))
+			child_stdout[0] = -1;   /* EOF/写失败: 摘 fd, 停止转发 */
 
 		/* ── 转发: child stderr → 父进程 stderr ── */
-		if (fds[2].revents & POLLIN)
-			forward_fd(child_stderr[0], 2);
+		if (fds[2].revents & (POLLIN | POLLHUP) && !forward_fd(child_stderr[0], 2))
+			child_stderr[0] = -1;
 
 		/* ── sandbox_fd: 内核 blocked 事件（任意子/孙进程） ── */
 		if (fds[3].revents & POLLIN) {
@@ -773,8 +797,18 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 				cleanup_exit(1);
 		}
 		/* ── 转发: 父进程 stdin → child stdin ── */
-		if (nfds > 4 && (fds[4].revents & POLLIN))
-			forward_fd(0, child_stdin[1]);
+		if (stdin_fd >= 0 && (fds[4].revents & (POLLIN | POLLHUP))) {
+			if (!forward_fd(stdin_fd, child_stdin[1])) {
+				/* stdin EOF/出错: 摘 fd 停止转发; 关 child_stdin[1] 写端
+				 * 传播 EOF 给子进程。fd0 自身保留, AUTH(decide_file_action)
+				 * 仍读 stdin, EOF 后默认 DENY。 */
+				stdin_fd = -1;
+				if (child_stdin[1] >= 0) {
+					close(child_stdin[1]);
+					child_stdin[1] = -1;
+				}
+			}
+		}
 	}
 	cleanup_exit(1);
 }

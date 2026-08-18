@@ -7,7 +7,9 @@ set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SANDBOX_RUN="/usr/bin/dyn-sandbox"
 KO_DIR="$DIR/../dist"
-TEST_BIN="seccomp_test"
+# seccomp_test lives in the (NFS) test dir, which the child's mount namespace
+# cannot see unless bind-mounted; the --mount /usr:ro covers /usr/bin instead.
+TEST_BIN="/usr/bin/seccomp_test"
 LOGFILE="test_seccomp.log"
 PASS=0; FAIL=0; SKIP=0
 
@@ -18,6 +20,9 @@ skip() { echo "SKIP: $1"; SKIP=$((SKIP+1)); }
 
 PW="111111"
 sudo_run() { echo "$PW" | sudo -S "$@"; }
+
+# Make the test binary visible to the sandbox child under --mount /usr:ro.
+sudo_run install -m 0755 "$DIR/seccomp_test" /usr/bin/seccomp_test 2>/dev/null
 
 : > "$LOGFILE"
 {
