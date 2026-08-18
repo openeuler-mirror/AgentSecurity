@@ -632,6 +632,14 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 	close(child_stdout[1]);  child_stdout[1] = -1;
 	close(child_stderr[1]);  child_stderr[1] = -1;
 
+	/* 先阻塞 SIGCHLD 再唤醒子进程: 若子进程在 signalfd 建好前退出,
+	 * 未阻塞的 SIGCHLD 会被默认处置直接丢弃, 父进程将永远感知不到
+	 * 子进程死亡。先阻塞, 死讯挂起在 pending, signalfd 建好即可读。 */
+	sigset_t sigmask;
+	sigemptyset(&sigmask);
+	sigaddset(&sigmask, SIGCHLD);
+	sigprocmask(SIG_BLOCK, &sigmask, NULL);
+
 	/* 非 root: parent 写 child 的 uid/gid map */
 	if (getuid() != 0)
 		write_uid_gid_map(child_pid);
@@ -663,10 +671,6 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 	fflush(stdout);
 
 	/* ── signalfd: 把 SIGCHLD 映射成 fd ── */
-	sigset_t sigmask;
-	sigemptyset(&sigmask);
-	sigaddset(&sigmask, SIGCHLD);
-	sigprocmask(SIG_BLOCK, &sigmask, NULL);
 	int sfd = signalfd(-1, &sigmask, SFD_CLOEXEC);
 	if (sfd < 0) {
 		perror("signalfd");
@@ -1056,7 +1060,8 @@ static void child_finalize(struct sandbox_config *cfg,
 	child_close_fds(landlock_fd);
 
 	if (cfg->workdir[0] && chdir(cfg->workdir) < 0)
-		fprintf(stderr, "chdir %s: %s\n", cfg->workdir, strerror(errno));
+		CHILD_FAIL_EXIT(EXIT_TOOL_FAIL, "invalid workdir %s: %s",
+				cfg->workdir, strerror(errno));
 
 	if (enable_sandbox(landlock_fd, seccomp_prog) < 0)
 		CHILD_FAIL_EXIT(EXIT_LANDLOCK_ERR, "sandbox enable failed");
