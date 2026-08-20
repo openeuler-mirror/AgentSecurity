@@ -268,6 +268,10 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 				fprintf(stderr, "--seccomp and --seccomp-syscalls are mutually exclusive\n");
 				return -1;
 			}
+			if (optarg[0] == '\0') {
+				fprintf(stderr, "--seccomp-syscalls cannot be empty\n");
+				return -1;
+			}
 			strncpy(cfg->seccomp_syscalls, optarg,
 				sizeof(cfg->seccomp_syscalls) - 1);
 			break;

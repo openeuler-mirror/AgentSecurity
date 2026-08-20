@@ -184,6 +184,7 @@ test_case "D13 mount 无效后缀" "$B_D --mount /x:invalid -D" "invalid mount o
 test_case "D14 mount-tmpfs 负数" "$B_D --mount-tmpfs /x:-1" "invalid tmpfs size" 1
 test_case "D15 domain 空字符串" "$B_D --domain '' -D" "empty domain" 1
 test_case "D16 seccomp 未知profile" "$B_D --seccomp unknown -- echo hello" "unknown seccomp profile" 1
+test_case "D17 seccomp-syscalls 空串" "$B_D --seccomp-syscalls '' -D" "cannot be empty" 1
 
 # ------------------------------------------------------------------
 #  E. 互斥检查
