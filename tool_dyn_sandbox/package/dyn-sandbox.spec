@@ -9,11 +9,11 @@
 
 Name:      dyn-sandbox
 Version:   1.0.0
-Release:   1%{?dist}
+Release:   2%{?dist}
 Summary:   dyn-sandbox sandbox isolation: kernel module + DNS proxy
-License:   GPL-2.0-only
+License:   GPL-2.0-only AND MulanPSL-2.0
 URL:       https://www.huawei.com
-Source0:   %{name}-%{version}.tar.gz
+Source0:   %{name}-%{version}-%{release}.tar.gz
 
 BuildRequires: libyaml-devel
 BuildRequires: kernel-devel
@@ -37,10 +37,10 @@ manages module load/unload.
 %setup -q
 
 %build
-make all
+make all kernelver=%{kernelver}
 
 %install
-make install DESTDIR=%{buildroot}
+make install DESTDIR=%{buildroot} kernelver=%{kernelver}
 
 %post
 /sbin/depmod -a
@@ -66,9 +66,12 @@ fi
 /usr/bin/dyn-sandbox-dns
 /usr/lib/systemd/system/dyn-sandbox.service
 /lib/modules/%{kernelver}/extra/dyn_sandbox.ko
-%license License/LICENSE
+%license LICENSES/GPL-2.0-only.txt LICENSES/MulanPSL-2.0.txt
 %doc README.md docs/*.md
 
 %changelog
+* Fri Aug 21 2026 dyn-sandbox team - 1.0.0-2
+- fix makefile and spec
+
 * Fri Jul 31 2026 dyn-sandbox team - 1.0.0-1
 - Initial RPM packaging
