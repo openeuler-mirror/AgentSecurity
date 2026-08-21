@@ -119,7 +119,13 @@ static int handle_mapping_value(struct pctx *ctx, const char *val)
 			e->rw = !(strcmp(val, "true") == 0 ||
 				       strcmp(val, "yes") == 0);
 		} else if (strcmp(f, "size") == 0) {
-			e->size = atol(val);
+			long s = atol(val);
+			if (s < 0) {
+				fprintf(stderr,
+					"policy: negative tmpfs size not allowed: %s\n", val);
+				return -1;
+			}
+			e->size = (unsigned long)s;
 		}
 
 	} else if (strcmp(ctx->section, "landlock") == 0) {

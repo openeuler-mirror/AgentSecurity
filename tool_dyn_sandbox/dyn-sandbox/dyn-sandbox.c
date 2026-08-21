@@ -241,9 +241,9 @@ static void bind_mount_override(const char *src, const char *target)
 			char *sep = strrchr(resolved, '/');
 			if (sep) {
 				*sep = '\0';
-				char cmd[512];
-				snprintf(cmd, sizeof(cmd), "mkdir -p %s", resolved);
-				system(cmd);
+				if (mkdir_p(resolved) < 0)
+					fprintf(stderr, "dyn-sandbox: warning: mkdir_p %s: %s\n",
+						resolved, strerror(errno));
 				*sep = '/';
 			}
 		} else {

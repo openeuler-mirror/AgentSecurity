@@ -36,6 +36,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <time.h>
+#include <sys/random.h>
 #include <ldns/ldns.h>
 
 #ifdef HAVE_SYSTEMD
@@ -84,7 +85,11 @@ struct pending_query {
 };
 
 static struct pending_query pending[MAX_PENDING];
-static uint16_t next_id = 1;           /* new_id auto-increment */
+
+/* new_id -> pending slot index (O(1) lookup), ID_FREE = not in use.
+ * new_id is 16-bit (0-65535); slot indices fit in int16_t. */
+#define ID_FREE  (-1)
+static int16_t id_to_idx[65536];
 static int listen_fd = -1;
 static int upstream_fd = -1;
 static struct sockaddr_in upstream_addr;
@@ -234,21 +239,28 @@ static int pending_alloc(void)
 	return -1;
 }
 
-/* Lookup by new_id, returns index or -1 */
-static int pending_lookup(uint16_t new_id)
+/* Allocate a unique random 16-bit ID (0 reserved). id_to_idx gives an O(1)
+ * occupancy check; draws ~1 time on average (≤256 in-use of 65535),
+ * mirroring dnsmasq's get_id(). */
+static uint16_t get_new_id(void)
 {
-	for (int i = 0; i < MAX_PENDING; i++) {
-		if (pending[i].in_use && pending[i].new_id == new_id)
-			return i;
+	uint16_t id = 0;
+
+	for (;;) {
+		if (getrandom(&id, sizeof(id), 0) != (ssize_t)sizeof(id))
+			id = (uint16_t)(rand() & 0xFFFF); /* non-crypto fallback */
+		if (id != 0 && id_to_idx[id] == ID_FREE)
+			return id;
 	}
-	return -1;
 }
 
 /* Release a slot */
 static void pending_free(int idx)
 {
-	if (idx >= 0 && idx < MAX_PENDING)
+	if (idx >= 0 && idx < MAX_PENDING && pending[idx].in_use) {
+		id_to_idx[pending[idx].new_id] = ID_FREE;
 		pending[idx].in_use = 0;
+	}
 }
 
 /* Clean up timed-out entries, returns count of entries freed */
@@ -261,7 +273,7 @@ static int pending_cleanup(int64_t now_ms)
 		if (now_ms - pending[i].timestamp_ms > PENDING_TIMEOUT * 1000) {
 			printf("[dyn-sandbox-dns] timeout: %s [id=%d] dropped\n",
 			       pending[i].domain, pending[i].new_id);
-			pending[i].in_use = 0;
+			pending_free(i);
 			count++;
 		}
 	}
@@ -393,18 +405,12 @@ static void handle_new_query(void)
 		return;
 	}
 
-	uint16_t new_id;
-	int retry = 0;
-	do {
-		new_id = next_id++;
-		if (next_id == 0) next_id = 1;  /* skip 0 */
-		retry++;
-	} while (pending_lookup(new_id) >= 0 && retry < MAX_PENDING);
-
-	if (retry >= MAX_PENDING) {
+	uint16_t new_id = get_new_id();
+	if (new_id == 0) {
 		fprintf(stderr, "[dyn-sandbox-dns] cannot allocate new_id, drop query from %s\n", client_ip);
 		return;
 	}
+	id_to_idx[new_id] = idx;
 
 	pending[idx].orig_id = ntohs(header->id);
 	pending[idx].new_id = new_id;
@@ -445,9 +451,12 @@ static void handle_upstream_reply(void)
 
 	uint16_t resp_id = ntohs(header->id);
 
-	int idx = pending_lookup(resp_id);
-	if (idx < 0)
-		return;  /* already cleaned up by timeout */
+	/* O(1) slot lookup via the ID map; the in_use / new_id re-checks
+	 * guard against a stale or reused entry (e.g. cleaned up by timeout). */
+	int idx = id_to_idx[resp_id];
+	if (idx < 0 || idx >= MAX_PENDING || !pending[idx].in_use ||
+	    pending[idx].new_id != resp_id)
+		return;  /* unknown, or already cleaned up by timeout */
 
 	/* Only extract and report IPs for A-record queries */
 	if (pending[idx].qtype == LDNS_RR_TYPE_A) {
@@ -551,7 +560,9 @@ int main(int argc, char **argv)
 	sd_notify(0, "READY=1");
 #endif
 
-	/* Main poll loop */
+	/* Main poll loop: ID map starts fully free (0xFF bytes => -1) */
+	srand((unsigned int)time(NULL));   /* seed rand() fallback in get_new_id() */
+	memset(id_to_idx, 0xff, sizeof(id_to_idx));
 	memset(pending, 0, sizeof(pending));
 
 	for (;;) {
@@ -566,7 +577,7 @@ int main(int argc, char **argv)
 
 		if (ret < 0) {
 			if (errno == EINTR)
-				break;
+				continue;	/* 信号打断/暂停恢复: 重新阻塞, 不做退出决策 */
 			perror("poll");
 			break;
 		}

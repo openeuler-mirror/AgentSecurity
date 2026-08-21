@@ -798,7 +798,10 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
 		return -EINVAL;
 	}
 
+	spin_lock_irqsave(&task->sighand->siglock, flags);
 	task->signal->flags &= ~SIGNAL_UNKILLABLE;
+	spin_unlock_irqrestore(&task->sighand->siglock, flags);
+
 	inst->sandbox_pid_ns = task_active_pid_ns(task);
 	put_task_struct(task);
 	pr_info("dyn-sandbox: SET_PID %d -> pid=%d\n",

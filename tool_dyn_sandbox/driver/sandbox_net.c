@@ -105,7 +105,6 @@ static const struct {
 	{ .net = IP4(10,88,0,0),   .prefix = 16 },
 	{ .net = IP4(172,18,0,0),  .prefix = 16 },
 	{ .net = IP4(172,19,0,0),  .prefix = 16 },
-	{ .net = IP4(192,168,99,0), .prefix = 24 },
 };
 
 static __be32 subnet_base;
@@ -131,19 +130,20 @@ static __be32 prefix_to_mask(int prefix)
 static int env_acquire_subnet(void)
 {
 	struct net_device *dev;
+	struct in_device *in_dev;
+	struct in_ifaddr *ifa;
 	unsigned long probe_used = 0;
 	DECLARE_BITMAP(dyn_used, MAX_SUBNET_OCTETS) = { 0 };
 	int i;
 
 	rcu_read_lock();
-	for_each_netdev(&init_net, dev) {
-		struct in_device *in_dev = __in_dev_get_rcu(dev);
+	for_each_netdev_rcu(&init_net, dev) {
+		in_dev = __in_dev_get_rcu(dev);
 
 		if (!in_dev)
 			continue;
 
-		for (struct in_ifaddr *ifa = in_dev->ifa_list; ifa;
-		     ifa = ifa->ifa_next) {
+		in_dev_for_each_ifa_rcu(ifa, in_dev) {
 			__be32 addr = ifa->ifa_address;
 
 			/* Phase 1: check against each probe subnet */
@@ -571,6 +571,8 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 {
 	struct sandbox_net_create *args;
 	struct sandbox_net_env *env;
+	__be16 dns_port;
+	unsigned long __flags;
 	int ret;
 
 	if (!inst)
@@ -619,26 +621,24 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	/* Write back the kernel-generated veth names; the child needs veth_child to configure its IP */
 	strscpy(args->veth_host, env->veth_host, sizeof(args->veth_host));
 	strscpy(args->veth_child, env->veth_child, sizeof(args->veth_child));
-	if (args->ndomains > 0 && !dns_proxy_port) {
+	/* Snapshot the port once so the check and the value stay consistent */
+	dns_port = READ_ONCE(dns_proxy_port);
+	if (args->ndomains > 0 && !dns_port) {
 		pr_err("dyn-sandbox: dyn-sandbox-dns not registered, but domains configured\n");
 		ret = -EAGAIN;
 		goto err_free_env;
 	}
-	args->dns_port = dns_proxy_port ?
-			 be16_to_cpu(dns_proxy_port) : 53;
+	args->dns_port = dns_port ? be16_to_cpu(dns_port) : 53;
 	if (copy_to_user(uarg, args, sizeof(*args))) {
-		kfree(args);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto err_free_env;
 	}
 
 	/* Register for REPORT_DNS lookup by child IP */
-	{
-		unsigned long __flags;
-		spin_lock_irqsave(&net_inst_lock, __flags);
-		list_add(&inst->net_node, &net_inst_list);
-		inst->in_net_inst_list = true;
-		spin_unlock_irqrestore(&net_inst_lock, __flags);
-	}
+	spin_lock_irqsave(&net_inst_lock, __flags);
+	list_add(&inst->net_node, &net_inst_list);
+	inst->in_net_inst_list = true;
+	spin_unlock_irqrestore(&net_inst_lock, __flags);
 
 	kfree(args);
 	return 0;
@@ -717,7 +717,7 @@ int net_set_dns_port(struct sandbox_dns_port __user *uarg)
 	if (p.port == 0)
 		return -EINVAL;
 
-	dns_proxy_port = cpu_to_be16(p.port);
+	WRITE_ONCE(dns_proxy_port, cpu_to_be16(p.port));
 	pr_info("dyn-sandbox: dyn-sandbox-dns port set to %d\n", p.port);
 	return 0;
 }
@@ -773,5 +773,11 @@ void net_cleanup_nat(void)
 	if (nat_added)
 		run_cmd("nft delete table netpolicy_nat 2>/dev/null; true");
 
-	run_cmd("nft flush chain inet firewalld filter_IN_public_pre 2>/dev/null; true");
+	/* 精确删除 env_add_filter_accept() 添加的那条 accept 规则，
+	 * 而不是 flush 整条 firewalld 链 —— flush 会误删其他组件/管理员
+	 * 在 filter_IN_public_pre 里配置的规则。 */
+	char cidr[32];
+	snprintf(cidr, sizeof(cidr), "%pI4/%d", &subnet_base, subnet_prefix);
+	run_cmd("nft delete rule inet firewalld filter_IN_public_pre "
+		"ip saddr %s accept 2>/dev/null; true", cidr);
 }
