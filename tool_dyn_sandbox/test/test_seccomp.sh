@@ -22,7 +22,10 @@ PW="111111"
 sudo_run() { echo "$PW" | sudo -S "$@"; }
 
 # Make the test binary visible to the sandbox child under --mount /usr:ro.
-sudo_run install -m 0755 "$DIR/seccomp_test" /usr/bin/seccomp_test 2>/dev/null
+# Primary source is dist/ (make all 后产物收敛于此); 未跑 make all 时回退到 test/ 源树.
+SRC="$DIR/../dist/seccomp_test"
+[ -f "$SRC" ] || SRC="$DIR/seccomp_test"
+sudo_run install -m 0755 "$SRC" /usr/bin/seccomp_test 2>/dev/null
 
 : > "$LOGFILE"
 {

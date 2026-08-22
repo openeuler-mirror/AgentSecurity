@@ -511,9 +511,19 @@ int main(int argc, char **argv)
 		if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
 			char *colon = strchr(argv[++i], ':');
 			if (colon) {
+				char *end;
+				long p;
 				*colon = '\0';
 				listen_addr = argv[i];
-				listen_port = atoi(colon + 1);
+				errno = 0;
+				p = strtol(colon + 1, &end, 10);
+				if (errno == ERANGE || end == colon + 1 || *end != '\0' ||
+				    p < 0 || p > 65535) {
+					fprintf(stderr, "[dyn-sandbox-dns] invalid --listen port: %s\n",
+						colon + 1);
+					return 1;
+				}
+				listen_port = (int)p;
 			} else {
 				listen_addr = argv[i];
 			}

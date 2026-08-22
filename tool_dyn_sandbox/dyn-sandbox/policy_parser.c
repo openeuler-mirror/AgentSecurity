@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <yaml.h>
 
@@ -196,14 +197,19 @@ static int handle_seq_value(struct pctx *ctx, const char *val)
 				return -1;
 			}
 			*slash = '\0';
-			int pfx = atoi(slash + 1);
-			if (pfx < 0 || pfx > 32) {
-				fprintf(stderr, "policy: invalid CIDR prefix %d\n", pfx);
+			char *end;
+			long pfx;
+			errno = 0;
+			pfx = strtol(slash + 1, &end, 10);
+			if (errno == ERANGE || end == slash + 1 || *end != '\0' ||
+			    pfx < 1 || pfx > 32) {
+				/* 拒绝非数字(/abc 曾静默成 /0)和 /0: 白名单加 0.0.0.0/0 会放行全部流量 */
+				fprintf(stderr, "policy: invalid CIDR prefix: %s\n", slash + 1);
 				return -1;
 			}
 			struct sandbox_cidr *c = &ctx->cfg->cidrs[ctx->cfg->ncidrs++];
 			c->addr = inet_addr(buf);
-			c->mask = htonl(pfx ? (~0U << (32 - pfx)) : 0);
+			c->mask = htonl(~0U << (32 - pfx)); /* pfx 已保证 1..32 */
 		}
 		return 0;
 	}

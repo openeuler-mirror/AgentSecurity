@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <getopt.h>
 #include <arpa/inet.h>
 
@@ -35,35 +36,49 @@ static int parse_mount(struct sandbox_config *cfg, const char *arg)
 		fprintf(stderr, "too many --mount entries\n");
 		return -1;
 	}
-	struct mount_entry *e = &cfg->mounts[cfg->nmounts++];
+	struct mount_entry *e = &cfg->mounts[cfg->nmounts++]; /* 先占位, 错误分支不回滚 */
 
-	char buf[512];
-	strncpy(buf, arg, sizeof(buf) - 1);
-	char *colon = strchr(buf, ':');
+	/* 先 strnlen 限幅取实长, memchr 只在串内找冒号 (memchr 不认 '\0', 不能按 sizeof 直接扫) */
+	size_t alen = strnlen(arg, sizeof(e->src));
+	const char *colon = memchr(arg, ':', alen);
+	size_t plen = colon ? (size_t)(colon - arg) : alen;
+	if (plen >= sizeof(e->src)) {
+		fprintf(stderr, "mount path too long: %zu chars (max %zu)\n",
+			plen, sizeof(e->src) - 1);
+		return -1;
+	}
+
 	if (colon) {
-		*colon = '\0';
-		if (strcmp(colon + 1, "rw") == 0)
+		/* rw/ro 精确匹配 (3 字节封顶; 255 路径+":rw" 边界需读窗口外 2 字节, argv 保证终止, 安全) */
+		const char *opt = colon + 1;
+		size_t optlen = strnlen(opt, 3);
+		int is_rw = (optlen == 2 && memcmp(opt, "rw", 2) == 0);
+		int is_ro = (optlen == 2 && memcmp(opt, "ro", 2) == 0);
+		if (is_rw)
 			e->rw = 1;
-		else if (strcmp(colon + 1, "ro") != 0) {
-			fprintf(stderr, "invalid mount option: %s"
-				" (use ro or rw)\n", colon + 1);
-			cfg->nmounts--;
+		else if (!is_ro) {
+			fprintf(stderr, "invalid mount option: %.*s (use ro or rw)\n",
+				(int)optlen, opt);
 			return -1;
 		}
 	}
-	strncpy(e->src, buf, sizeof(e->src) - 1);
-	strncpy(e->dest, buf, sizeof(e->dest) - 1);
+
+	memcpy(e->src, arg, plen);
+	e->src[plen] = '\0';
+	memcpy(e->dest, arg, plen);
+	e->dest[plen] = '\0';
 	return 0;
 }
 
 static int parse_mount_tmpfs(struct sandbox_config *cfg, const char *arg)
 {
-	char buf[512];
-	strncpy(buf, arg, sizeof(buf) - 1);
-	char *colon = strchr(buf, ':');
+	/* 限范围扫描, 同 parse_mount: 先 strnlen 限幅取串长, 再 memchr 只在串内找冒号 */
+	const size_t path_max = sizeof(((struct mount_entry *)0)->dest);
+	size_t alen = strnlen(arg, path_max);
+	const char *colon = memchr(arg, ':', alen);
+	size_t plen = colon ? (size_t)(colon - arg) : alen;
 	unsigned long size = 0;
 	if (colon) {
-		*colon = '\0';
 		long s = atol(colon + 1);
 		if (s <= 0) {
 			fprintf(stderr, "invalid tmpfs size: %ld\n", s);
@@ -73,7 +88,7 @@ static int parse_mount_tmpfs(struct sandbox_config *cfg, const char *arg)
 	}
 
 	/* /tmp 已由系统挂载，只修改大小即可 */
-	if (strcmp(buf, "/tmp") == 0) {
+	if (plen == 4 && memcmp(arg, "/tmp", 4) == 0) {
 		cfg->tmpfs_size_mb = size > 0 ? size : 256;
 		return 0;
 	}
@@ -82,10 +97,16 @@ static int parse_mount_tmpfs(struct sandbox_config *cfg, const char *arg)
 		fprintf(stderr, "too many --mount entries\n");
 		return -1;
 	}
-	struct mount_entry *e = &cfg->mounts[cfg->nmounts++];
+	struct mount_entry *e = &cfg->mounts[cfg->nmounts++]; /* 先占位, 错误分支不回滚 */
+	if (plen >= path_max) {
+		fprintf(stderr, "mount path too long: %zu chars (max %zu)\n",
+			plen, path_max - 1);
+		return -1;
+	}
 	e->is_tmpfs = 1;
 	e->size = size;
-	strncpy(e->dest, buf, sizeof(e->dest) - 1);
+	memcpy(e->dest, arg, plen);
+	e->dest[plen] = '\0';
 	return 0;
 }
 
@@ -96,18 +117,30 @@ static int parse_landlock(struct sandbox_config *cfg, const char *arg)
 		fprintf(stderr, "too many --landlock entries\n");
 		return -1;
 	}
-	struct landlock_entry *e = &cfg->landlock_rules[cfg->nlandlock++];
+	struct landlock_entry *e = &cfg->landlock_rules[cfg->nlandlock++]; /* 先占位, 错误分支不回滚 */
 
-	char *colon = strchr(arg, ':');
+	/* 限范围扫描, 同 parse_mount: 先 strnlen 限幅取串长, 再 memchr 只在串内找冒号 */
+	size_t alen = strnlen(arg, sizeof(e->path));
+	const char *colon = memchr(arg, ':', alen);
+	size_t plen = colon ? (size_t)(colon - arg) : alen;
+	if (plen >= sizeof(e->path)) {
+		fprintf(stderr, "landlock path too long: %zu chars (max %zu)\n",
+			plen, sizeof(e->path) - 1);
+		return -1;
+	}
+	memcpy(e->path, arg, plen);
+	e->path[plen] = '\0';
+
+	/* 权限串: 限 sizeof(e->perms) 内校验长度, 超长显式拒绝 */
 	if (colon) {
-		size_t plen = colon - arg;
-		if (plen > sizeof(e->path) - 1)
-			plen = sizeof(e->path) - 1;
-		memcpy(e->path, arg, plen);
-		e->path[plen] = '\0';
-		strncpy(e->perms, colon + 1, sizeof(e->perms) - 1);
-	} else {
-		strncpy(e->path, arg, sizeof(e->path) - 1);
+		size_t permlen = strnlen(colon + 1, sizeof(e->perms));
+		if (permlen >= sizeof(e->perms)) {
+			fprintf(stderr, "landlock perms too long: max %zu\n",
+				sizeof(e->perms) - 1);
+			return -1;
+		}
+		memcpy(e->perms, colon + 1, permlen);
+		e->perms[permlen] = '\0';
 	}
 	return 0;
 }
@@ -119,51 +152,106 @@ static int parse_domains(struct sandbox_config *cfg, const char *arg)
 		fprintf(stderr, "empty domain name\n");
 		return -1;
 	}
-	char dom_buf[4096];
-	strncpy(dom_buf, arg, sizeof(dom_buf) - 1);
-	char *tok = strtok(dom_buf, ",");
-	while (tok) {
+	const char *p = arg;
+	for (;;) {
+		/* strnlen 限幅取实长, memchr 只在串内找逗号; 超长段拒绝; 空段跳过(同 strtok) */
+		size_t seg_len = strnlen(p, SANDBOX_DOMAIN_MAX_LEN);
+		const char *comma = memchr(p, ',', seg_len);
+		size_t len = comma ? (size_t)(comma - p) : seg_len;
+		if (len == 0) {
+			if (comma) {
+				p = comma + 1;   /* 前导/连续逗号: 空段 */
+				continue;
+			}
+			break;               /* 串尾 */
+		}
+		if (len >= SANDBOX_DOMAIN_MAX_LEN) {
+			fprintf(stderr, "domain too long: %zu chars (max %d)\n",
+				len, SANDBOX_DOMAIN_MAX_LEN - 1);
+			return -1;
+		}
 		if (cfg->ndomains >= SANDBOX_MAX_DOMAINS) {
 			fprintf(stderr, "too many --domain entries (max %d)\n",
 				SANDBOX_MAX_DOMAINS);
 			return -1;
 		}
-		strncpy(cfg->domains[cfg->ndomains], tok,
-			SANDBOX_DOMAIN_MAX_LEN - 1);
+		memcpy(cfg->domains[cfg->ndomains], p, len);
+		cfg->domains[cfg->ndomains][len] = '\0';
 		cfg->ndomains++;
-		tok = strtok(NULL, ",");
+		if (!comma)
+			break;
+		p = comma + 1;
 	}
 	return 0;
 }
 
 static int parse_cidrs(struct sandbox_config *cfg, const char *arg)
 {
-	char cidr_buf[4096];
-	strncpy(cidr_buf, arg, sizeof(cidr_buf) - 1);
-	char *tok = strtok(cidr_buf, ",");
-	while (tok) {
+	const char *p = arg;
+	for (;;) {
+		/* 同 parse_domains; 合法 CIDR 段 ≤16 字符, 64 封顶, 超长拒绝 */
+		size_t seg_len = strnlen(p, 64);
+		const char *comma = memchr(p, ',', seg_len);
+		size_t seglen = comma ? (size_t)(comma - p) : seg_len;
+		if (seglen == 0) {
+			if (comma) {
+				p = comma + 1;   /* 空段 */
+				continue;
+			}
+			break;               /* 串尾 */
+		}
+		if (seglen >= 64) {
+			fprintf(stderr, "invalid CIDR segment too long (max 63)\n");
+			return -1;
+		}
 		if (cfg->ncidrs >= SANDBOX_MAX_CIDRS) {
 			fprintf(stderr, "too many --cidr entries (max %d)\n",
 				SANDBOX_MAX_CIDRS);
 			return -1;
 		}
-		char buf[64];
-		strncpy(buf, tok, sizeof(buf) - 1);
-		char *slash = strchr(buf, '/');
+		/* 段内找 '/' : 只在 seglen 内 */
+		const char *slash = memchr(p, '/', seglen);
 		if (!slash) {
-			fprintf(stderr, "invalid CIDR: %s (need /prefix)\n", tok);
+			fprintf(stderr, "invalid CIDR: %.*s (need /prefix)\n",
+				(int)seglen, p);
 			return -1;
 		}
-		*slash = '\0';
-		int pfx = atoi(slash + 1);
-		if (pfx < 0 || pfx > 32) {
-			fprintf(stderr, "invalid prefix: %d\n", pfx);
+		size_t iplen = (size_t)(slash - p);
+		if (iplen == 0 || iplen >= INET_ADDRSTRLEN) {
+			fprintf(stderr, "invalid CIDR: %.*s\n", (int)seglen, p);
+			return -1;
+		}
+		char ip[INET_ADDRSTRLEN];
+		memcpy(ip, p, iplen);
+		ip[iplen] = '\0';
+
+		/* 前缀段: 限斜杠后的段内字节(合法 1..32, ≤3 字符), 不越过逗号/串尾 */
+		size_t pfx_region = seglen - iplen - 1;
+		size_t pfxlen = strnlen(slash + 1, pfx_region);
+		if (pfxlen == 0 || pfxlen > 3) {
+			fprintf(stderr, "invalid prefix: %.*s\n",
+				(int)pfxlen, slash + 1);
+			return -1;
+		}
+		char pfxbuf[4];
+		memcpy(pfxbuf, slash + 1, pfxlen);
+		pfxbuf[pfxlen] = '\0';
+		char *end;
+		long pfx;
+		errno = 0;
+		pfx = strtol(pfxbuf, &end, 10);
+		if (errno == ERANGE || end == pfxbuf || *end != '\0' ||
+		    pfx < 1 || pfx > 32) {
+			/* 拒绝非数字(/abc 曾静默成 /0)和 /0: 白名单加 0.0.0.0/0 会放行全部流量 */
+			fprintf(stderr, "invalid prefix: %s\n", pfxbuf);
 			return -1;
 		}
 		struct sandbox_cidr *c = &cfg->cidrs[cfg->ncidrs++];
-		c->addr = inet_addr(buf);
-		c->mask = htonl(pfx ? (~0U << (32 - pfx)) : 0);
-		tok = strtok(NULL, ",");
+		c->addr = inet_addr(ip);
+		c->mask = htonl(~0U << (32 - pfx)); /* pfx 已保证 1..32 */
+		if (!comma)
+			break;
+		p = comma + 1;
 	}
 	return 0;
 }
@@ -229,7 +317,8 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 			break;
 
 		case 't':
-			if (parse_mount_tmpfs(cfg, optarg) < 0) return -1;
+			if (parse_mount_tmpfs(cfg, optarg) < 0)
+				return -1;
 			break;
 
 #ifdef CONFIG_LANDLOCK_ENABLE
@@ -238,7 +327,8 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 				fprintf(stderr, "--landlock and --no-landlock are mutually exclusive\n");
 				return -1;
 			}
-			if (parse_landlock(cfg, optarg) < 0) return -1;
+			if (parse_landlock(cfg, optarg) < 0)
+				return -1;
 			break;
 
 		case 256: /* --no-landlock */
@@ -277,11 +367,13 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 			break;
 
 		case 'g':
-			if (parse_domains(cfg, optarg) < 0) return -1;
+			if (parse_domains(cfg, optarg) < 0)
+				return -1;
 			break;
 
 		case 'i':
-			if (parse_cidrs(cfg, optarg) < 0) return -1;
+			if (parse_cidrs(cfg, optarg) < 0)
+				return -1;
 			break;
 
 		case 257: /* --share-net */
