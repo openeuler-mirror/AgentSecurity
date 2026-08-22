@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * param_parse.c — 参数解析（CLI + YAML policy）
  */
@@ -254,6 +268,10 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 				fprintf(stderr, "--seccomp and --seccomp-syscalls are mutually exclusive\n");
 				return -1;
 			}
+			if (optarg[0] == '\0') {
+				fprintf(stderr, "--seccomp-syscalls cannot be empty\n");
+				return -1;
+			}
 			strncpy(cfg->seccomp_syscalls, optarg,
 				sizeof(cfg->seccomp_syscalls) - 1);
 			break;
@@ -270,9 +288,15 @@ int parse_args(struct sandbox_config *cfg, int argc, char **argv)
 			cfg->network_mode = NET_MODE_SHARE;
 			break;
 
-		case 'z':
-			cfg->tmpfs_size_mb = atol(optarg);
+		case 'z': {
+			long s = atol(optarg);
+			if (s < 0) {
+				fprintf(stderr, "invalid --tmpfs-size: %ld (must be >= 0, 0 = default 256)\n", s);
+				return -1;
+			}
+			cfg->tmpfs_size_mb = s;
 			break;
+		}
 
 		case 'D':
 			cfg->dump_config = 1;
@@ -342,7 +366,7 @@ void dump_config(const struct sandbox_config *cfg)
 {
 	printf("=== sandbox_config dump ===\n");
 	printf("workdir: %s\n", cfg->workdir);
-	printf("tmpfs_size_mb: %lu\n", cfg->tmpfs_size_mb);
+	printf("tmpfs_size_mb: %ld\n", cfg->tmpfs_size_mb);
 	{
 		static const char *const net_modes[] = {
 			"isolate", "share", "filter"

@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * policy_parser.c — YAML policy file parser using libyaml
  */
@@ -105,7 +119,13 @@ static int handle_mapping_value(struct pctx *ctx, const char *val)
 			e->rw = !(strcmp(val, "true") == 0 ||
 				       strcmp(val, "yes") == 0);
 		} else if (strcmp(f, "size") == 0) {
-			e->size = atol(val);
+			long s = atol(val);
+			if (s < 0) {
+				fprintf(stderr,
+					"policy: negative tmpfs size not allowed: %s\n", val);
+				return -1;
+			}
+			e->size = (unsigned long)s;
 		}
 
 	} else if (strcmp(ctx->section, "landlock") == 0) {
@@ -215,7 +235,7 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 {
 	FILE *fh;
 	yaml_parser_t parser;
-	yaml_event_t event;
+	yaml_event_t event = {0};   /* 零初始化，out: 处 yaml_event_delete 幂等 */
 
 	int saved_dump = cfg->dump_config;
 	memset(cfg, 0, sizeof(*cfg));
@@ -374,6 +394,8 @@ int parse_policy_file(struct sandbox_config *cfg, const char *path)
 	ret = 0;
 
 out:
+	/* 统一释放尚未 delete 的 event（幂等 no-op） */
+	yaml_event_delete(&event);
 	yaml_parser_delete(&parser);
 	fclose(fh);
 	return ret;

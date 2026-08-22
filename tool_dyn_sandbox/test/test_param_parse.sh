@@ -101,7 +101,7 @@ test_case "B4 mount-tmpfs"        "$B_D --mount-tmpfs /data:128 -D" 'size=128'
 test_case "B5 mount-tmpfs /tmp"   "$B_D --mount-tmpfs /tmp:512 -D" 'tmpfs_size_mb: 512'
 test_case "B6 mount-tmpfs /tmp 默认" "$B_D --mount-tmpfs /tmp -D" 'tmpfs_size_mb: 256'
 test_case "B7 landlock 含权限"    "$B_D --landlock '/usr:read+execute' -D" 'perms=read+execute'
-test_case "B8 landlock 无权限"    "$B_D --landlock '/usr' -D" 'landlock_rules (1)'
+test_case "B8 landlock 无权限"    "$B_D --landlock '/usr' -D" 'landlock, nolandlock 0, rules (1)'
 test_case "B9 domain 单值"       "$B_D --domain example.com -D" 'example.com'
 test_case "B10 domain 多值"      "$B_D --domain a.com,b.com,c.com -D" 'domains (3)'
 test_case "B11 cidr 单值"        "$B_D --cidr 10.0.0.0/8 -D" '10.0.0.0/8'
@@ -184,6 +184,7 @@ test_case "D13 mount 无效后缀" "$B_D --mount /x:invalid -D" "invalid mount o
 test_case "D14 mount-tmpfs 负数" "$B_D --mount-tmpfs /x:-1" "invalid tmpfs size" 1
 test_case "D15 domain 空字符串" "$B_D --domain '' -D" "empty domain" 1
 test_case "D16 seccomp 未知profile" "$B_D --seccomp unknown -- echo hello" "unknown seccomp profile" 1
+test_case "D17 seccomp-syscalls 空串" "$B_D --seccomp-syscalls '' -D" "cannot be empty" 1
 
 # ------------------------------------------------------------------
 #  E. 互斥检查
@@ -232,7 +233,7 @@ test_case "F4 landlock access 列表" "$B_D -D --policy $TMPDIR/f4.yaml" 'perms=
 
 put_yaml f5.yaml "landlock:
   - {path: /usr}"
-test_case "F5 landlock 无 access" "$B_D -D --policy $TMPDIR/f5.yaml" 'landlock_rules (1)'
+test_case "F5 landlock 无 access" "$B_D -D --policy $TMPDIR/f5.yaml" 'landlock, nolandlock 0, rules (1)'
 
 put_yaml f6.yaml "network:
   mode: filter

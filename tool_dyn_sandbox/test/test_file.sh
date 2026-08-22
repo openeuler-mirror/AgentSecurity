@@ -491,7 +491,7 @@ rc=$?
 # === T20: ALLOW — 路径在白名单中，退出码 0 + 日志 ALLOW ===
 T=$((T+1)); log "Test $T: ALLOW path (in allow list)"
 log_save
-run_dyn_test_custom "T20a" "ALLOW /mnt" "/mnt" \
+run_dyn_test_custom "T20a" "ALLOW /mnt" "mnt" \
     timeout 15 ${SANDBOX_RUN} --mount /usr:ro --mount /lib:ro --mount /lib64:ro \
         --mount-tmpfs /mnt:16 --landlock '/:execute' \
         -- /usr/bin/touch /mnt/allowed

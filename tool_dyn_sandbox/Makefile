@@ -1,5 +1,7 @@
 # 顶层 Makefile — 构建所有组件
 
+kernelver ?= $(shell uname -r)
+
 LANDLOCK_ENABLE ?= 0
 ifeq ($(LANDLOCK_ENABLE),1)
 export CONFIG_LANDLOCK_ENABLE := 1
@@ -9,29 +11,30 @@ endif
 
 all: kmod user test
 	mkdir -p dist
-	cp driver/dyn_sandbox.ko dyn-sandbox/dyn-sandbox dyn-sandbox-dns/dyn-sandbox-dns test/seccomp_test dist/
+	cp driver/dyn_sandbox.ko dyn-sandbox/dyn-sandbox dyn-sandbox-dns/dyn-sandbox-dns dist/
+	@if [ -e test/seccomp_test ]; then cp test/seccomp_test dist/; fi
 
 kmod:
-	$(MAKE) -C driver
+	$(MAKE) -C driver kernelver=$(kernelver)
 
 user:
 	$(MAKE) -C dyn-sandbox
 	$(MAKE) -C dyn-sandbox-dns HAVE_SYSTEMD=1
 
 test: user
-	$(MAKE) -C test
+	@if [ -d test ]; then $(MAKE) -C test; fi
 
 install:
 	install -d $(DESTDIR)/usr/bin
 	install -d $(DESTDIR)/usr/lib/systemd/system
-	install -d $(DESTDIR)/lib/modules/$(shell uname -r)/extra
+	install -d $(DESTDIR)/lib/modules/$(kernelver)/extra
 	install -m 0755 dyn-sandbox/dyn-sandbox $(DESTDIR)/usr/bin/
 	install -m 0755 dyn-sandbox-dns/dyn-sandbox-dns $(DESTDIR)/usr/bin/
 	install -m 0644 service/dyn-sandbox.service $(DESTDIR)/usr/lib/systemd/system/
-	install -m 0644 driver/dyn_sandbox.ko $(DESTDIR)/lib/modules/$(shell uname -r)/extra/
+	install -m 0644 driver/dyn_sandbox.ko $(DESTDIR)/lib/modules/$(kernelver)/extra/
 
 clean:
 	$(MAKE) -C driver clean
 	$(MAKE) -C dyn-sandbox clean
 	$(MAKE) -C dyn-sandbox-dns clean
-	$(MAKE) -C test clean
+	@if [ -d test ]; then $(MAKE) -C test; fi

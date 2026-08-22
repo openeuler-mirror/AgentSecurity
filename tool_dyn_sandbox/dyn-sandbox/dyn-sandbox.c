@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ *
+ * dyn-sandbox is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the
+ * Mulan PSL v2.  You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+ * KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 /*
  * sandbox-run.c — AI Agent Tool 执行沙箱
  *
@@ -227,9 +241,9 @@ static void bind_mount_override(const char *src, const char *target)
 			char *sep = strrchr(resolved, '/');
 			if (sep) {
 				*sep = '\0';
-				char cmd[512];
-				snprintf(cmd, sizeof(cmd), "mkdir -p %s", resolved);
-				system(cmd);
+				if (mkdir_p(resolved) < 0)
+					fprintf(stderr, "dyn-sandbox: warning: mkdir_p %s: %s\n",
+						resolved, strerror(errno));
 				*sep = '/';
 			}
 		} else {
@@ -457,7 +471,10 @@ static int setup_virtual_fs(struct sandbox_config *cfg)
 		fprintf(stderr, "dyn-sandbox: warning: mkdir /dev/pts: %s\n", strerror(errno));
 	if (mkdir("/dev/shm", 0755) < 0 && errno != EEXIST)
 		fprintf(stderr, "dyn-sandbox: warning: mkdir /dev/shm: %s\n", strerror(errno));
-	mount("tmpfs", "/dev/shm", "tmpfs", 0, NULL);
+	if (mount("tmpfs", "/dev/shm", "tmpfs", 0, NULL) < 0) {
+		fprintf(stderr, "mount /dev/shm: %s\n", strerror(errno));
+		return -1;
+	}
 
 	/* /tmp — 独立 tmpfs */
 	if (mkdir("/tmp", 0777) < 0 && errno != EEXIST) {
@@ -467,7 +484,10 @@ static int setup_virtual_fs(struct sandbox_config *cfg)
 	unsigned long tmpfs_sz = cfg->tmpfs_size_mb > 0 ? cfg->tmpfs_size_mb : 256;
 	char tmpfs_opt[64];
 	snprintf(tmpfs_opt, sizeof(tmpfs_opt), "mode=0777,size=%luM", tmpfs_sz);
-	mount("tmpfs", "/tmp", "tmpfs", 0, tmpfs_opt);
+	if (mount("tmpfs", "/tmp", "tmpfs", 0, tmpfs_opt) < 0) {
+		fprintf(stderr, "mount /tmp: %s\n", strerror(errno));
+		return -1;
+	}
 	return 0;
 }
 
@@ -577,8 +597,9 @@ static int setup_filesystem(struct sandbox_config *cfg)
 
 /* ------------------------------------------------------------------ */
 /*  forward_fd — 从 src fd 读到 buf, 全部写入 dst fd                    */
+/*  返回 1 = 继续转发; 0 = src 已 EOF/出错或写失败, 调用方收敛该 fd      */
 /* ------------------------------------------------------------------ */
-static void forward_fd(int src, int dst)
+static int forward_fd(int src, int dst)
 {
 	char buf[4096];
 	ssize_t n = read(src, buf, sizeof(buf));
@@ -586,10 +607,12 @@ static void forward_fd(int src, int dst)
 		ssize_t off = 0;
 		while (off < n) {
 			ssize_t w = write(dst, buf + off, n - off);
-			if (w < 0) return;
+			if (w < 0) return 0;      /* 对端已关(EPIPE), 停止转发 */
 			off += w;
 		}
+		return 1;
 	}
+	return n < 0 && errno == EINTR;   /* EINTR 重试; 其余(含 EOF)收敛该 fd */
 }
 
 /* ------------------------------------------------------------------ */
@@ -632,6 +655,18 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 	close(child_stdout[1]);  child_stdout[1] = -1;
 	close(child_stderr[1]);  child_stderr[1] = -1;
 
+	/* 父进程忽略 SIGPIPE: 向已死子进程写 stdin 不再自杀, 由 forward_fd
+	 * 以 EPIPE 返回并收敛该 fd。须在 clone 之后设置, 避免传给 exec 的工具。 */
+	signal(SIGPIPE, SIG_IGN);
+
+	/* 先阻塞 SIGCHLD 再唤醒子进程: 若子进程在 signalfd 建好前退出,
+	 * 未阻塞的 SIGCHLD 会被默认处置直接丢弃, 父进程将永远感知不到
+	 * 子进程死亡。先阻塞, 死讯挂起在 pending, signalfd 建好即可读。 */
+	sigset_t sigmask;
+	sigemptyset(&sigmask);
+	sigaddset(&sigmask, SIGCHLD);
+	sigprocmask(SIG_BLOCK, &sigmask, NULL);
+
 	/* 非 root: parent 写 child 的 uid/gid map */
 	if (getuid() != 0)
 		write_uid_gid_map(child_pid);
@@ -663,15 +698,14 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 	fflush(stdout);
 
 	/* ── signalfd: 把 SIGCHLD 映射成 fd ── */
-	sigset_t sigmask;
-	sigemptyset(&sigmask);
-	sigaddset(&sigmask, SIGCHLD);
-	sigprocmask(SIG_BLOCK, &sigmask, NULL);
 	int sfd = signalfd(-1, &sigmask, SFD_CLOEXEC);
 	if (sfd < 0) {
 		perror("signalfd");
 		cleanup_exit(1);
 	}
+
+	/* stdin 转发状态: 初始为 fd0, EOF 后置 -1 摘出 poll 集合 (poll 忽略负 fd) */
+	int stdin_fd = 0;
 
 	/* ── poll 事件循环: I/O 转发 + 信号 ── */
 	while (1) {
@@ -694,7 +728,7 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 		fds[nfds].events = POLLIN;
 		nfds++;
 
-		fds[nfds].fd = 0;
+		fds[nfds].fd = stdin_fd;
 		fds[nfds].events = POLLIN;
 		nfds++;
 
@@ -707,12 +741,12 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 		}
 
 		/* ── 转发: child stdout → 父进程 stdout ── */
-		if (fds[1].revents & POLLIN)
-			forward_fd(child_stdout[0], 1);
+		if (fds[1].revents & (POLLIN | POLLHUP) && !forward_fd(child_stdout[0], 1))
+			child_stdout[0] = -1;   /* EOF/写失败: 摘 fd, 停止转发 */
 
 		/* ── 转发: child stderr → 父进程 stderr ── */
-		if (fds[2].revents & POLLIN)
-			forward_fd(child_stderr[0], 2);
+		if (fds[2].revents & (POLLIN | POLLHUP) && !forward_fd(child_stderr[0], 2))
+			child_stderr[0] = -1;
 
 		/* ── sandbox_fd: 内核 blocked 事件（任意子/孙进程） ── */
 		if (fds[3].revents & POLLIN) {
@@ -763,8 +797,18 @@ static void run_parent(pid_t child_pid, struct sandbox_config *cfg)
 				cleanup_exit(1);
 		}
 		/* ── 转发: 父进程 stdin → child stdin ── */
-		if (nfds > 4 && (fds[4].revents & POLLIN))
-			forward_fd(0, child_stdin[1]);
+		if (stdin_fd >= 0 && (fds[4].revents & (POLLIN | POLLHUP))) {
+			if (!forward_fd(stdin_fd, child_stdin[1])) {
+				/* stdin EOF/出错: 摘 fd 停止转发; 关 child_stdin[1] 写端
+				 * 传播 EOF 给子进程。fd0 自身保留, AUTH(decide_file_action)
+				 * 仍读 stdin, EOF 后默认 DENY。 */
+				stdin_fd = -1;
+				if (child_stdin[1] >= 0) {
+					close(child_stdin[1]);
+					child_stdin[1] = -1;
+				}
+			}
+		}
 	}
 	cleanup_exit(1);
 }
@@ -957,7 +1001,7 @@ static void child_setup_stdio(void)
 
 /* 阶段 2: 网络隔离 — veth pair + nftables
  * 仅白名单模式进入; isolate 无网络, --share-net 共享宿主网络 */
-static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
+static void child_setup_network(struct sandbox_config *cfg)
 {
 	if (cfg->network_mode != NET_MODE_WHITELIST)
 		return;
@@ -965,7 +1009,6 @@ static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
 	struct sandbox_net_create req;
 	memset(&req, 0, sizeof(req));
 	req.flags = 0;
-	snprintf(req.veth_host, sizeof(req.veth_host), "vp-h-%d", (int)my_pid);
 	req.ndomains = cfg->ndomains;
 	for (int di = 0; di < cfg->ndomains; di++)
 		strncpy(req.domains[di], cfg->domains[di],
@@ -973,7 +1016,6 @@ static void child_setup_network(struct sandbox_config *cfg, pid_t my_pid)
 	req.ncidrs = cfg->ncidrs;
 	for (int ci = 0; ci < cfg->ncidrs; ci++)
 		req.cidrs[ci] = cfg->cidrs[ci];
-	snprintf(req.veth_child, sizeof(req.veth_child), "vp-c-%d", (int)my_pid);
 
 	if (ioctl(sandbox_fd, SANDBOX_NET_CREATE, &req) < 0)
 		CHILD_FAIL_EXIT(EXIT_NET_ERR, "SANDBOX_NET_CREATE: %s",
@@ -1056,7 +1098,8 @@ static void child_finalize(struct sandbox_config *cfg,
 	child_close_fds(landlock_fd);
 
 	if (cfg->workdir[0] && chdir(cfg->workdir) < 0)
-		fprintf(stderr, "chdir %s: %s\n", cfg->workdir, strerror(errno));
+		CHILD_FAIL_EXIT(EXIT_TOOL_FAIL, "invalid workdir %s: %s",
+				cfg->workdir, strerror(errno));
 
 	if (enable_sandbox(landlock_fd, seccomp_prog) < 0)
 		CHILD_FAIL_EXIT(EXIT_LANDLOCK_ERR, "sandbox enable failed");
@@ -1069,10 +1112,10 @@ static void child_finalize(struct sandbox_config *cfg,
 }
 
 /* ------------------------------------------------------------------ */
-static void run_child(struct sandbox_config *cfg, pid_t my_pid)
+static void run_child(struct sandbox_config *cfg)
 {
 	child_setup_stdio();
-	child_setup_network(cfg, my_pid);
+	child_setup_network(cfg);
 
 	int landlock_fd;
 	struct sock_fprog seccomp_prog;
@@ -1122,9 +1165,9 @@ int main(int argc, char **argv)
 	 *   net   — 网络隔离 (默认完全空 netns, 有 --domain/--cidr 时才配置 veth)
 	 *   user  — 非 root 时自动创建 (parent 写 uid_map) */
 	/* 创建三路 pipe: parent 控制 child 的 stdio */
-	pipe2(child_stdin,  O_CLOEXEC);
-	pipe2(child_stdout, O_CLOEXEC);
-	pipe2(child_stderr, O_CLOEXEC);
+	(void)pipe2(child_stdin,  O_CLOEXEC);
+	(void)pipe2(child_stdout, O_CLOEXEC);
+	(void)pipe2(child_stderr, O_CLOEXEC);
 	int clone_flags = SIGCHLD | CLONE_NEWNS | CLONE_NEWPID |
 			  CLONE_NEWIPC | CLONE_NEWUTS;
 	/* isolate / whitelist 隔离网络; --share-net 复用宿主网络 */
@@ -1132,8 +1175,6 @@ int main(int argc, char **argv)
 		clone_flags |= CLONE_NEWNET;
 	if (getuid() != 0)
 		clone_flags |= CLONE_NEWUSER;
-
-	pid_t my_pid = getpid();
 
 	pid_t child_pid = raw_clone_wrapper(clone_flags);
 	if (child_pid < 0) {
@@ -1144,7 +1185,7 @@ int main(int argc, char **argv)
 	if (child_pid > 0)
 		run_parent(child_pid, &cfg);
 	else
-		run_child(&cfg, my_pid);
+		run_child(&cfg);
 
 	return EXIT_TOOL_FAIL; /* unreached */
 }

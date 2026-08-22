@@ -1,19 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox_dev.h
  *
  * UAPI protocol header for /dev/dyn-sandbox
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+
  */
 #ifndef _SANDBOX_DEV_H
 #define _SANDBOX_DEV_H
@@ -68,11 +60,6 @@ struct sandbox_dns_port {
 struct sandbox_net_create {
 	/* input fields */
 	__u32 flags;
-#define SANDBOX_NET_F_NO_VETH  1   /* isolated mode, no network */
-
-	char  veth_host[SANDBOX_IFNAME_SZ];
-	char  veth_child[SANDBOX_IFNAME_SZ];
-
 	char  domains[SANDBOX_MAX_DOMAINS][SANDBOX_DOMAIN_MAX_LEN];
 	int   ndomains;
 	struct sandbox_cidr cidrs[SANDBOX_MAX_CIDRS];
@@ -80,6 +67,8 @@ struct sandbox_net_create {
 
 	/* output fields */
 	int   env_id;
+	char  veth_host[SANDBOX_IFNAME_SZ];   /* kernel-generated */
+	char  veth_child[SANDBOX_IFNAME_SZ];  /* kernel-generated */
 	__u32 host_ip;       /* host-side veth IP */
 	__u32 child_ip;      /* child-side veth IP */
 	__u32 gateway;

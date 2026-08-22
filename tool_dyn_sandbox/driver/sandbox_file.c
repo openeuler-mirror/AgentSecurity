@@ -1,35 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sandbox_file.c
  *
  * File runtime authorization via kretprobes
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+
  */
 
 /*
  * KERNEL VERSION DEPENDENCIES:
- *
- * All 13 kretprobes in kprobes[] (line 552) depend on symbol names of
- * internal kernel functions.  Most are static (do_sys_openat2, do_mknodat,
- * hook_file_open, hook_file_truncate, all hook_path_*), so their symbols
- * are only present in kallsyms when CONFIG_KALLSYMS_ALL=y.
- *
- * See the kprobes[] array for the exact symbol list.
+ * All kretprobes in kprobes[] hook internal (mostly static) kernel functions,
+ * whose symbols are only in kallsyms when CONFIG_KALLSYMS_ALL=y.
  */
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
 #include <linux/atomic.h>
@@ -40,6 +28,7 @@
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #include <asm/syscall.h>
 #include <uapi/linux/landlock.h>
 
@@ -56,20 +45,13 @@ static LIST_HEAD(inst_list);
 static DEFINE_SPINLOCK(inst_lock);
 
 /**
- * inst_find_by_pidns - Lookup sandbox_instance by pid namespace
- * @pid: PID of the blocked task (for debug / future use)
- * @pid_ns: pid namespace of the blocked task
- *
- * Called from kretprobe handlers to find the sandbox instance for the
- * current process.  Fork children inherit the parent's pid namespace,
- * so matching by pid_ns instead of PID supports arbitrary-depth fork.
- *
- * Two-phase lookup:
- *   Phase 1 — direct ns match (common case: fork shares parent's pid_ns)
- *   Phase 2 — walk pid_ns->parent chain (nested pid namespaces)
+ * inst_find_by_pidns - Find the sandbox instance for a blocked task.
+ * Fork children inherit the parent's pid namespace, so matching by pid_ns
+ * (instead of PID) supports arbitrary-depth fork: direct ns match first, then
+ * walk the pid_ns->parent chain for nested namespaces (CLONE_NEWPID).
  *
  * Context: any (kretprobe handler, may be atomic)
- * Return: pointer to sandbox_instance, or NULL if not found.
+ * Return: instance with an extra kref taken (caller must kref_put), or NULL.
  */
 static struct sandbox_instance *inst_find_by_pidns(pid_t pid,
 						   const struct pid_namespace *pid_ns)
@@ -85,6 +67,7 @@ static struct sandbox_instance *inst_find_by_pidns(pid_t pid,
 	/* Phase 1: direct ns match — fork children share parent's pid_ns */
 	list_for_each_entry(inst, &inst_list, list_node)
 		if (inst->sandbox_pid_ns && pid_ns == inst->sandbox_pid_ns) {
+			kref_get(&inst->ref); /* caller owns a ref until it kref_put's */
 			spin_unlock_irqrestore(&inst_lock, flags);
 			return inst;
 		}
@@ -95,6 +78,7 @@ static struct sandbox_instance *inst_find_by_pidns(pid_t pid,
 		while (ns && ns->level > 0) {
 			list_for_each_entry(inst, &inst_list, list_node)
 				if (inst->sandbox_pid_ns && ns == inst->sandbox_pid_ns) {
+					kref_get(&inst->ref); /* caller owns a ref until it kref_put's */
 					spin_unlock_irqrestore(&inst_lock, flags);
 					return inst;
 				}
@@ -112,26 +96,33 @@ static struct sandbox_instance *inst_find_by_pidns(pid_t pid,
 
 struct probe_data {
 	enum op_type type;
-	/* ABI-neutral syscall arguments (saved in entry, parsed in ret handler) */
-	unsigned long fname_ptr;
-	unsigned long aux_arg;
-	/* hook_file_open fields */
-	u64 open_flags;
-	bool is_dir;
+	/* Object the LSM hook denied on (snapshot at entry; ref taken on -EACCES) */
+	enum blocked_cap_kind cap_kind;
+	struct path  cap_path;
+	struct file *cap_file;
+	/* hook_file_open / hook_path_mknod aux (captured by the hook entry handler) */
+	u64    open_flags;
+	bool   is_dir;
+	umode_t mode;
 	/* hook_file_truncate field */
 	struct file *file;
 };
 
 /*
- * Per-task Landlock handoff state, indexed by pid.  Replaces the shared
- * inst->state.ll_denied / is_dir fields: each sandbox child mutates only its
- * own entry, so concurrent children never clobber each other.
+ * Per-task Landlock handoff state, indexed by pid: each sandbox child mutates
+ * only its own entry, so concurrent children never clobber each other.
  */
 struct blocked_state {
 	struct list_head node;
 	pid_t  pid;
 	bool   landlocked;   /* this task's syscall was denied by Landlock */
 	bool   is_dir;       /* denied open target is a directory (hook_file_open only) */
+	/* Object the sensor hook denied on, held between hook ret and syscall ret */
+	u64    open_flags;
+	umode_t mode;
+	enum blocked_cap_kind cap_kind;
+	struct path  cap_path;
+	struct file *cap_file;
 };
 
 /*
@@ -144,7 +135,8 @@ struct blocked_state {
  * its own task (sensor set and executor consume run in the same syscall
  * stack), and distinct tasks have distinct pids.
  *
- * Return: pointer to blocked_state, or NULL on allocation failure.
+ * Return: pointer to blocked_state, or NULL on allocation failure.  Valid only
+ * while the caller holds an inst reference (see struct comment above).
  */
 static struct blocked_state *get_thread_state(struct sandbox_instance *inst, pid_t pid)
 {
@@ -168,122 +160,101 @@ static struct blocked_state *get_thread_state(struct sandbox_instance *inst, pid
 }
 
 /**
- * entry_handler_syscall - Set type for a kretprobe entry
- * @ri:  kretprobe instance
- * @regs: CPU registers at function entry
- * @type: op_type for this syscall
+ * entry_handler_probe_data_reset - Reset the reused probe_data at a kretprobe entry
+ * @type: op_type for this probe
  *
- * Called at the end of each entry handler wrapper. The probe_name is obtained
- * from get_kretprobe(ri)->kp.symbol_name in the ret handler, so there's no
- * need to pass it through here.
+ * ri->data is kmalloc'd (not kzalloc'd) and reused, so each probe invocation
+ * resets the cap slots before the object is (re)captured.  Shared by the
+ * syscall-level wrappers (entry_handler_open & co.) and the self-contained
+ * hook_file_truncate probe.
  *
  * Return: 0 (always)
  */
-static int entry_handler_syscall(struct kretprobe_instance *ri, struct pt_regs *regs,
+static int entry_handler_probe_data_reset(struct kretprobe_instance *ri, struct pt_regs *regs,
 				 enum op_type type)
 {
 	struct probe_data *data = (struct probe_data *)ri->data;
 
 	data->type = type;
+	data->cap_kind = BLOCKED_CAP_NONE;
+	data->cap_file = NULL;
+	data->mode = 0;
 	return 0;
 }
 
+/*
+ * Syscall entry handlers only tag the op type; the object is captured from
+ * the LSM hook (child's context) and reaches the entry via blocked_state.
+ */
 static int entry_handler_open(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-
-	data->fname_ptr = func_arg_n(regs, 1);	/* filename (char __user *) */
-	data->aux_arg   = func_arg_n(regs, 2);	/* open_how */
-	
-	if (trace_all)
-		pr_info("dyn-sandbox: ENTRY [do_sys_openat2] fname_ptr=0x%lx aux=0x%lx\n",
-			data->fname_ptr, data->aux_arg);
-	return entry_handler_syscall(ri, regs, OP_OPEN);
+	return entry_handler_probe_data_reset(ri, regs, OP_OPEN);
 }
 
 static int entry_handler_unlink(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-	struct filename *fname = (struct filename *)func_arg_n(regs, 1);
-
-	data->fname_ptr = !IS_ERR_OR_NULL(fname) ? (unsigned long)fname->name : 0;
-	return entry_handler_syscall(ri, regs, OP_UNLINK);
+	return entry_handler_probe_data_reset(ri, regs, OP_UNLINK);
 }
 
 static int entry_handler_rmdir(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-	struct filename *fname = (struct filename *)func_arg_n(regs, 1);
-
-	data->fname_ptr = !IS_ERR_OR_NULL(fname) ? (unsigned long)fname->name : 0;
-	return entry_handler_syscall(ri, regs, OP_RMDIR);
+	return entry_handler_probe_data_reset(ri, regs, OP_RMDIR);
 }
 
 static int entry_handler_mkdir(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-	struct filename *fname = (struct filename *)func_arg_n(regs, 1);
-
-	data->fname_ptr = !IS_ERR_OR_NULL(fname) ? (unsigned long)fname->name : 0;
-	return entry_handler_syscall(ri, regs, OP_MKDIR);
+	return entry_handler_probe_data_reset(ri, regs, OP_MKDIR);
 }
 
 static int entry_handler_mknod(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-	struct filename *fname = (struct filename *)func_arg_n(regs, 1);
-
-	data->aux_arg   = func_arg_n(regs, 2);	/* mode */
-	data->fname_ptr = !IS_ERR_OR_NULL(fname) ? (unsigned long)fname->name : 0;
-	return entry_handler_syscall(ri, regs, OP_MKNOD);
+	return entry_handler_probe_data_reset(ri, regs, OP_MKNOD);
 }
 
 static int entry_handler_truncate(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct probe_data *data = (struct probe_data *)ri->data;
-
-	data->fname_ptr = func_arg_n(regs, 0);	/* const char __user *pathname */
-	return entry_handler_syscall(ri, regs, OP_TRUNCATE);
+	return entry_handler_probe_data_reset(ri, regs, OP_TRUNCATE);
 }
 
 /*
- * entry_handler_hook_file_truncate — Entry handler for hook_file_truncate LSM hook
- *
- * Captures the struct file pointer for path extraction in the ret handler.
- * hook_file_truncate is called from security_file_truncate() which is invoked
- * by do_sys_ftruncate() (the ftruncate(fd) syscall path). This is the only
- * kprobe covering ftruncate — we do all work in one LSM-level kprobe instead
- * of adding a separate do_sys_ftruncate syscall kprobe.
+ * entry_handler_hook_file_truncate — Entry handler for hook_file_truncate.
+ * The only kprobe covering ftruncate: it works at the LSM level instead of a
+ * separate do_sys_ftruncate syscall probe.
  */
 static int entry_handler_hook_file_truncate(struct kretprobe_instance *ri,
 					    struct pt_regs *regs)
 {
 	struct probe_data *data = (struct probe_data *)ri->data;
+	struct file *file = (struct file *)func_arg_n(regs, 0);
 
-	data->file = (struct file *)func_arg_n(regs, 0);
-	return entry_handler_syscall(ri, regs, OP_FTRUNCATE);
+	entry_handler_probe_data_reset(ri, regs, OP_FTRUNCATE);
+
+	data->file = file;
+	if (file) {
+		data->cap_path = file->f_path;
+		data->cap_kind = BLOCKED_CAP_PATH;
+	}
+	return 0;
 }
 
-static void extract_parent_dir(char *path)
+/*
+ * entry_handler_hook_path - Shared entry handler for the hook_path_* LSM probes.
+ * Snapshots the denied object (hook arg0).  Value copy only — the ret
+ * handler takes the reference on -EACCES.  arg2 is the mode for mkdir/mknod.
+ */
+static int entry_handler_hook_path(struct kretprobe_instance *ri,
+				   struct pt_regs *regs)
 {
-	char *slash;
-	size_t len;
+	struct probe_data *data = (struct probe_data *)ri->data;
+	struct path *p = (struct path *)func_arg_n(regs, 0);
 
-	if (!path || !*path)
-		return;
-
-	len = strlen(path);
-	while (len > 1 && path[len - 1] == '/')
-		path[--len] = '\0';
-
-	slash = strrchr(path, '/');
-	if (!slash) {
-		strcpy(path, ".");
-	} else if (slash == path) {
-		path[1] = '\0';
-	} else {
-		*slash = '\0';
+	data->cap_kind = BLOCKED_CAP_NONE;
+	if (p) {
+		data->cap_path = *p;
+		data->cap_kind = BLOCKED_CAP_PATH;
 	}
+	data->mode = (umode_t)func_arg_n(regs, 2);	/* mknod/mkdir mode */
+	return 0;
 }
 
 /**
@@ -298,6 +269,14 @@ static u16 derive_request_access(struct probe_data *data)
 
 	switch (data->type) {
 	case OP_OPEN:
+		if (data->cap_kind == BLOCKED_CAP_PATH) {
+			/* O_CREAT create: Landlock denies in hook_path_mknod (parent
+			 * dir MAKE_REG).  That probe carries the parent dir as cap_path
+			 * and sets no open_flags, so derive from the create semantics,
+			 * not the (unset) open flags. */
+			acc = LANDLOCK_ACCESS_FS_MAKE_REG;
+			break;
+		}
 		switch (data->open_flags & O_ACCMODE) {
 		case O_RDONLY:
 			acc = data->is_dir ? LANDLOCK_ACCESS_FS_READ_DIR :
@@ -330,7 +309,7 @@ static u16 derive_request_access(struct probe_data *data)
 		break;
 
 	case OP_MKNOD:
-		if (S_ISREG((umode_t)data->aux_arg) || (umode_t)data->aux_arg == 0)
+		if (S_ISREG(data->mode) || data->mode == 0)
 			acc = LANDLOCK_ACCESS_FS_MAKE_REG;
 		break;
 
@@ -342,18 +321,9 @@ static u16 derive_request_access(struct probe_data *data)
 	return acc;
 }
 
-
-
-
 /**
- * entry_handler_hook_file_open - Entry handler for hook_file_open
- * @ri:  kretprobe instance
- * @regs: CPU registers at function entry
- *
- * Captures the file flags and directory status for accurate access
- * calculation when this LSM hook denies a file open.
- *
- * Return: 0 (always)
+ * entry_handler_hook_file_open - Entry handler for hook_file_open.
+ * Captures the flags/dir status and snapshots the file (object) for DECISION.
  */
 static int entry_handler_hook_file_open(struct kretprobe_instance *ri,
 					struct pt_regs *regs)
@@ -361,28 +331,26 @@ static int entry_handler_hook_file_open(struct kretprobe_instance *ri,
 	struct probe_data *data = (struct probe_data *)ri->data;
 	struct file *file = (struct file *)func_arg_n(regs, 0);
 
+	data->cap_kind = BLOCKED_CAP_NONE;
 	if (!IS_ERR_OR_NULL(file)) {
 		data->open_flags = file->f_flags;
 		data->is_dir = d_is_dir(file->f_path.dentry);
+		data->cap_file = file;
+		data->cap_kind = BLOCKED_CAP_FILE;
 	}
 	return 0;
 }
 
 /**
- * ret_handler_hook_path - Common sensor: detect Landlock denials from any
- *                         hook_path_* LSM hook
- * @ri:  kretprobe instance
- * @regs: CPU registers at function return
- *
- * Marks the current task's per-task blocked_state so the corresponding
- * syscall ret_handler knows the -EACCES came from Landlock.  For
- * hook_file_open, also captures is_dir for accurate access calculation.
- *
- * Return: 0 (always)
+ * ret_handler_hook_path - Common sensor for the hook_path_* LSM probes.
+ * On -EACCES, marks the per-task blocked_state so the syscall ret handler
+ * knows the denial came from Landlock; for hook_file_open also captures
+ * is_dir/open_flags.
  */
 static int ret_handler_hook_path(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	long ret = (int)regs_return_value(regs);
+	struct probe_data *data = (struct probe_data *)ri->data;
 
 	if (ret == -EACCES) {
 		struct sandbox_instance *inst = inst_find_by_pidns(current->pid, task_active_pid_ns(current));
@@ -393,10 +361,27 @@ static int ret_handler_hook_path(struct kretprobe_instance *ri, struct pt_regs *
 			if (st) {
 				st->landlocked = true;
 				if (strcmp(name, "hook_file_open") == 0) {
-					struct probe_data *data = (struct probe_data *)ri->data;
 					st->is_dir = data->is_dir;
+					st->open_flags = data->open_flags;
 				}
+				if (strcmp(name, "hook_path_mknod") == 0)
+					st->mode = data->mode;
+				/* Take the reference only on denial (the object is still
+				 * live here: the trampoline runs before the caller's error
+				 * cleanup).  For BLOCKED_CAP_FILE, hold cap_path separately
+				 * because do_dentry_open() zeroes f->f_path on -EACCES. */
+				st->cap_kind = data->cap_kind;
+				if (data->cap_kind == BLOCKED_CAP_PATH) {
+					path_get(&data->cap_path);
+					st->cap_path = data->cap_path;
+				} else if (data->cap_kind == BLOCKED_CAP_FILE) {
+					st->cap_file = get_file(data->cap_file);
+					st->cap_path = data->cap_file->f_path;
+					path_get(&st->cap_path);
+				}
+				data->cap_kind = BLOCKED_CAP_NONE;
 			}
+			kref_put(&inst->ref, inst_release);
 		}
 	}
 
@@ -457,98 +442,116 @@ static void log_blocked_access(struct kretprobe_instance *ri,
  * Return: 0 (always)
  */
 /**
- * build_entry - Allocate and fill a blocked_entry from probe data
- * @data: probe_data captured by the entry handler
+ * fill_entry_paths - Fill user-facing paths from an object: blocked_file is the
+ * last d_path component (works for mount roots, whose dentry name is "/");
+ * blocked_resolved is the full d_path() string.  d_path() does not sleep
+ * (rename_lock seqcount-guarded), safe in kprobe ret context.  Display-only:
+ * grants act on the captured object, never on these strings.
+ */
+static void fill_entry_paths(const struct path *p, struct blocked_entry *entry)
+{
+	char buf[SANDBOX_PATH_MAX];
+	char *path;
+	const char *slash;
+
+	if (!p)
+		return;
+	path = d_path(p, buf, sizeof(buf));
+	if (IS_ERR(path))
+		return;
+	memmove(buf, path, strlen(path) + 1);
+	strncpy(entry->blocked_resolved, buf, sizeof(entry->blocked_resolved) - 1);
+	slash = strrchr(buf, '/');
+	strscpy(entry->blocked_file, slash && slash[1] ? slash + 1 : "/",
+		sizeof(entry->blocked_file));
+}
+
+/**
+ * release_entry_caps - Release every owned object held by an entry
+ * @entry: blocked_entry whose owned refs to drop (not freed here)
  *
- * Parses the path, derives the Landlock access mask, extracts parent
- * directory, and resolves the absolute path via kern_path.
- *
- * Return: pointer to blocked_entry, or NULL on allocation failure.
+ * Process context only: path_put may sleep (dput -> dentry_kill).  The drain
+ * (inst_release, possibly atomic) must NOT call this inline — it defers whole
+ * entries to the sb_defer worker instead.
+ */
+static void release_entry_caps(struct blocked_entry *entry)
+{
+	if (entry->blocked_file_ptr) {
+		fput(entry->blocked_file_ptr);
+		entry->blocked_file_ptr = NULL;
+	}
+	if (entry->cap_kind == BLOCKED_CAP_PATH) {
+		path_put(&entry->cap_path);
+		entry->cap_kind = BLOCKED_CAP_NONE;
+	} else if (entry->cap_kind == BLOCKED_CAP_FILE) {
+		fput(entry->cap_file);
+		entry->cap_file = NULL;
+		path_put(&entry->cap_path);
+		entry->cap_kind = BLOCKED_CAP_NONE;
+	}
+}
+
+/**
+ * build_entry - Allocate and fill a blocked_entry from probe data.
+ * The entry takes ownership of the object the LSM hook denied on.
+ * Return: entry, or NULL when there is nothing to grant on (allocation
+ *         failure or no captured object).
  */
 static struct blocked_entry *build_entry(struct probe_data *data)
 {
 	struct blocked_entry *entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
 	if (!entry)
-		/* Low memory: skip dynamic auth, Landlock -EACCES
-		 * propagates as a hard deny.  Safe fallback.
-		 */
+		/* Low memory: -EACCES propagates as a hard deny. */
 		return NULL;
 
 	entry->pid = current->pid;
 	entry->type = data->type;
 
-	/* Parse path and auxiliary args from saved registers */
-	switch (data->type) {
-	case OP_FTRUNCATE:
-		if (data->file) {
-			char buf[SANDBOX_PATH_MAX];
-			char *path = d_path(&data->file->f_path, buf, sizeof(buf));
-			if (!IS_ERR(path)) {
-				memmove(buf, path, strlen(path) + 1);
-				strncpy(entry->blocked_file, buf,
-					sizeof(entry->blocked_file) - 1);
-				/* Set resolved path directly from d_path */
-				strncpy(entry->blocked_resolved, buf,
-					sizeof(entry->blocked_resolved) - 1);
-			}
-		}
-		entry->blocked_file_ptr = data->file;
-		break;
-	case OP_OPEN:
-		if (data->fname_ptr)
-			strncpy_from_user(entry->blocked_file,
-				(const char __user *)data->fname_ptr,
-				 sizeof(entry->blocked_file) - 1);
-		if (data->aux_arg)
-			data->open_flags = ((struct open_how *)data->aux_arg)->flags;
-		break;
-	case OP_TRUNCATE:
-		if (data->fname_ptr)
-			strncpy_from_user(entry->blocked_file,
-				(const char __user *)data->fname_ptr,
-				 sizeof(entry->blocked_file) - 1);
-		break;
-	case OP_UNLINK:
-	case OP_RMDIR:
-	case OP_MKDIR:
-	case OP_MKNOD:
-		if (data->fname_ptr)
-			strncpy(entry->blocked_file, (const char *)data->fname_ptr,
-				sizeof(entry->blocked_file) - 1);
-		break;
-	default:
-		break;
-	}
+	entry->cap_kind = data->cap_kind;
+	entry->cap_path = data->cap_path;
+	entry->cap_file = data->cap_file;
+	entry->open_flags = data->open_flags;
 
 	entry->request_access = derive_request_access(data);
 
-	/* Parent dir extraction -- not needed for FTRUNCATE */
+	/* Display strings from the owned object (grant never uses these). */
 	switch (data->type) {
-	case OP_OPEN:
-		if (data->open_flags & O_CREAT)
-			extract_parent_dir(entry->blocked_file);
+	case OP_FTRUNCATE:
+		if (entry->cap_kind == BLOCKED_CAP_PATH)
+			fill_entry_paths(&entry->cap_path, entry);
+		else if (data->file)
+			fill_entry_paths(&data->file->f_path, entry);
+
+		if (data->file)
+			/* Own a file ref so the cached allowed_access grant in
+			 * DECISION survives a child killed before it. */
+			entry->blocked_file_ptr = get_file(data->file);
 		break;
+	case OP_OPEN:
+		/* BLOCKED_CAP_FILE: open denied (cap_file->f_path zeroed by
+		 * do_dentry_open's cleanup_all, so cap_path holds the ref).
+		 * BLOCKED_CAP_PATH: O_CREAT denied in hook_path_mknod (parent dir). */
+		if (entry->cap_kind == BLOCKED_CAP_FILE ||
+		    entry->cap_kind == BLOCKED_CAP_PATH)
+			fill_entry_paths(&entry->cap_path, entry);
+		break;
+	case OP_TRUNCATE:
 	case OP_UNLINK:
 	case OP_RMDIR:
 	case OP_MKDIR:
 	case OP_MKNOD:
-		extract_parent_dir(entry->blocked_file);
+		if (entry->cap_kind == BLOCKED_CAP_PATH)
+			fill_entry_paths(&entry->cap_path, entry);
 		break;
 	default:
 		break;
 	}
 
-	/* kern_path resolution -- skipped for FTRUNCATE (already resolved via d_path) */
-	if (data->type != OP_FTRUNCATE && entry->blocked_file[0])
-		kern_path(entry->blocked_file, LOOKUP_FOLLOW,
-			  &entry->blocked_path);
-
-	if (entry->blocked_path.dentry) {
-		char tmp[SANDBOX_PATH_MAX];
-		char *abs = d_path(&entry->blocked_path, tmp, sizeof(tmp));
-		if (!IS_ERR(abs))
-			strncpy(entry->blocked_resolved, abs,
-				sizeof(entry->blocked_resolved) - 1);
+	/* No object -> nothing to grant on; drop so -EACCES propagates as a hard
+	 * deny.  FTRUNCATE is exempt: its grant is file-based (blocked_file_ptr). */
+	if (entry->cap_kind == BLOCKED_CAP_NONE && data->type != OP_FTRUNCATE) {
+		kfree(entry);
+		return NULL;
 	}
 
 	return entry;
@@ -558,33 +561,58 @@ static int ret_handler_blocked_common(struct kretprobe_instance *ri, struct pt_r
 {
 	struct probe_data *data = (struct probe_data *)ri->data;
 	long ret = (int)(long)regs_return_value(regs);
-	struct sandbox_instance *inst = inst_find_by_pidns(current->pid, task_active_pid_ns(current));
+	struct sandbox_instance *inst;
 	unsigned long flags;
 
 	if (ret != -EACCES)
 		return 0;
 
+	inst = inst_find_by_pidns(current->pid, task_active_pid_ns(current));
 	if (!inst)
 		return 0;
 
 	/*
-	 * OP_FTRUNCATE comes from hook_file_truncate, which is itself a Landlock
-	 * LSM hook.  For all other ops, only act on -EACCES that the sensor
-	 * confirmed as Landlock; consume the per-task state either way.
+	 * OP_FTRUNCATE comes from hook_file_truncate, itself a Landlock LSM hook;
+	 * for all other ops only act on -EACCES the sensor confirmed as Landlock.
 	 */
 	if (data->type != OP_FTRUNCATE) {
 		struct blocked_state *st = get_thread_state(inst, current->pid);
-		if (!st || !st->landlocked)
+		if (!st || !st->landlocked) {
+			kref_put(&inst->ref, inst_release);
 			return 0;
-		data->is_dir = st->is_dir;   /* consumed by build_entry below */
+		}
+		/* Move the sensor's object into probe_data (build_entry takes
+		 * ownership); st is fully consumed so a stale entry cannot
+		 * double-release the object. */
+		data->is_dir = st->is_dir;
+		data->open_flags = st->open_flags;
+		data->mode = st->mode;
+		data->cap_kind = st->cap_kind;
+		data->cap_path = st->cap_path;
+		data->cap_file = st->cap_file;
+		st->cap_kind = BLOCKED_CAP_NONE;
 		st->landlocked = false;
+	} else if (data->cap_kind == BLOCKED_CAP_PATH) {
+		/* hook_file_truncate denied: snapshot is still live here (trampoline
+		 * runs before do_dentry_open's cleanup_all zeroes f->f_path). */
+		path_get(&data->cap_path);
 	}
 
 	struct blocked_entry *entry = build_entry(data);
-	if (!entry)
+	if (!entry) {
+		/* build_entry took no ownership: release what we pulled from st. */
+		if (data->cap_kind == BLOCKED_CAP_PATH)
+			path_put(&data->cap_path);
+		else if (data->cap_kind == BLOCKED_CAP_FILE) {
+			fput(data->cap_file);
+			path_put(&data->cap_path);
+		}
+		data->cap_kind = BLOCKED_CAP_NONE;
+		kref_put(&inst->ref, inst_release);
 		return 0;
+	}
 
-	log_blocked_access(ri, data, entry->blocked_file);
+	log_blocked_access(ri, data, entry->blocked_resolved);
 
 	spin_lock_irqsave(&inst->state.blocked_lock, flags);
 	list_add_tail(&entry->list_node, &inst->state.blocked_list);
@@ -595,11 +623,12 @@ static int ret_handler_blocked_common(struct kretprobe_instance *ri, struct pt_r
 	send_sig(SIGSTOP, current, 0);
 	regs_set_return_value(regs, -ERESTARTNOINTR);
 
+	kref_put(&inst->ref, inst_release);
 	return 0;
 }
 
 /*
- * Kernel symbol version isolation (B1):
+ * Kernel symbol version isolation:
  *  - kernel >= 7.0: fs/namei.c do_* series renamed to filename_* (Al Viro, 2026),
  *    symbol name only; signature unchanged (int dfd, struct filename *name, ...).
  *  - openEuler 6.6 / kernel < 7.0: still do_*.
@@ -667,24 +696,36 @@ static struct kretprobe kprobes[] = {
 		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_file_open",
 	},
+	/* Every hook_path_* probe needs data_size + entry handler — the entry
+	 * handler snapshots arg0; the ret handler references it on -EACCES only. */
 	{
 		.handler	 = ret_handler_hook_path,
+		.entry_handler	 = entry_handler_hook_path,
+		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_path_mknod",
 	},
 	{
 		.handler	 = ret_handler_hook_path,
+		.entry_handler	 = entry_handler_hook_path,
+		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_path_mkdir",
 	},
 	{
 		.handler	 = ret_handler_hook_path,
+		.entry_handler	 = entry_handler_hook_path,
+		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_path_unlink",
 	},
 	{
 		.handler	 = ret_handler_hook_path,
+		.entry_handler	 = entry_handler_hook_path,
+		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_path_rmdir",
 	},
 	{
 		.handler	 = ret_handler_hook_path,
+		.entry_handler	 = entry_handler_hook_path,
+		.data_size	 = sizeof(struct probe_data),
 		.kp.symbol_name	 = "hook_path_truncate",
 	}
 };
@@ -757,7 +798,10 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
 		return -EINVAL;
 	}
 
+	spin_lock_irqsave(&task->sighand->siglock, flags);
 	task->signal->flags &= ~SIGNAL_UNKILLABLE;
+	spin_unlock_irqrestore(&task->sighand->siglock, flags);
+
 	inst->sandbox_pid_ns = task_active_pid_ns(task);
 	put_task_struct(task);
 	pr_info("dyn-sandbox: SET_PID %d -> pid=%d\n",
@@ -773,7 +817,8 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
  * Copies the blocked filename and resolved absolute path from the instance
  * to userspace after a kretprobe handler has SIGSTOP'd the child.
  *
- * Return: 0 on success, -EBADFD if inst is NULL, -EFAULT on copy_to_user failure
+ * Return: 0 on success, -EBADFD if inst is NULL, -ENOENT if blocked_list is
+ *         empty (spurious wake / already consumed), -EFAULT on copy_to_user failure
  */
 int sandbox_file_handle_get_blocked(struct sandbox_instance *inst, void __user *uarg)
 {
@@ -796,36 +841,49 @@ int sandbox_file_handle_get_blocked(struct sandbox_instance *inst, void __user *
 	}
 	spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
 
+	if (!entry)
+		return -ENOENT;
+
 	if (copy_to_user(uarg, &info, sizeof(info)))
 		return -EFAULT;
 	return 0;
 }
 
+/*
+ * entry_grant_path - Landlock grant target from an entry's object.
+ * BLOCKED_CAP_PATH: the parent dir or file; BLOCKED_CAP_FILE: the file, or for
+ * O_CREAT the parent dir (the file inode may be recreated on restart; a rule on
+ * the parent covers it, since Landlock is inode-keyed + hierarchical).
+ */
+static bool entry_grant_path(const struct blocked_entry *entry, struct path *out)
+{
+	if (entry->cap_kind == BLOCKED_CAP_PATH) {
+		*out = entry->cap_path;
+		return true;
+	}
+	if (entry->cap_kind == BLOCKED_CAP_FILE && entry->cap_path.dentry) {
+		if (entry->type == OP_OPEN && (entry->open_flags & O_CREAT)) {
+			/* cap_path holds a ref on its dentry, so d_parent is stable
+			 * (reparenting only happens under a live-dentry rename). */
+			out->mnt = entry->cap_path.mnt;
+			out->dentry = entry->cap_path.dentry->d_parent;
+		} else {
+			*out = entry->cap_path;
+		}
+		return true;
+	}
+	return false;
+}
+
 /**
  * sandbox_file_handle_decision - SANDBOX_FILE_DECISION ioctl handler
- * @inst: sandbox instance (may be NULL)
- * @uarg: userspace pointer to struct sandbox_file_decision
  *
- * Refuses at the entry when Landlock runtime auth is not active: blocked
- * events only exist while the kretprobes are registered, and the ALLOW path
- * derefs cred->security + sandbox_lbs_cred which is only safe once the
- * Landlock blobs were allocated.  When not ready the blocked list is
- * necessarily empty, so no SIGSTOP'd child is left hanging.
- *
- * On DECISION_ALLOW: dynamically inserts a Landlock rule for the blocked
- * path via sandbox_landlock_allow_path(), then sends SIGCONT to the child.
- * If the grant fails (e.g. -ENOMEM/-EAGAIN/-ENOENT), the decision is
- * degraded to DENY — the child's return value is forced to -EACCES so it
- * does not restart with -ERESTARTNOINTR and re-block forever — and the
- * failure errno is returned to the daemon.
- * On DECISION_DENY: sets decision state to DENY and sends SIGCONT.
- * On unknown decision: returns -EINVAL.
- *
- * Return: 0 on success, -EBADFD if inst is NULL, -EFAULT on copy_from_user
- *         failure, -EOPNOTSUPP if Landlock runtime auth is not active,
- *         -ENOENT if the blocked list is empty, -EINVAL on unknown decision,
- *         otherwise the sandbox_landlock_allow_path() errno on a failed grant
- *         (child still SIGCONT'd, but as a DENY)
+ * ALLOW: inserts a Landlock rule for the denied object (cap_path/cap_file),
+ * then SIGCONT the child.  A failed grant degrades to DENY: the child returns
+ * -EACCES instead of restarting with -ERESTARTNOINTR and re-blocking forever.
+ * DENY: sets decision state and SIGCONT.  Refuses with -EOPNOTSUPP when
+ * Landlock runtime auth is not active (the blocked list is necessarily empty,
+ * so no SIGSTOP'd child is left hanging).
  */
 int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uarg)
 {
@@ -863,9 +921,8 @@ int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uar
 	child = get_pid_task(pid, PIDTYPE_PID);
 	put_pid(pid);
 	if (!child) {
-		/* Task already exited — discard entry */
-		if (entry->blocked_path.dentry)
-			path_put(&entry->blocked_path);
+		/* Task already exited — discard entry (drop owned objects first) */
+		release_entry_caps(entry);
 		kfree(entry);
 		return -ESRCH;
 	}
@@ -873,36 +930,47 @@ int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uar
 	if (d.decision == DECISION_ALLOW) {
 		atomic_set(&inst->state.decision, DECISION_ALLOW);
 
-		/* path-based allow (for kprobes that captured dentry) */
-		if (entry->blocked_path.dentry) {
-			const struct cred *cred;
-			void *dom;
+		/* Object-based grant: no path resolution, so namespace-local
+		 * mounts (tmpfs /mnt, bind mounts) grant on the child's actual inodes.
+		 * FTRUNCATE with a captured path grants here too: an O_TRUNC denial
+		 * restarts open() and recomputes allowed_access from the ruleset, so
+		 * TRUNCATE must be in the ruleset or the cache grant is lost.  The
+		 * cache grant still runs below for ftruncate(fd) on an open file. */
+		if (entry->type != OP_FTRUNCATE ||
+		    entry->cap_kind == BLOCKED_CAP_PATH) {
+			struct path grant;
+			bool have_grant = entry_grant_path(entry, &grant);
 
-			cred = get_task_cred(child);
-			dom = *(void **)(cred->security
-					 + sandbox_lbs_cred);
-			ret = sandbox_landlock_allow_path(
-				&entry->blocked_path,
-				dom,
-				entry->request_access);
-			put_cred(cred);
+			if (have_grant) {
+				const struct cred *cred;
+				void *dom;
 
-			if (ret) {
-				/* Grant failed (e.g. -ENOMEM/-EAGAIN/-ENOENT):
-				 * degrade to DENY so the child returns -EACCES
-				 * instead of restarting with -ERESTARTNOINTR and
-				 * re-blocking forever.  The errno is propagated
-				 * to the daemon via the ioctl return value. */
-				pr_warn_ratelimited("dyn-sandbox: ALLOW failed (%d), degraded to DENY path=%s\n",
-						    ret, entry->blocked_file);
+				cred = get_task_cred(child);
+				dom = *(void **)(cred->security
+						 + sandbox_lbs_cred);
+				ret = sandbox_landlock_allow_path(
+					&grant, dom, entry->request_access);
+				put_cred(cred);
+
+				if (ret) {
+					/* Grant failed: degrade to DENY so the child returns
+					 * -EACCES instead of re-blocking forever.  Errno is
+					 * propagated to the daemon via the ioctl return. */
+					pr_warn_ratelimited("dyn-sandbox: ALLOW failed (%d), degraded to DENY path=%s\n",
+							    ret, entry->blocked_resolved);
+					regs_set_return_value(task_pt_regs(child), -EACCES);
+				}
+			} else {
+				/* No object to grant on: degrade to DENY. */
+				ret = -ENOENT;
+				pr_warn_ratelimited("dyn-sandbox: ALLOW no grant object, degraded to DENY path=%s\n",
+						    entry->blocked_resolved);
 				regs_set_return_value(task_pt_regs(child), -EACCES);
 			}
 		}
 
-		/* file-based allow (hook_file_truncate: modify cached allowed_access)
-		 * Skip when the path-based grant already degraded to DENY: a
-		 * contradiction would leave TRUNCATE cached in f_security->allowed_access
-		 * even though the child is being denied. */
+		/* File-based allow (hook_file_truncate): set TRUNCATE in the cached
+		 * allowed_access.  Skipped if the path grant degraded to DENY. */
 		if (!ret && entry->type == OP_FTRUNCATE &&
 		    entry->blocked_file_ptr &&
 		    sandbox_lbs_file >= 0) {
@@ -923,41 +991,103 @@ int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uar
 	send_sig(SIGCONT, child, 0);
 	put_task_struct(child);
 
-	/* Free entry outside of any lock */
-	if (entry->blocked_path.dentry)
-		path_put(&entry->blocked_path);
+	/* Drop owned objects (path_put/fput).  Process context — safe to sleep. */
+	release_entry_caps(entry);
 	kfree(entry);
-
-	/* (blocked_list not explicitly emptied here — next dequeue sees empty */
 
 	return ret;
 }
 
-/**
- * sandbox_drain_blocked_entries - Free all pending blocked_entry on a list
- * @list: list_head of blocked_entry queue to drain
- *
- * Iterates the list, releases blocked_path references, and frees each entry.
- * The caller must ensure no concurrent access to the list.
+/*
+ * Deferred-free machinery: inst_release() (possibly atomic kprobe context)
+ * cannot path_put (may sleep), so drained entries/states are freed by this
+ * workqueue worker in process context.  flush_work() in exit guarantees release
+ * before unload.
  */
-static void sandbox_drain_blocked_entries(struct list_head *list)
-{
-	struct blocked_entry *entry, *tmp;
+static DEFINE_SPINLOCK(sb_defer_lock);
+static LIST_HEAD(sb_defer_entries);
+static LIST_HEAD(sb_defer_states);
+static struct work_struct sb_defer_work;
 
-	list_for_each_entry_safe(entry, tmp, list, list_node) {
+static void sb_defer_release(struct work_struct *work)
+{
+	struct blocked_entry *entry, *entry_tmp;
+	struct blocked_state *st, *st_tmp;
+	struct list_head elist, slist;
+	unsigned long flags;
+
+	INIT_LIST_HEAD(&elist);
+	INIT_LIST_HEAD(&slist);
+
+	spin_lock_irqsave(&sb_defer_lock, flags);
+	list_splice_init(&sb_defer_entries, &elist);
+	list_splice_init(&sb_defer_states, &slist);
+	spin_unlock_irqrestore(&sb_defer_lock, flags);
+
+	/* Process context: path_put/fput may sleep here. */
+	list_for_each_entry_safe(entry, entry_tmp, &elist, list_node) {
 		list_del(&entry->list_node);
-		if (entry->blocked_path.dentry)
-			path_put(&entry->blocked_path);
+		release_entry_caps(entry);
 		kfree(entry);
+	}
+	list_for_each_entry_safe(st, st_tmp, &slist, node) {
+		list_del(&st->node);
+		if (st->cap_kind == BLOCKED_CAP_PATH)
+			path_put(&st->cap_path);
+		else if (st->cap_kind == BLOCKED_CAP_FILE) {
+			fput(st->cap_file);
+			path_put(&st->cap_path);
+		}
+		kfree(st);
 	}
 }
 
 /**
- * sandbox_file_release - Release file auth state for an instance
- * @inst: sandbox instance being released
- *
- * Removes the instance from inst_list (so kprobe handlers no longer find it)
- * and releases the blocked_path if one was captured.
+ * sandbox_file_drain_blocks - Splice both blocked lists off the instance and
+ * move everything to the sb_defer worker for release.  Must not sleep: called
+ * from inst_release(), which can run in atomic kprobe context.  Safe because
+ * every list writer holds a transient inst reference, so a zero refcount
+ * implies all list_adds completed.
+ */
+void sandbox_file_drain_blocks(struct sandbox_instance *inst)
+{
+	struct blocked_entry *entry, *entry_tmp;
+	struct blocked_state *st, *st_tmp;
+	struct list_head drain_list, drain_flags;
+	unsigned long flags;
+
+	INIT_LIST_HEAD(&drain_list);
+	INIT_LIST_HEAD(&drain_flags);
+	spin_lock_irqsave(&inst->state.blocked_lock, flags);
+	list_splice_init(&inst->state.blocked_list, &drain_list);
+	list_splice_init(&inst->state.blocked_flag_list, &drain_flags);
+	spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
+
+	list_for_each_entry_safe(entry, entry_tmp, &drain_list, list_node) {
+		list_del(&entry->list_node);
+		spin_lock_irqsave(&sb_defer_lock, flags);
+		list_add_tail(&entry->list_node, &sb_defer_entries);
+		spin_unlock_irqrestore(&sb_defer_lock, flags);
+	}
+	/* Leftover per-task blocked_state (tasks killed before consuming it). */
+	list_for_each_entry_safe(st, st_tmp, &drain_flags, node) {
+		list_del(&st->node);
+		spin_lock_irqsave(&sb_defer_lock, flags);
+		list_add_tail(&st->node, &sb_defer_states);
+		spin_unlock_irqrestore(&sb_defer_lock, flags);
+	}
+
+	/* Schedule under the lock so the empty-check sees anything added here. */
+	spin_lock_irqsave(&sb_defer_lock, flags);
+	if (!list_empty(&sb_defer_entries) || !list_empty(&sb_defer_states))
+		schedule_work(&sb_defer_work);
+	spin_unlock_irqrestore(&sb_defer_lock, flags);
+}
+
+/**
+ * sandbox_file_release - Remove the instance from inst_list and kill the child.
+ * Blocked lists are NOT drained here; inst_release() (atomic-safe) handles them
+ * once the last kprobe handler has dropped its transient reference.
  */
 void sandbox_file_release(struct sandbox_instance *inst)
 {
@@ -971,30 +1101,6 @@ void sandbox_file_release(struct sandbox_instance *inst)
 		list_del(&inst->list_node);
 		spin_unlock_irqrestore(&inst_lock, flags);
 		inst->in_inst_list = false;
-	}
-
-	/* Drain any leftover blocked entries */
-	{
-		struct list_head drain_list;
-
-		INIT_LIST_HEAD(&drain_list);
-		spin_lock_irqsave(&inst->state.blocked_lock, flags);
-		list_splice_init(&inst->state.blocked_list, &drain_list);
-		spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
-		sandbox_drain_blocked_entries(&drain_list);
-	}
-
-	/* Free leftover per-task blocked_state entries (tasks killed before consuming) */
-	{
-		struct blocked_state *st, *tmp;
-		struct list_head drain_flags;
-
-		INIT_LIST_HEAD(&drain_flags);
-		spin_lock_irqsave(&inst->state.blocked_lock, flags);
-		list_splice_init(&inst->state.blocked_flag_list, &drain_flags);
-		spin_unlock_irqrestore(&inst->state.blocked_lock, flags);
-		list_for_each_entry_safe(st, tmp, &drain_flags, node)
-			kfree(st);
 	}
 
 	/* Kill the child process if still alive (e.g., stuck in SIGSTOP) */
@@ -1015,31 +1121,25 @@ void sandbox_file_release(struct sandbox_instance *inst)
 /* ====================================================================== */
 
 /**
- * sandbox_file_init - Enable file runtime authorization per the decision
+ * sandbox_file_init - Enable file runtime authorization per the decision.
  *
- * Whether to enable is decided ONLY by two inputs:
- *   - landlock_enable param: 1 = on (strict), 0 = off, -1 = unset (default).
- *   - landlock_enable unset (-1, default): sandbox_landlock_probe() — enable
- *     iff lsm_names confirms Landlock is active, otherwise skip (the only
- *     graceful path; module loads network-only).
- *
- * Any value other than -1/0/1 is a configuration error: the module aborts
- * loading rather than silently treating it as "auto".
- *
- * kallsyms_lookup_name is resolved first: both strict and auto need it to even
- * detect Landlock, so a resolution failure is fatal for both — without it the
- * module cannot tell "LSM compiled in but disabled" apart from "absent", and
- * there is no graceful fallback.  landlock_enable=0 returns before this step.
- *
- * Once the decision is "enable", initialization runs to completion and any
- * failure (symbol resolution, kprobe registration) is fatal — the module
- * aborts loading rather than silently losing file authorization.
+ * Decision inputs: landlock_enable param (1 = strict on, 0 = off, -1 = unset);
+ * when unset, sandbox_landlock_probe() enables iff lsm_names shows Landlock is
+ * active (the only graceful path — module loads network-only otherwise).
+ * Any other value aborts loading.  landlock_enable=0 returns before resolving
+ * kallsyms_lookup_name; otherwise a resolution failure is fatal (needed to tell
+ * "LSM compiled in but disabled" apart from "absent").  Once the decision is
+ * "enable", any init failure (symbols, kprobe registration) aborts the load.
  *
  * Return: 0 on success or when the decision is "off"; negative errno aborts.
  */
 int sandbox_file_init(void)
 {
 	int ret, i;
+
+	/* Deferred-free worker must be usable whenever an instance can be closed
+	 * (inst_release -> drain), regardless of the landlock switch. */
+	INIT_WORK(&sb_defer_work, sb_defer_release);
 
 	if (landlock_enable < -1 || landlock_enable > 1) {
 		pr_err("dyn-sandbox: invalid landlock_enable=%d (must be -1, 0 or 1), aborting init\n",
@@ -1098,17 +1198,15 @@ err_kprobes:
 }
 
 /**
- * sandbox_file_exit - Unregister kretprobes if active, assert inst_list empty
- *
- * Uses sandbox_landlock_ready() as the guard: at exit time it is true iff the
- * kretprobes were registered — landlock_active is set only on a successful
- * init chain, and cleared on any partial-failure unwind (err_kprobes) and on
- * graceful skip.  Module refcounting guarantees all instances were released
- * via their file_operations release path before this.
+ * sandbox_file_exit - Unregister kretprobes if active, assert inst_list empty.
+ * sandbox_landlock_ready() is true iff the kretprobes were registered.
  */
 void sandbox_file_exit(void)
 {
 	int i;
+
+	/* Drain any deferred capped objects before the module unloads. */
+	flush_work(&sb_defer_work);
 
 	if (sandbox_landlock_ready()) {
 		for (i = 0; i < NUM_KPROBES; i++)
