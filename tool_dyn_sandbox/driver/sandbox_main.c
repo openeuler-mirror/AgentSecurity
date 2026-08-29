@@ -37,16 +37,24 @@ MODULE_DESCRIPTION("dyn-sandbox kernel module: network isolation + file runtime 
 /*  Char device — /dev/dyn-sandbox                                        */
 /* ====================================================================== */
 
+static int sandbox_ioctl_check(uint32_t permission, unsigned int cmd);
+
 static long sandbox_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	void __user *uarg = (void __user *)arg;
 	struct sandbox_instance *inst = filp->private_data;
+	int ret;
+
+	if (!inst)
+		return -EBADFD;
+
+	ret = sandbox_ioctl_check(inst->caller_permission, cmd);
+	if (ret)
+		return ret;
 
 	switch (cmd) {
 	/* --- Network ioctls --- */
 	case SANDBOX_NET_CREATE:
-		if (!inst)
-			return -EBADFD;
 		return net_create(inst, uarg);
 
 	case SANDBOX_NET_REPORT_DNS:
@@ -66,13 +74,37 @@ static long sandbox_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		return sandbox_file_handle_set_pid(inst, uarg);
 
 	default:
-		return -ENOTTY;
+		return -ENOTTY;	/* 兜底: 门禁外的未知命令不应可达 */
 	}
 }
 
-/* ====================================================================== */
-/*  Caller authentication — restrict /dev/dyn-sandbox to trusted binaries */
-/* ====================================================================== */
+/*
+ * sandbox_ioctl_check - Command-level permission gate for /dev/dyn-sandbox
+ * @permission: permission bitmask granted to the caller at open (see
+ *              sandbox_caller_permission)
+ * @cmd:        ioctl command to check
+ *
+ * Each trusted binary is granted only the bits for its own role's commands
+ * (see sandbox_trusted_exe).  This prevents a compromised dyn-sandbox-dns
+ * from issuing launcher commands (NET_CREATE / FILE_*) and vice versa.
+ *
+ * Return: 0 if allowed, -EPERM if the command is not in the caller's mask,
+ *         -ENOTTY if cmd does not carry this device's magic (keeps the
+ *         pre-existing unknown-command behavior, e.g. version-skew detection).
+ */
+static int sandbox_ioctl_check(uint32_t permission, unsigned int cmd)
+{
+	unsigned int nr;
+
+	if (_IOC_TYPE(cmd) != SANDBOX_IOCTL_MAGIC)
+		return -ENOTTY;
+
+	nr = _IOC_NR(cmd);
+	if (nr >= 32)
+		return -EPERM;	/* NR 超出 uint32_t 位域: 无对应权限位 */
+
+	return (permission & (1U << nr)) ? 0 : -EPERM;
+}
 
 /*
  * Only these executables may open /dev/dyn-sandbox.  Matched against the
@@ -84,34 +116,45 @@ static long sandbox_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
  * The sandbox core (dyn-sandbox) and the DNS proxy (dyn-sandbox-dns) are
  * installed at /usr/bin by the RPM.  Any other caller — including a sandbox
  * tool after execve() — is rejected.
+ *
+ * Each entry also carries the ioctl permission mask granted to that binary
+ * (its own role only).  sandbox_ioctl_check() enforces it per command, so a
+ * compromised dyn-sandbox-dns cannot issue launcher commands (NET_CREATE /
+ * FILE_*) and vice versa.
  */
-static const char *const sandbox_trusted_exe_paths[] = {
-	"/usr/bin/dyn-sandbox",
-	"/usr/bin/dyn-sandbox-dns",
+static const struct {
+	const char *path;
+	uint32_t    permission;
+} sandbox_trusted_exe[] = {
+	{ "/usr/bin/dyn-sandbox",
+	  SANDBOX_PERM(SANDBOX_NET_CREATE) | SANDBOX_PERM(SANDBOX_FILE_GET_BLOCKED) |
+	  SANDBOX_PERM(SANDBOX_FILE_DECISION) | SANDBOX_PERM(SANDBOX_FILE_SET_PID) },
+	{ "/usr/bin/dyn-sandbox-dns",
+	  SANDBOX_PERM(SANDBOX_NET_REPORT_DNS) | SANDBOX_PERM(SANDBOX_NET_SET_DNS_PORT) },
 };
 
 /**
- * sandbox_trusted_caller - Is the current process a trusted binary?
+ * sandbox_caller_permission - Resolve the current process's ioctl permission
  *
  * Resolves the caller's executable path via d_path() on mm->exe_file and
  * compares it byte-for-byte against the trusted list.  Full-path exact
  * matching only — a copied binary named "dyn-sandbox" elsewhere must NOT
  * pass, and prefix/basename matches are rejected too.
  *
- * Return: true if trusted, false otherwise.
+ * Return: the granted permission bitmask if trusted, 0 otherwise.
  */
-static bool sandbox_trusted_caller(void)
+static uint32_t sandbox_caller_permission(void)
 {
 	struct mm_struct *mm = current->mm;
 	struct file *exe_file;
 	char *buf;
 	char *path;
-	bool trusted = false;
+	uint32_t permission = 0;
 	int i;
 
 	/* Kernel threads / exec teardown edge cases have no usable exe. */
 	if (!mm)
-		return false;
+		return 0;
 
 	rcu_read_lock();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
@@ -128,15 +171,15 @@ static bool sandbox_trusted_caller(void)
 #endif
 	rcu_read_unlock();
 	if (!exe_file)
-		return false;
+		return 0;
 
 	buf = (char *)__get_free_page(GFP_KERNEL);
 	if (buf) {
 		path = d_path(&exe_file->f_path, buf, PAGE_SIZE);
 		if (!IS_ERR(path)) {
-			for (i = 0; i < ARRAY_SIZE(sandbox_trusted_exe_paths); i++) {
-				if (strcmp(path, sandbox_trusted_exe_paths[i]) == 0) {
-					trusted = true;
+			for (i = 0; i < ARRAY_SIZE(sandbox_trusted_exe); i++) {
+				if (strcmp(path, sandbox_trusted_exe[i].path) == 0) {
+					permission = sandbox_trusted_exe[i].permission;
 					break;
 				}
 			}
@@ -145,7 +188,7 @@ static bool sandbox_trusted_caller(void)
 	}
 	fput(exe_file);
 
-	return trusted;
+	return permission;
 }
 
 /**
@@ -154,9 +197,10 @@ static bool sandbox_trusted_caller(void)
  * @filp:  file pointer to attach the instance to
  *
  * Authenticates the caller first: only the trusted binaries (see
- * sandbox_trusted_caller) may open the device.  Anything else — an attacker,
- * or a sandbox tool that execve'd something else — gets -EPERM before any
- * instance is allocated.
+ * sandbox_caller_permission) may open the device, and each is granted only
+ * its own ioctl permission mask.  Anything else — an attacker, or a sandbox
+ * tool that execve'd something else — gets -EPERM before any instance is
+ * allocated.
  *
  * Return: 0 on success, -EPERM if the caller is not a trusted binary,
  *         -ENOMEM on allocation failure
@@ -164,13 +208,17 @@ static bool sandbox_trusted_caller(void)
 static int sandbox_open(struct inode *inode, struct file *filp)
 {
 	struct sandbox_instance *inst;
+	uint32_t permission;
 
-	if (!sandbox_trusted_caller())
+	permission = sandbox_caller_permission();
+	if (permission == 0)
 		return -EPERM;
 
 	inst = kzalloc(sizeof(*inst), GFP_KERNEL);
 	if (!inst)
 		return -ENOMEM;
+
+	inst->caller_permission = permission;
 
 	kref_init(&inst->ref); /* root reference owned by sandbox_release */
 	INIT_LIST_HEAD(&inst->net_node);

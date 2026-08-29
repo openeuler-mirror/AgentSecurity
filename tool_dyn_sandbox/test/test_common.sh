@@ -11,7 +11,9 @@ _SANDBOX_SYSTEMD=${_SANDBOX_SYSTEMD:-0}
 
 test_setup() {
     # 把当前构建的二进制与内核模块安装到系统路径 (/usr/bin, /lib/modules/.../extra)
-    sudo_run make -C ${DIR}/.. install
+    # 顶层 make 默认 LANDLOCK_ENABLE=0, 而测试套件依赖 landlock 特性, 必须显式传 1
+    # (install 依赖 all, 否则会用无 Landlock 变体覆盖安装导致 landlock 用例全挂)
+    sudo_run make -C ${DIR}/.. install LANDLOCK_ENABLE=1
     sudo_run depmod -a
 
     if [ -d /run/systemd/system ]; then

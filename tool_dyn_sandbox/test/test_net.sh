@@ -279,6 +279,25 @@ else
         || fail "N${N12_BASE} multi-site traversal (${N12_PASS}/10 passed, ${N12_FAIL} failed)"
 fi
 
+# ────────────────────────────────────────────────
+# N13: 16 条 CIDR 上限（完整启动，脚本长度超过旧版 1024 上限）
+#   SANDBOX_MAX_CIDRS=16；16 条 + DNS 段规则集 > 1024B，PAGE_SIZE 下必须能部署。
+#   用私有 10.x 段 + /usr/bin/true，不联网、无外部依赖。
+# ────────────────────────────────────────────────
+T=$((T+1)); log "Test N$T: 16 CIDRs (limit)"
+cidr_args=()
+for i in $(seq 1 16); do
+    cidr_args+=("--cidr" "10.0.$i.0/24")
+done
+run_test "N$T" "16 CIDRs (limit)" \
+    timeout 15 ${SANDBOX_RUN} "${cidr_args[@]}" ${BASE_MOUNT} -- /usr/bin/true
+# /usr/bin/true 不执行 ip addr show，日志无 inet 输出，只判退出码
+if [ $? -eq 0 ]; then
+    pass "N$T 16 CIDRs (limit)"
+else
+    fail "N$T 16 CIDRs (limit)"
+fi
+
 {
 
 

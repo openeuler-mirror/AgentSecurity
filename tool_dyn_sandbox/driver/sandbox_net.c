@@ -25,7 +25,8 @@
 #include "sandbox_dev.h"
 #include "sandbox_net.h"
 
-#define SANDBOX_CMD_MAX       1024  /* max call_usermodehelper command length */
+/* Must be >= nft_append's PAGE_SIZE cap */
+#define SANDBOX_CMD_MAX       PAGE_SIZE
 #define MAX_SUBNET_OCTETS     256   /* number of /16 subnets in 10.0.0.0/8 */
 
 /* ====================================================================== */
@@ -520,14 +521,16 @@ static int net_deploy_nftables(struct sandbox_net_env *env)
 			goto too_large;
 	}
 
-	ret = nft_append(script, &slen,
-		"add element netpolicy allowed { %pI4/32 }\n", &env->child_ip);
-	if (ret)
-		goto too_large;
-
+	/* child_ip must always be reachable (the child may access its own IP).
+	 * Keep it as a standalone rule, not an interval-set element: if a user
+	 * CIDR already covers the child subnet (e.g. 10.0.0.0/8 covers
+	 * 10.99.0.0/16), a /32 inside the set would be a strict subset and the
+	 * kernel rejects the whole nft transaction with -ENOTEMPTY. */
 	ret = nft_append(script, &slen,
 		"add chain netpolicy output { type filter hook output priority filter; }\n"
-		"add rule netpolicy output ip daddr @allowed accept\n");
+		"add rule netpolicy output ip daddr @allowed accept\n"
+		"add rule netpolicy output ip daddr %pI4 accept\n",
+		&env->child_ip);
 	if (ret)
 		goto too_large;
 

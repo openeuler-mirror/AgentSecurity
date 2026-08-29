@@ -6,7 +6,7 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-SANDBOX_RUN="$DIR/../dyn-sandbox/dyn-sandbox"
+SANDBOX_RUN="$DIR/../dist/dyn-sandbox"
 
 PASS=0; FAIL=0; TOTAL=0
 TMPDIR="/tmp/test_param_parse_$$"
@@ -175,16 +175,27 @@ test_overflow "D7 cidr 超限" 'too many --cidr entries' 1 "$B_D" "${D7_ARGS[@]}
 test_case "D8 CIDR 无前缀" "$B_D --cidr 10.0.0.0 -D" 'need /prefix' 1
 test_case "D9 CIDR 无效前缀33" "$B_D --cidr 10.0.0.0/33 -D" 'invalid prefix' 1
 test_case "D10 CIDR 前缀负数" "$B_D --cidr '10.0.0.0/-1' -D" 'invalid prefix' 1
-test_case "D11 seccomp 互斥(profile先)" \
+# D11: 前缀非数字曾被 atoi 静默当作 0 -> /0 放行全部流量 (fail-open), 必须拒绝
+test_case "D11 CIDR 前缀非数字" "$B_D --cidr '10.0.0.0/abc' -D" 'invalid prefix' 1
+# D12: 前缀0 (/0) 会让白名单变成 0.0.0.0/0 -> 放行全部流量, 必须拒绝
+test_case "D12 CIDR 前缀0" "$B_D --cidr '10.0.0.0/0' -D" 'invalid prefix' 1
+test_case "D13 seccomp 互斥(profile先)" \
 	"$B_D --seccomp default --seccomp-syscalls read" 'mutually exclusive' 1
-test_case "D12 seccomp 互斥(syscalls先)" \
+test_case "D14 seccomp 互斥(syscalls先)" \
 	"$B_D --seccomp-syscalls read --seccomp default" 'mutually exclusive' 1
 
-test_case "D13 mount 无效后缀" "$B_D --mount /x:invalid -D" "invalid mount option" 1
-test_case "D14 mount-tmpfs 负数" "$B_D --mount-tmpfs /x:-1" "invalid tmpfs size" 1
-test_case "D15 domain 空字符串" "$B_D --domain '' -D" "empty domain" 1
-test_case "D16 seccomp 未知profile" "$B_D --seccomp unknown -- echo hello" "unknown seccomp profile" 1
-test_case "D17 seccomp-syscalls 空串" "$B_D --seccomp-syscalls '' -D" "cannot be empty" 1
+test_case "D15 mount 无效后缀" "$B_D --mount /x:invalid -D" "invalid mount option" 1
+test_case "D16 mount-tmpfs 负数" "$B_D --mount-tmpfs /x:-1" "invalid tmpfs size" 1
+test_case "D17 domain 空字符串" "$B_D --domain '' -D" "empty domain" 1
+test_case "D18 seccomp 未知profile" "$B_D --seccomp unknown -- echo hello" "unknown seccomp profile" 1
+test_case "D19 seccomp-syscalls 空串" "$B_D --seccomp-syscalls '' -D" "cannot be empty" 1
+# D20: mount 路径超长(≥256) 曾因 strncpy 静默截断成错误路径, 现在必须显式拒绝
+test_case "D20 mount 路径超长" "$B_D --mount '/$(printf 'a%.0s' {1..300})' -D" 'mount path too long' 1
+# D21: mount 路径段恰为 255 合法 + ":rw" (总长>256) 应放行: memchr 按冒号分界,
+#      只限路径段长, 不以 arg 总长一刀切
+test_case "D21 mount 边界255+option" "$B_D --mount '/$(printf 'a%.0s' {1..254}):rw' -D" 'mounts (1)' 0
+# D22: landlock 路径超长(≥256) 曾被静默截断成错误路径授权, 现在必须显式拒绝
+test_case "D22 landlock 路径超长" "$B_D --landlock '/$(printf 'a%.0s' {1..300}):read' -D" 'landlock path too long' 1
 
 # ------------------------------------------------------------------
 #  E. 互斥检查
@@ -374,7 +385,8 @@ echo "=== I. 特殊边界场景 ==="
 
 # I1: domain 127 字符 + .com（共 131 → 截断到 127）
 LONG_DOMAIN="$(python3 -c "print('a'*127 + '.com')" 2>/dev/null || echo "a...long.com")"
-test_case "I1 domain 长字符串" "$B_D --domain '$LONG_DOMAIN' -D" 'domains (1)'
+# I1: 域名超长(≥128) 曾被 strncpy 静默截断成另一个域名, 现在必须显式拒绝
+test_case "I1 domain 超长被拒" "$B_D --domain '$LONG_DOMAIN' -D" 'domain too long' 1
 
 # I2: 同名 mount 重复，两条都加入（当前无去重）
 test_case "I3 同名 mount 重复" \

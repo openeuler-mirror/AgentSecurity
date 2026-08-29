@@ -24,6 +24,10 @@ struct pt_regs;
 
 #define MAX_ENV_IDS 16384
 
+/* 单个 ioctl 命令对应的权限位：位索引 = _IOC_NR(cmd)（本项目最大 7，uint32_t 足够）。
+ * 权限掩码由 sandbox_trusted_exe[] 按"二进制职责"授予，任何用户态输入都无法篡改。 */
+#define SANDBOX_PERM(cmd)  (1U << _IOC_NR(cmd))
+
 /**
  * func_arg_n - Read the n-th argument of a C function call from pt_regs
  * @regs: pt_regs captured at function entry (e.g., by kprobe)
@@ -145,6 +149,7 @@ struct sandbox_instance {
 	pid_t            registered_pid;
 	bool             in_inst_list;
 	bool             in_net_inst_list;
+	uint32_t         caller_permission; /* ioctl 命令权限位掩码, open 时按 exe 路径授予 */
 	struct sandbox_state state;	 /* blocked_file, decision, etc */
 	struct sandbox_net_env *net;	 /* NULL = no network */
 	const struct pid_namespace *sandbox_pid_ns;  /* set at SET_PID, for fork child lookup */

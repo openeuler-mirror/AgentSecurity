@@ -111,8 +111,16 @@ static void drop_privileges(void)
 	int last_cap = 63;
 	if (f) {
 		char buf[16];
-		if (fgets(buf, sizeof(buf), f))
-			last_cap = atoi(buf);
+		if (fgets(buf, sizeof(buf), f)) {
+			char *end;
+			errno = 0;
+			long v = strtol(buf, &end, 10);
+			/* buf 以 '\n' 结尾; 只接受纯数字, 否则保持默认值 63 */
+			if (errno != ERANGE && end != buf &&
+			    (*end == '\0' || *end == '\n') &&
+			    v >= 0 && v <= 63)
+				last_cap = (int)v;
+		}
 		fclose(f);
 	}
 
@@ -266,6 +274,7 @@ static int pivot_root_into_tmpfs(void)
 {
 	char base_path[] = "/tmp/sandbox-XXXXXX";
 	char oldroot[512];
+	char leak[512];
 
 	if (!mkdtemp(base_path)) {
 		perror("mkdtemp");
@@ -289,6 +298,11 @@ static int pivot_root_into_tmpfs(void)
 	}
 
 	chdir("/");
+	/* Remove the mkdtemp dir left on the host /tmp. After pivot_root it is
+	 * a plain empty dir on the shared host filesystem — dead weight, safe to
+	 * drop; ignoring any rmdir error keeps this best-effort. */
+	snprintf(leak, sizeof(leak), "/oldroot%s", base_path);
+	rmdir(leak);
 	return 0;
 }
 
