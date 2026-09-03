@@ -71,6 +71,12 @@ struct sandbox_config {
 
 	/* /tmp tmpfs size in MB, 0 = default 256; 有符号: 负数在解析期拒绝, 防 -1 回绕成 ULONG_MAX */
 	long tmpfs_size_mb;
+	/* 解析期专用 (不参与序列化/dump): tmpfs_size_mb 的来源, 用于 --tmpfs-size 与
+	 * --mount-tmpfs /tmp:MB 两拼写互斥检查. 0=未设 1=--tmpfs-size 2=--mount-tmpfs /tmp */
+	int tmpfs_size_src;
+	/* 解析期专用 (不参与序列化/dump): -c 是否已由 CLI 设置 (S5 重复检测).
+	 * 不能用 workdir 内容判重复: 默认 "/" 与显式 "-c /" 撞车, 需显式标记 */
+	int workdir_set;
 
 	/* flags */
 	int no_landlock;     /* --no-landlock: skip all landlock */
@@ -88,6 +94,11 @@ void print_usage(const char *prog);
 
 /* 从 YAML 策略文件加载配置（libyaml） */
 int parse_policy_file(struct sandbox_config *cfg, const char *path);
+
+/* 校验挂载路径 (CLI --mount/--mount-tmpfs 与 YAML bind/tmpfs 共用):
+ * 必须以 '/' 开头; 组件不得为空('//'/尾部'/')、'.' 或 '..'; 且不得命中内部
+ * 停泊根 /oldroot. 禁 '..'/ /oldroot 防经停泊根叠回其挂载点逃逸. 0 合法, -1 非法 */
+int sandbox_validate_mount_path(const char *path);
 
 /* 打印 config 所有字段（用于调试） */
 void dump_config(const struct sandbox_config *cfg);

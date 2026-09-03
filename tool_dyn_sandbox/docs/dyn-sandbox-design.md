@@ -638,11 +638,10 @@ version: 1
 
 mount:
   - type: bind
-    src: /usr
-    dest: /usr
+    src: /usr           # bind 只收 src；沙箱内目标恒 = src
     readonly: true
   - type: tmpfs
-    dest: /tmp
+    dest: /tmp          # tmpfs 只收 dest（无 src）
     size: "100MB"
 
 landlock:

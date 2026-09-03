@@ -23,6 +23,9 @@
 #include <linux/file.h>
 #include <linux/mm.h>
 #include <linux/rcupdate.h>
+#include <linux/namei.h>      /* vfs_path_lookup / LOOKUP_FOLLOW */
+#include <linux/fs_struct.h>  /* get_fs_root (inline) */
+#include <linux/sched.h>      /* init_task */
 
 #include "sandbox.h"
 #include "sandbox_version.h"
@@ -107,20 +110,16 @@ static int sandbox_ioctl_check(uint32_t permission, unsigned int cmd)
 }
 
 /*
- * Only these executables may open /dev/dyn-sandbox.  Matched against the
- * caller's *actual* executable (current->mm->exe_file), NOT current->comm:
- * comm is a user-settable string (prctl(PR_SET_NAME)) and is trivially
- * spoofable.  mm->exe_file is bound at execve() to the real binary's inode,
- * so the process must genuinely be running one of these files.
+ * Only these executables may open /dev/dyn-sandbox.  Trust is established by
+ * inode identity (i_sb->s_dev + i_ino), re-resolved in the init namespace on
+ * every open — NOT by a path string (namespace-relative, spoofable via
+ * unshare + bind-mount) and NOT by current->comm (user-settable).  The trust
+ * set follows the current file, so a binary upgrade needs no module reload.
  *
- * The sandbox core (dyn-sandbox) and the DNS proxy (dyn-sandbox-dns) are
- * installed at /usr/bin by the RPM.  Any other caller — including a sandbox
- * tool after execve() — is rejected.
- *
- * Each entry also carries the ioctl permission mask granted to that binary
- * (its own role only).  sandbox_ioctl_check() enforces it per command, so a
- * compromised dyn-sandbox-dns cannot issue launcher commands (NET_CREATE /
- * FILE_*) and vice versa.
+ * Each entry carries the ioctl permission mask for that binary's role;
+ * sandbox_ioctl_check() enforces it per command, so a compromised
+ * dyn-sandbox-dns cannot issue launcher commands (NET_CREATE / FILE_*) and
+ * vice versa.
  */
 static const struct {
 	const char *path;
@@ -134,12 +133,39 @@ static const struct {
 };
 
 /**
+ * trusted_inode_of - Resolve a trusted binary's inode in the init namespace
+ * @path: full path of the trusted binary
+ * @dev:  output: device number (i_sb->s_dev)
+ * @ino:  output: inode number
+ *
+ * Anchored at init_task.fs, never current->fs: a caller in a private
+ * user/mount namespace must not influence which file resolves.  Re-resolved
+ * on every call so a binary upgrade (inode change) works without reload.
+ *
+ * Return: 0 on success, negative errno otherwise (caller fails closed).
+ */
+static int trusted_inode_of(const char *path, dev_t *dev, unsigned long *ino)
+{
+	struct path root, p;
+	int ret;
+
+	get_fs_root(init_task.fs, &root);
+	ret = vfs_path_lookup(root.dentry, root.mnt, path, LOOKUP_FOLLOW, &p);
+	path_put(&root);
+	if (ret)
+		return ret;
+
+	*dev = p.dentry->d_inode->i_sb->s_dev;
+	*ino = p.dentry->d_inode->i_ino;
+	path_put(&p);
+	return 0;
+}
+
+/**
  * sandbox_caller_permission - Resolve the current process's ioctl permission
  *
- * Resolves the caller's executable path via d_path() on mm->exe_file and
- * compares it byte-for-byte against the trusted list.  Full-path exact
- * matching only — a copied binary named "dyn-sandbox" elsewhere must NOT
- * pass, and prefix/basename matches are rejected too.
+ * Compares mm->exe_file's inode against the trusted list (re-resolved in the
+ * init namespace).  A copied or bind-mounted fake binary cannot match.
  *
  * Return: the granted permission bitmask if trusted, 0 otherwise.
  */
@@ -147,8 +173,8 @@ static uint32_t sandbox_caller_permission(void)
 {
 	struct mm_struct *mm = current->mm;
 	struct file *exe_file;
-	char *buf;
-	char *path;
+	dev_t exe_dev;
+	unsigned long exe_ino;
 	uint32_t permission = 0;
 	int i;
 
@@ -173,18 +199,17 @@ static uint32_t sandbox_caller_permission(void)
 	if (!exe_file)
 		return 0;
 
-	buf = (char *)__get_free_page(GFP_KERNEL);
-	if (buf) {
-		path = d_path(&exe_file->f_path, buf, PAGE_SIZE);
-		if (!IS_ERR(path)) {
-			for (i = 0; i < ARRAY_SIZE(sandbox_trusted_exe); i++) {
-				if (strcmp(path, sandbox_trusted_exe[i].path) == 0) {
-					permission = sandbox_trusted_exe[i].permission;
-					break;
-				}
-			}
+	exe_dev = file_inode(exe_file)->i_sb->s_dev;
+	exe_ino = file_inode(exe_file)->i_ino;
+	for (i = 0; i < ARRAY_SIZE(sandbox_trusted_exe); i++) {
+		dev_t tdev;
+		unsigned long tino;
+
+		if (trusted_inode_of(sandbox_trusted_exe[i].path, &tdev, &tino) == 0 &&
+		    exe_dev == tdev && exe_ino == tino) {
+			permission = sandbox_trusted_exe[i].permission;
+			break;
 		}
-		free_page((unsigned long)buf);
 	}
 	fput(exe_file);
 

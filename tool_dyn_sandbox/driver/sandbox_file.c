@@ -23,6 +23,7 @@
 #include <linux/atomic.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/pid_namespace.h>
 #include <linux/thread_info.h>
 #include <linux/cred.h>
 #include <linux/namei.h>
@@ -489,6 +490,8 @@ static void release_entry_caps(struct blocked_entry *entry)
 		path_put(&entry->cap_path);
 		entry->cap_kind = BLOCKED_CAP_NONE;
 	}
+	put_pid(entry->pid_ref);
+	entry->pid_ref = NULL;
 }
 
 /**
@@ -504,7 +507,7 @@ static struct blocked_entry *build_entry(struct probe_data *data)
 		/* Low memory: -EACCES propagates as a hard deny. */
 		return NULL;
 
-	entry->pid = current->pid;
+	entry->pid_ref = get_task_pid(current, PIDTYPE_PID);
 	entry->type = data->type;
 
 	entry->cap_kind = data->cap_kind;
@@ -550,6 +553,9 @@ static struct blocked_entry *build_entry(struct probe_data *data)
 	/* No object -> nothing to grant on; drop so -EACCES propagates as a hard
 	 * deny.  FTRUNCATE is exempt: its grant is file-based (blocked_file_ptr). */
 	if (entry->cap_kind == BLOCKED_CAP_NONE && data->type != OP_FTRUNCATE) {
+		/* Atomic-safe: current is alive (running its own kretprobe), so
+		 * put_pid cannot reach count 0 / free_pid_ns here. */
+		put_pid(entry->pid_ref);
 		kfree(entry);
 		return NULL;
 	}
@@ -754,6 +760,29 @@ static int landlock_enable = 0;
 /*  File ioctl handlers                                                   */
 /* ====================================================================== */
 
+/* task_is_descendant_of_current - is @task a child/descendant of current?
+ *
+ * SET_PID must only target the sandbox child (CLONE_NEWPID PID 1); this guards
+ * against a recycled pid landing on an unrelated process whose
+ * SIGNAL_UNKILLABLE must not be cleared. Walks real_parent under RCU.
+ */
+static bool task_is_descendant_of_current(struct task_struct *task)
+{
+	struct task_struct *p;
+
+	rcu_read_lock();
+	for (p = task; p; p = rcu_dereference(p->real_parent)) {
+		if (p == current) {
+			rcu_read_unlock();
+			return true;
+		}
+		if (p == p->real_parent)
+			break;
+	}
+	rcu_read_unlock();
+	return false;
+}
+
 /**
  * sandbox_file_handle_set_pid - SANDBOX_FILE_SET_PID ioctl handler
  * @inst: sandbox instance (may be NULL if device open raced teardown)
@@ -773,13 +802,48 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
 	pid_t new_pid;
 	struct task_struct *task;
 	unsigned long flags;
+	struct pid *pid_ref;
 
 	if (!inst)
 		return -EBADFD;
 	if (copy_from_user(&new_pid, uarg, sizeof(new_pid)))
 		return -EFAULT;
 
-	inst->registered_pid = new_pid;
+	/* Validate before committing any state: pid_ref pins the child's pid so
+	 * release's SIGKILL can't resolve to a recycled process; the descendant
+	 * check keeps SET_PID on the sandbox child. */
+	pid_ref = find_get_pid(new_pid);
+	if (!pid_ref)
+		return -ESRCH;
+
+	task = get_pid_task(pid_ref, PIDTYPE_PID);
+	if (!task) {
+		put_pid(pid_ref);
+		return -ESRCH;
+	}
+	if (!task->signal) {
+		put_task_struct(task);
+		put_pid(pid_ref);
+		return -EINVAL;
+	}
+
+	/* SET_PID must only target a descendant of current (the sandbox child),
+	 * never an arbitrary process whose SIGNAL_UNKILLABLE could be cleared. */
+	if (!task_is_descendant_of_current(task)) {
+		put_task_struct(task);
+		put_pid(pid_ref);
+		return -EPERM;
+	}
+
+	spin_lock_irqsave(&task->sighand->siglock, flags);
+	task->signal->flags &= ~SIGNAL_UNKILLABLE;
+	spin_unlock_irqrestore(&task->sighand->siglock, flags);
+
+	/* Commit after validation: take ownership of pid_ref (released in
+	 * sandbox_file_release), set sandbox_pid_ns before publishing to inst_list
+	 * so inst_find_by_pidns never sees a half-registered entry. */
+	inst->registered_pid_ref = pid_ref;
+	inst->sandbox_pid_ns = get_pid_ns(task_active_pid_ns(task));
 
 	spin_lock_irqsave(&inst_lock, flags);
 	if (!inst->in_inst_list) {
@@ -788,24 +852,9 @@ int sandbox_file_handle_set_pid(struct sandbox_instance *inst, void __user *uarg
 	}
 	spin_unlock_irqrestore(&inst_lock, flags);
 
-	struct pid *pid = find_get_pid(new_pid);
-	task = get_pid_task(pid, PIDTYPE_PID);
-	put_pid(pid);
-	if (!task)
-		return -ESRCH;
-	if (!task->signal) {
-		put_task_struct(task);
-		return -EINVAL;
-	}
-
-	spin_lock_irqsave(&task->sighand->siglock, flags);
-	task->signal->flags &= ~SIGNAL_UNKILLABLE;
-	spin_unlock_irqrestore(&task->sighand->siglock, flags);
-
-	inst->sandbox_pid_ns = task_active_pid_ns(task);
 	put_task_struct(task);
 	pr_info("dyn-sandbox: SET_PID %d -> pid=%d\n",
-		inst->registered_pid, current->pid);
+		new_pid, current->pid);
 	return 0;
 }
 
@@ -890,7 +939,6 @@ int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uar
 	struct sandbox_file_decision d;
 	struct blocked_entry *entry;
 	unsigned long flags;
-	pid_t blocked_pid;
 	struct task_struct *child;
 	int ret = 0;
 
@@ -915,11 +963,9 @@ int sandbox_file_handle_decision(struct sandbox_instance *inst, void __user *uar
 	if (!entry)
 		return -ENOENT;
 
-	blocked_pid = entry->pid;
-
-	struct pid *pid = find_get_pid(blocked_pid);
-	child = get_pid_task(pid, PIDTYPE_PID);
-	put_pid(pid);
+	/* pid_ref pins the original pid: even if the blocked task has since been
+	 * killed, get_pid_task cannot return a recycled different process. */
+	child = get_pid_task(entry->pid_ref, PIDTYPE_PID);
 	if (!child) {
 		/* Task already exited — discard entry (drop owned objects first) */
 		release_entry_caps(entry);
@@ -1103,16 +1149,26 @@ void sandbox_file_release(struct sandbox_instance *inst)
 		inst->in_inst_list = false;
 	}
 
-	/* Kill the child process if still alive (e.g., stuck in SIGSTOP) */
-	if (inst->registered_pid) {
-		struct pid *pid = find_get_pid(inst->registered_pid);
-		struct task_struct *task = get_pid_task(pid, PIDTYPE_PID);
+	/* Drop the pid_ns ref taken in SET_PID (process context; never inst_release,
+	 * which may run in atomic kprobe context where free_pid_ns's mntput can't). */
+	if (inst->sandbox_pid_ns) {
+		put_pid_ns(inst->sandbox_pid_ns);
+		inst->sandbox_pid_ns = NULL;
+	}
 
-		put_pid(pid);
+	/* Kill the child process if still alive (e.g., stuck in SIGSTOP).
+	 * pid_ref pins the original pid: if the child already exited, get_pid_task
+	 * returns NULL instead of a recycled different process. */
+	if (inst->registered_pid_ref) {
+		struct task_struct *task =
+			get_pid_task(inst->registered_pid_ref, PIDTYPE_PID);
+
 		if (task) {
 			send_sig(SIGKILL, task, 0);
 			put_task_struct(task);
 		}
+		put_pid(inst->registered_pid_ref);
+		inst->registered_pid_ref = NULL;
 	}
 }
 

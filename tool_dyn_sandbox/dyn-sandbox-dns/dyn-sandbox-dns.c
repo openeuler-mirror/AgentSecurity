@@ -64,6 +64,7 @@ struct dns_header {
  */
 #define MAX_PENDING 256
 #define PENDING_TIMEOUT 5 /* seconds */
+#define MAX_PENDING_PER_PREFIX 16 /* 每 /16 前缀(沙箱)在途查询上限 */
 
 /* Monotonic ms — NTP wall-clock steps must not rewind timeouts */
 static int64_t mono_now_ms(void)
@@ -85,6 +86,12 @@ struct pending_query {
 };
 
 static struct pending_query pending[MAX_PENDING];
+
+/* Per-/16-prefix in-flight query counter — O(1) direct-indexed, no scanning.
+ * Each sandbox owns one /16 subnet (10.x.0.0/16 dynamic or probe_subnets), so
+ * the 16-bit IP prefix uniquely identifies a sandbox; one client therefore
+ * cannot starve the shared pending table. */
+static uint16_t per_prefix_pending[1 << 16];
 
 /* new_id -> pending slot index (O(1) lookup), ID_FREE = not in use.
  * new_id is 16-bit (0-65535); slot indices fit in int16_t. */
@@ -217,6 +224,8 @@ static int extract_a_records(const uint8_t *wire, size_t wire_len,
 		ldns_rdf *rdf = ldns_rr_a_address(rr);
 		if (!rdf)
 			continue;
+		if (ldns_rdf_size(rdf) < sizeof(struct in_addr))
+			continue;
 
 		struct in_addr addr;
 		memcpy(&addr, ldns_rdf_data(rdf), sizeof(addr));
@@ -228,6 +237,12 @@ static int extract_a_records(const uint8_t *wire, size_t wire_len,
 }
 
 /* --- Pending table helpers --- */
+
+/* /16 prefix key of a client IP (each sandbox owns one /16 subnet) */
+static unsigned prefix_index(struct in_addr ip)
+{
+	return ntohl(ip.s_addr) >> 16;
+}
 
 /* Find a free slot, returns index or -1 */
 static int pending_alloc(void)
@@ -258,6 +273,9 @@ static uint16_t get_new_id(void)
 static void pending_free(int idx)
 {
 	if (idx >= 0 && idx < MAX_PENDING && pending[idx].in_use) {
+		unsigned px = prefix_index(pending[idx].client.sin_addr);
+		if (per_prefix_pending[px] > 0)
+			per_prefix_pending[px]--;
 		id_to_idx[pending[idx].new_id] = ID_FREE;
 		pending[idx].in_use = 0;
 	}
@@ -383,6 +401,13 @@ static void handle_new_query(void)
 	if (n < (ssize_t)sizeof(struct dns_header))
 		return;
 
+	/* Per-sandbox quota: drop before parse so a flooding client pays only
+	 * one array read and can never starve other sandboxes' DNS.  Silent
+	 * (no per-drop log) to avoid turning a flood into log spam. */
+	unsigned px = prefix_index(client.sin_addr);
+	if (per_prefix_pending[px] >= MAX_PENDING_PER_PREFIX)
+		return;
+
 	struct dns_header *header = (struct dns_header *)buf;
 	size_t query_len = (size_t)n;
 
@@ -419,6 +444,7 @@ static void handle_new_query(void)
 	snprintf(pending[idx].domain, sizeof(pending[idx].domain), "%s", domain);
 	pending[idx].timestamp_ms = mono_now_ms();
 	pending[idx].in_use = 1;
+	per_prefix_pending[px]++;
 
 	/* Replace DNS ID and forward to upstream */
 	header->id = htons(new_id);
@@ -532,8 +558,7 @@ int main(int argc, char **argv)
 
 	read_upstream_dns();
 
-	/* Open /dev/dyn-sandbox */
-	sandbox_fd = open(SANDBOX_DEVICE, O_RDWR);
+	sandbox_fd = open(SANDBOX_DEVICE, O_RDWR | O_CLOEXEC);
 	if (sandbox_fd < 0) {
 		perror("open " SANDBOX_DEVICE);
 		fprintf(stderr, "[dyn-sandbox-dns] is dyn_sandbox.ko loaded?\n");
