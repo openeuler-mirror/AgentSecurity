@@ -73,6 +73,7 @@
 #define EXIT_NS_ERR        5
 #define EXIT_KPROBE_ERR    6
 #define EXIT_NET_ERR       7
+#define EXIT_FD_ERR        8
 
 static int sandbox_fd = -1;
 static int child_wait_fd = -1;  /* eventfd: child 等 parent 写完 UID map */
@@ -392,13 +393,12 @@ static int setup_user_mounts(struct sandbox_config *cfg)
                                fprintf(stderr, "mkdir -p %s: %s\n", dest, strerror(errno));
 				return -1;
 			}
-			char opts[64] = "mode=0777";
-			char size_opt[32];
-			if (e->size > 0) {
-				snprintf(size_opt, sizeof(size_opt),
-					 "mode=0777,size=%luM", e->size);
-				strcpy(opts, size_opt);
-			}
+			/* size 统一语义: 0 / 未指定 = 默认 256M (与 /tmp tmpfs、--tmpfs-size
+			 * 一致, usage-guide "--mount-tmpfs 默认 256 MB"; 防省略 size 时挂出
+			 * 无上限 tmpfs, 沙箱进程可写满内存). 显式 :N 用 N. */
+			unsigned long sz = e->size > 0 ? e->size : 256;
+			char opts[64];
+			snprintf(opts, sizeof(opts), "mode=0777,size=%luM", sz);
 			if (mount("tmpfs", dest, "tmpfs", 0, opts) < 0) {
 				fprintf(stderr, "mount tmpfs %s: %s\n",
 					dest, strerror(errno));
@@ -1091,11 +1091,23 @@ static void child_setup_security(struct sandbox_config *cfg,
 /* ------------------------------------------------------------------ */
 static void child_close_fds(int landlock_fd)
 {
+	/* landlock_fd is kept open; close everything else >= 3. */
 	if (landlock_fd > 3) {
-		syscall(SYS_close_range, 3, landlock_fd - 1, 0);
-		syscall(SYS_close_range, landlock_fd + 1, UINT_MAX, 0);
+		if (syscall(SYS_close_range, 3, landlock_fd - 1, 0) < 0 ||
+		    syscall(SYS_close_range, landlock_fd + 1, UINT_MAX, 0) < 0)
+			CHILD_FAIL_EXIT(EXIT_FD_ERR, "close_range failed: %s",
+					strerror(errno));
 	} else {
-		syscall(SYS_close_range, 3, UINT_MAX, 0);
+		/* This branch only hits landlock_fd == -1 (no_landlock mode, set in
+		 * child_setup_security when cfg->no_landlock — the default build with
+		 * LANDLOCK_ENABLE=0 forces this via policy_parser.c). landlock_fd == 3
+		 * is unreachable: setup_landlock_base fails -> CHILD_FAIL_EXIT before
+		 * child_finalize, and with sandbox_fd occupying fd 3 a successful
+		 * create_ruleset always yields fd 4. With no fd to preserve, close
+		 * everything >= 3 (including sandbox_fd). */
+		if (syscall(SYS_close_range, 3, UINT_MAX, 0) < 0)
+			CHILD_FAIL_EXIT(EXIT_FD_ERR, "close_range failed: %s",
+					strerror(errno));
 	}
 }
 
@@ -1105,8 +1117,8 @@ static void child_finalize(struct sandbox_config *cfg,
 			   struct sock_fprog *seccomp_prog)
 {
 	if (umount2("/oldroot", MNT_DETACH) < 0)
-		fprintf(stderr, "dyn-sandbox: warning: umount /oldroot: %s\n",
-			strerror(errno));
+		CHILD_FAIL_EXIT(EXIT_MOUNT_ERR, "umount /oldroot: %s",
+				strerror(errno));
 	rmdir("/oldroot");
 
 	child_close_fds(landlock_fd);
@@ -1158,7 +1170,7 @@ int main(int argc, char **argv)
 	}
 
 	/* 打开 /dev/dyn-sandbox (检查模块是否加载) */
-	sandbox_fd = open(SANDBOX_DEVICE, O_RDWR);
+	sandbox_fd = open(SANDBOX_DEVICE, O_RDWR | O_CLOEXEC);
 	if (sandbox_fd < 0) {
 		fprintf(stderr, "dyn-sandbox: cannot open %s\n", SANDBOX_DEVICE);
 		return EXIT_KPROBE_ERR;

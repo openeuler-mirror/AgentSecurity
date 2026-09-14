@@ -2,22 +2,12 @@
 /*
  * sandbox_landlock_layout.h
  *
- * Kernel-version-dependent Landlock internal struct mirrors.
- *
- * ALL definitions in this file mirror kernel-internal types from
- * security/landlock/{ruleset.h,object.h,fs.c}.  These types are NOT
- * part of the stable kernel API and their layouts change between
- * kernel versions.
- *
- * The version-dependent struct (ll_ruleset) is selected at build time
- * from LINUX_VERSION_CODE: the 6.7+ layout (root_inode + root_net_port,
- * u32 access_masks) is BTF-verified on 6.8.0-136-generic; the 6.6 and
- * older layout (single root, u16 fs_access_masks) is verified on
- * openEuler 6.6.0-159.4.3.154.x86_64.
- *
- * When porting to a new kernel, this is the ONLY file that needs
- * updating for Landlock struct layout changes (see the version boundary
- * on ll_ruleset and the LL_RULESET_ROOT() accessor below).
+ * Mirrors of kernel-internal Landlock types from
+ * security/landlock/{ruleset.h,object.h,fs.c} — NOT part of the stable
+ * kernel API; layouts change between versions.  ll_ruleset is selected at
+ * build time from LINUX_VERSION_CODE (6.7+ vs 6.6, BTF-verified on
+ * 6.8.0-136-generic and openEuler 6.6.0-159.4.3.154).  Porting to a new
+ * kernel touches only this file for Landlock layout changes.
  *
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
@@ -44,12 +34,15 @@ struct ll_inode_sec {
 
 /*
  * struct landlock_object (kernel: security/landlock/object.h)
- * Mirrors the kernel-internal object refcounted by Landlock rules.
+ * Mirrors offsets 0..15 of the kernel object.  The trailing union is
+ * kernel-owned (landlock_create_object()/landlock_put_object() handle
+ * alloc/release), so only the refcounted prefix used by
+ * ll_get_inode_object() needs mirroring: usage@0, lock@4, underobj@8.
  */
 struct ll_object {
-	refcount_t usage;
-	spinlock_t lock;
-	void *underobj;
+	refcount_t usage;     /* offset 0 */
+	spinlock_t lock;      /* offset 4 */
+	void *underobj;       /* offset 8 */
 };
 
 /*
@@ -77,19 +70,11 @@ struct ll_rule {
 
 /*
  * struct landlock_ruleset (kernel: security/landlock/ruleset.h)
- *
- * Layout is kernel-version dependent, selected at build time:
- *  - 6.7+: two rb_roots (root_inode, root_net_port) — network rules
- *    landed in 6.7 — then hierarchy and the lock/.../access_masks block
- *    with u32 access_masks (renamed from fs_access_masks, widened).
- *    BTF-verified on 6.8.0-136-generic.
- *  - 6.6 and older: a single 'root' rb_root (inode rules only), and
- *    u16 fs_access_masks.  Verified on openEuler 6.6.0-159.4.3.154.
- *
- * A mismatched layout does not fail to compile — it silently corrupts
- * data (e.g. the mutex lock sits at the wrong offset and allow_path
- * hangs).  Keep the version boundary in sync with the running kernel
- * when porting.
+ * Layout selected at build time: 6.7+ has root_inode + root_net_port (net
+ * rules landed in 6.7) and u32 access_masks[]; 6.6 has single root and
+ * u16 fs_access_masks[] (BTF-verified on 6.8.0-136-generic / openEuler
+ * 6.6.0-159.4.3.154).  A mismatched layout silently corrupts data (mutex
+ * at wrong offset), so keep the version boundary in sync when porting.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 struct ll_ruleset {

@@ -391,13 +391,21 @@ static struct sandbox_net_env *net_alloc_env(struct sandbox_net_create *args,
 static void net_env_release(struct kref *kref)
 {
 	struct sandbox_net_env *env = container_of(kref, struct sandbox_net_env, ref);
+	int ret;
 
-	if (env->veth_host[0])
-		run_cmd_ns(env->ns_path, "nft delete table netpolicy 2>/dev/null; true");
-	run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null; true",
+	ret = run_cmd_ns(env->ns_path, "nft delete table netpolicy 2>/dev/null");
+	if (ret)
+		pr_warn("dyn-sandbox: env=%d nft delete table failed: %d\n",
+			env->id, ret);
+	ret = run_cmd("ip link delete %s 2>/dev/null", env->veth_host);
+	if (ret)
+		pr_warn("dyn-sandbox: env=%d ip link delete %s failed: %d\n",
+			env->id, env->veth_host, ret);
+	ret = run_cmd("umount %s 2>/dev/null; rm -f %s 2>/dev/null",
 		env->ns_path, env->ns_path);
-	if (env->veth_host[0])
-		run_cmd("ip link delete %s 2>/dev/null; true", env->veth_host);
+	if (ret)
+		pr_warn("dyn-sandbox: env=%d umount/rm ns_path failed: %d\n",
+			env->id, ret);
 	spin_lock(&env_id_lock);
 	__clear_bit(env->id, env_id_bitmap);
 	spin_unlock(&env_id_lock);
@@ -581,6 +589,13 @@ int net_create(struct sandbox_instance *inst, struct sandbox_net_create __user *
 	if (!inst)
 		return -EBADFD;
 
+	/* Reject a second NET_CREATE on the same fd: otherwise inst->net would be
+	 * overwritten (leaking the previous env) and inst->net_node would be
+	 * list_add()'d into net_inst_list a second time, corrupting the list.
+	 */
+	if (inst->net)
+		return -EEXIST;
+
 	/* Phase 1: copy + validate args from userspace */
 	args = kzalloc(sizeof(*args), GFP_KERNEL);
 	if (!args)
@@ -669,13 +684,16 @@ int net_report_dns(struct sandbox_dns_report __user *uarg)
 	if (copy_from_user(&report, uarg, sizeof(report)))
 		return -EFAULT;
 
-	pr_info("dyn-sandbox: REPORT_DNS src_ip=%pI4 domain='%s' ips=%d\n",
-		&report.src_ip, report.domain, report.ip_count);
-
 	if (report.ip_count <= 0 || report.ip_count > SANDBOX_MAX_IPS)
 		return -EINVAL;
 	if (report.domain[0] == '\0')
 		return -EINVAL;
+
+	/* Force NUL termination: copy_from_user carries no such guarantee. */
+	report.domain[sizeof(report.domain) - 1] = '\0';
+
+	pr_info("dyn-sandbox: REPORT_DNS src_ip=%pI4 domain='%s' ips=%d\n",
+		&report.src_ip, report.domain, report.ip_count);
 
 	env = env_find_by_child_ip(report.src_ip);
 	if (!env) {

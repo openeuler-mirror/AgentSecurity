@@ -18,13 +18,15 @@
  *    root_net_port to struct landlock_ruleset, shifting all fields
  *    after it; a build for 6.6 will silently corrupt data on 6.7+.
  *
- * 2. landlock_fs_underops (via kallsyms_lookup_name)
- *    static const in security/landlock/fs.c.  Its symbol is only
- *    present in kallsyms when CONFIG_KALLSYMS_ALL=y.
+ * 2. landlock_create_object / landlock_put_object / landlock_fs_underops
+ *    (via kallsyms_lookup_name)
+ *    Not EXPORT_SYMBOL'd.  Non-static functions (create/put) stay in kallsyms;
+ *    underops is a static data symbol (needs CONFIG_KALLSYMS_ALL=y).  All three
+ *    present on 6.6 and 7.0.
  *
- * 3. landlock_create_object (via kprobe address)
- *    Defined in security/landlock/object.c.  Not EXPORT_SYMBOL'd.
- *    Function name and signature may change across versions.
+ * 3. get_inode_object (NOT resolved by name)
+ *    A static, single-caller function GCC inlines (absent from kallsyms), so
+ *    ll_get_inode_object() replicates the algorithm in-module.
  *
  * 4. struct lsm_blob_sizes (landlock_blob_sizes global)
  *    Read via kallsyms + the PUBLIC header <linux/lsm_hooks.h> for the
@@ -54,7 +56,12 @@ int sandbox_lbs_cred  = -1;
 int sandbox_lbs_file  = -1;
 static int sandbox_lbs_inode = -1;
 
-static void *(*ll_create_object)(const void *underops, void *underobj);
+/* Kernel Landlock object-lifecycle symbols, resolved in sandbox_landlock_init()
+ * via kallsyms (see header deps 2/3).  ll_put_object() on the last ref runs the
+ * kernel release_inode() (blob clear + iput) then kfree_rcu(). */
+static void (*ll_put_object)(void *obj);
+static struct ll_object *(*ll_create_object)(const struct ll_object_underops *underops,
+					     void *underobj);
 static const struct ll_object_underops *ll_fs_underops;
 static const struct lsm_blob_sizes *ll_blob_sizes;
 
@@ -111,22 +118,81 @@ static struct ll_rule *rule_alloc_init(struct ll_object *obj, u32 num_layers, u1
 
 	rule->key.object = obj;
 	rule->num_layers = num_layers;
+	/*
+	 * level = 1-based layer position: unmask_layers() clears the mask bit
+	 * BIT_ULL(layer->level - 1).  Emit 1..N so a multi-layer domain stays
+	 * correct (all-num_layers would only ever clear the top bit).
+	 */
 	for (i = 0; i < num_layers; i++)
 		rule->layers[i] = (struct ll_layer){
-			.level = num_layers,
+			.level = i + 1,
 			.access = access,
 		};
 	return rule;
+}
+
+/*
+ * ll_get_inode_object - Kernel get_inode_object() replica (header dep 3: the
+ * real one is a static, single-caller function GCC inlines, so it cannot be
+ * resolved by name).  Returns one caller-owned counted ref, or an ERR_PTR.
+ *
+ * Mirrors the kernel algorithm:
+ *   - refcount_inc_not_zero() under RCU: never use a dying object without a
+ *     ref (#9 UAF);
+ *   - on a dying object, spin on object->lock until release_inode() clears
+ *     the blob, then retry;
+ *   - if absent, create and publish under inode->i_lock with an ihold(); a
+ *     losing creator kfrees its candidate and retries, so exactly one object
+ *     per inode and release_inode()'s iput() balances the ihold() (#4).
+ */
+static struct ll_object *ll_get_inode_object(struct inode *inode)
+{
+	struct ll_object *object, *new_object;
+	void __rcu **slot = (void __rcu **)(inode->i_security + sandbox_lbs_inode);
+
+	rcu_read_lock();
+retry:
+	object = rcu_dereference(*slot);
+	if (object) {
+		if (likely(refcount_inc_not_zero(&object->usage))) {
+			rcu_read_unlock();
+			return object;
+		}
+		/* Racing with release_inode(): wait for it, then retry. */
+		spin_lock(&object->lock);
+		spin_unlock(&object->lock);
+		goto retry;
+	}
+	rcu_read_unlock();
+
+	new_object = ll_create_object(ll_fs_underops, inode);
+	if (IS_ERR(new_object))
+		return new_object;
+
+	/* Protects against concurrent get_inode_object() / hook_sb_delete(). */
+	spin_lock(&inode->i_lock);
+	if (unlikely(rcu_access_pointer(*slot))) {
+		/* Someone else just created the object; bail out and retry. */
+		spin_unlock(&inode->i_lock);
+		kfree(new_object);
+		rcu_read_lock();
+		goto retry;
+	}
+
+	ihold(inode);
+	rcu_assign_pointer(*slot, new_object);
+	spin_unlock(&inode->i_lock);
+	return new_object;
 }
 
 int sandbox_landlock_allow_path(struct path *path, void *dom_ptr, u16 access_mask)
 {
 	struct ll_ruleset *dom = dom_ptr;
 	struct inode *inode;
-	struct ll_object *obj;
+	struct ll_object *obj = NULL;
 	struct ll_rule *rule;
-	bool owns_obj = false;   /* obj was created here, not yet adopted by a rule/blob */
-	bool locked   = false;
+	bool locked = false;
+	unsigned int i;
 	int ret = -ENOMEM;
 
 	if (!path || !dom_ptr)
@@ -138,29 +204,24 @@ int sandbox_landlock_allow_path(struct path *path, void *dom_ptr, u16 access_mas
 	if (!inode)
 		return -ENOENT;
 
-	rcu_read_lock();
-	obj = *(void __rcu **)(inode->i_security + sandbox_lbs_inode);
-	if (obj)
-		obj = (void *)rcu_dereference(obj);
-	rcu_read_unlock();
-
-	if (!obj) {
-		obj = ll_create_object(ll_fs_underops, inode);
-		if (!obj)
-			goto err;
-		owns_obj = true;
+	/* Acquire a counted object ref. On success @obj holds
+	 * one ref owned by this function: handed to the new rule on INSERT,
+	 * dropped on UPDATE/error. */
+	obj = ll_get_inode_object(inode);
+	if (IS_ERR(obj)) {
+		ret = PTR_ERR(obj);
+		goto err;
 	}
 
 	if (!mutex_trylock(&dom->lock)) {
 		pr_warn_ratelimited("dyn-sandbox: domain lock contended (child is STOPPED, should not happen)\n");
 		ret = -EAGAIN;
-		goto err;
+		goto err_put;
 	}
 	locked = true;
 
 	rule = rb_entry(rb_find(obj, LL_RULESET_ROOT(dom), rb_rule_cmp), struct ll_rule, node);
 	if (rule) {
-		unsigned int i;
 		pr_info("dyn-sandbox: ALLOW_PATH ino=%lu access=0x%x UPDATE layers_before=[",
 			inode->i_ino, access_mask);
 		for (i = 0; i < rule->num_layers; i++)
@@ -168,43 +229,43 @@ int sandbox_landlock_allow_path(struct path *path, void *dom_ptr, u16 access_mas
 				rule->layers[i].level,
 				rule->layers[i].access);
 		pr_cont("]\n");
+		/* UPDATE: @rule already holds a ref to @obj, so with the one we
+		 * acquired, usage >= 2 — the drop below never reaches zero and
+		 * ll_put_object() only decrements.  Extend every layer. */
 		for (i = 0; i < rule->num_layers; i++)
 			rule->layers[i].access |= access_mask;
 	} else {
 		pr_info("dyn-sandbox: ALLOW_PATH ino=%lu access=0x%x INSERT\n",
 			inode->i_ino, access_mask);
+		/* INSERT: adopt our ref as the rule's (net +1, as in the kernel's
+		 * create_rule() get_object / append_fs_rule() put_object pair). */
 		rule = rule_alloc_init(obj, dom->num_layers, access_mask);
 		if (!rule)
-			goto err;      /* err releases the mutex */
-		/* A newly created obj has usage=1 as this rule's reference (same handoff as
-		 * create_rule); take +1 only when obj came from the inode blob (already
-		 * referenced by another rule). */
-		if (!owns_obj)
-			refcount_inc(&obj->usage);
-		owns_obj = false;  /* rule holds the obj reference now, not this function */
+			goto err_unlock_put;
 		rb_add(&rule->node, LL_RULESET_ROOT(dom), rb_rule_less);
 		dom->num_rules++;
+		obj = NULL;	/* ref adopted by the rule — skip the drop below */
 	}
 
 	mutex_unlock(&dom->lock);
 	locked = false;
 
-	if (!rcu_access_pointer(*(void __rcu **)(inode->i_security + sandbox_lbs_inode))) {
-		rcu_read_lock();
-		if (!rcu_dereference(*(void __rcu **)(inode->i_security + sandbox_lbs_inode))) {
-			ihold(inode);
-			rcu_assign_pointer(*(void __rcu **)(inode->i_security + sandbox_lbs_inode), obj);
-		}
-		rcu_read_unlock();
+	if (obj) {
+		ll_put_object(obj);	/* UPDATE path: release our temporary ref */
+		obj = NULL;
 	}
-
 	return 0;
 
-err:
-	if (locked)
+err_unlock_put:
+	if (locked) {
 		mutex_unlock(&dom->lock);
-	if (owns_obj)
-		kfree(obj);
+		locked = false;
+	}
+err_put:
+	/* @obj is always a valid acquired ref here; on the last ref
+	 * ll_put_object() runs kernel release_inode() (blob clear + iput). */
+	ll_put_object(obj);
+err:
 	return ret;
 }
 
@@ -312,37 +373,33 @@ bool sandbox_landlock_probe(void)
 
 int sandbox_landlock_init(void)
 {
-	struct kprobe kp_cr = { .symbol_name = "landlock_create_object" };
-
 	if (!kln) {
 		pr_err("dyn-sandbox: kallsyms_lookup_name not resolved, aborting Landlock init\n");
 		return -EOPNOTSUPP;
 	}
 
-	if (register_kprobe(&kp_cr) == 0) {
-		ll_create_object = (void *)kp_cr.addr;
-		unregister_kprobe(&kp_cr);
-	}
-
-	ll_fs_underops = (const struct ll_object_underops *)kln("landlock_fs_underops");
+	ll_put_object    = (void *)kln("landlock_put_object");
+	ll_create_object = (void *)kln("landlock_create_object");
+	ll_fs_underops   = (const struct ll_object_underops *)kln("landlock_fs_underops");
 
 	ll_blob_sizes = (const struct lsm_blob_sizes *)kln("landlock_blob_sizes");
 	if (ll_blob_sizes)
 		probe_landlock_offsets(ll_blob_sizes);
 
-	if (!ll_create_object || !ll_fs_underops || !ll_blob_sizes) {
+	if (!ll_put_object || !ll_create_object || !ll_fs_underops || !ll_blob_sizes) {
 		pr_warn("dyn-sandbox: Landlock symbol resolution incomplete "
-			"(create_obj=%s underops=%s blob_sizes=%s), ALLOW_FILE disabled\n",
+			"(create_obj=%s underops=%s put_obj=%s blob_sizes=%s), ALLOW_FILE disabled\n",
 			ll_create_object ? "ok" : "missing",
 			ll_fs_underops ? "ok" : "missing",
+			ll_put_object ? "ok" : "missing",
 			ll_blob_sizes ? "ok" : "missing");
 		return -EOPNOTSUPP;
 	}
 
 	landlock_active = true;
 
-	pr_info("dyn-sandbox: create_obj=%p underops=%p lbs_cred=%d lbs_file=%d lbs_inode=%d\n",
-		ll_create_object, ll_fs_underops,
+	pr_info("dyn-sandbox: create_obj=%p underops=%p put_obj=%p lbs_cred=%d lbs_file=%d lbs_inode=%d\n",
+		ll_create_object, ll_fs_underops, ll_put_object,
 		sandbox_lbs_cred, sandbox_lbs_file, sandbox_lbs_inode);
 
 	return 0;

@@ -19,6 +19,7 @@
 
 #include "sandbox_dev.h"
 
+struct pid;
 struct pid_namespace;
 struct pt_regs;
 
@@ -99,7 +100,8 @@ enum blocked_cap_kind {
  */
 struct blocked_entry {
 	struct list_head list_node;
-	pid_t            pid;               /* PID of the blocked task */
+	struct pid      *pid_ref;          /* pid of the blocked task; ref held so the
+					       pid number cannot be recycled before DECISION */
 	char             blocked_file[SANDBOX_PATH_MAX];
 	char             blocked_resolved[SANDBOX_PATH_MAX];
 	u16              request_access;
@@ -146,7 +148,8 @@ struct sandbox_instance {
 	struct list_head list_node;	 /* in inst_list (kprobe PID lookup) */
 	struct list_head net_node;	 /* in net_inst_list (REPORT_DNS by child_ip) */
 	struct kref      ref;		 /* refcount: sandbox_release owns one; kprobe handlers hold transient */
-	pid_t            registered_pid;
+	struct pid      *registered_pid_ref;  /* pid of the sandbox child; ref held so
+						release's SIGKILL can't hit a recycled pid */
 	bool             in_inst_list;
 	bool             in_net_inst_list;
 	uint32_t         caller_permission; /* ioctl 命令权限位掩码, open 时按 exe 路径授予 */

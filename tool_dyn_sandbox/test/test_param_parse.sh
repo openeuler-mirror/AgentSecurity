@@ -100,6 +100,28 @@ test_case "B3 mount bind 多个"    "$B_D --mount /a:ro --mount /b:rw -D" 'mount
 test_case "B4 mount-tmpfs"        "$B_D --mount-tmpfs /data:128 -D" 'size=128'
 test_case "B5 mount-tmpfs /tmp"   "$B_D --mount-tmpfs /tmp:512 -D" 'tmpfs_size_mb: 512'
 test_case "B6 mount-tmpfs /tmp 默认" "$B_D --mount-tmpfs /tmp -D" 'tmpfs_size_mb: 256'
+test_case "B17 mount-tmpfs :0 默认(用户挂载)" "$B_D --mount-tmpfs /data:0 -D" 'dest=/data rw=0 size=0'
+test_case "B18 mount-tmpfs /tmp:0 默认" "$B_D --mount-tmpfs /tmp:0 -D" 'tmpfs_size_mb: 256'
+test_case "B19 mount-tmpfs 逗号多值" "$B_D --mount-tmpfs '/d1:100,/d2:200' -D" 'mounts (2)'
+test_case "B19b mount-tmpfs 多值第二条解析" "$B_D --mount-tmpfs '/d1:100,/d2:200' -D" 'dest=/d2 rw=0 size=200'
+test_case "B20 mount bind 逗号多值" "$B_D --mount '/a:ro,/b:rw' -D" 'mounts (2)'
+test_case "B20b mount bind 多值 rw 生效" "$B_D --mount '/a:ro,/b:rw' -D" 'dest=/b rw=1'
+# B21-B26: 空段 (前导 / 中间连续 / 尾逗号) 一律拒绝 — 逗号必须严格分隔非空挂载
+test_case "B21 tmpfs 连续逗号空段拒绝" "$B_D --mount-tmpfs '/d1:100,,/d2:200' -D" 'empty --mount-tmpfs entry' 1
+test_case "B22 tmpfs 尾逗号空段拒绝" "$B_D --mount-tmpfs '/d1:100,/d2:200,' -D" 'empty --mount-tmpfs entry' 1
+test_case "B23 mount 逗号含 /tmp 段(改大小+普通段混用)" "$B_D --mount-tmpfs '/tmp:64,/data:128' -D" 'tmpfs_size_mb: 64'
+test_case "B24 tmpfs 前导逗号空段拒绝" "$B_D --mount-tmpfs ',/d1:100,/d2:200' -D" 'empty --mount-tmpfs entry' 1
+test_case "B25 bind 前导逗号空段拒绝" "$B_D --mount ',/a:ro,/b:rw' -D" 'empty --mount entry' 1
+test_case "B26 bind 尾逗号空段拒绝" "$B_D --mount '/a:ro,/b:rw,' -D" 'empty --mount entry' 1
+test_case "B26b bind 连续逗号空段拒绝" "$B_D --mount '/a:ro,,/b:rw' -D" 'empty --mount entry' 1
+test_case "B27 tmpfs 中段非法整串拒绝" "$B_D --mount-tmpfs '/d1:100,/x:abc,/d2:200' -D" 'invalid tmpfs size' 1
+test_case "B28 bind 中段非法整串拒绝" "$B_D --mount '/a:ro,/x:bad,/b:rw' -D" 'invalid mount option' 1
+# B29-B32: domain/cidr 空段与 --mount 同规 — 空段(前导/连续/尾逗号)一律拒绝,
+#          不再像旧版同 strtok 那样静默跳过 (对齐 --mount/--mount-tmpfs 多值形式)
+test_case "B29 domain 前导逗号空段拒绝" "$B_D --domain ',a.com,b.com' -D" 'empty --domain entry' 1
+test_case "B30 domain 尾逗号空段拒绝"   "$B_D --domain 'a.com,b.com,' -D" 'empty --domain entry' 1
+test_case "B31 cidr 连续逗号空段拒绝"   "$B_D --cidr '10.0.0.0/8,,192.168.0.0/16' -D" 'empty --cidr entry' 1
+test_case "B32 cidr 前导逗号空段拒绝"   "$B_D --cidr ',10.0.0.0/8' -D" 'empty --cidr entry' 1
 test_case "B7 landlock 含权限"    "$B_D --landlock '/usr:read+execute' -D" 'perms=read+execute'
 test_case "B8 landlock 无权限"    "$B_D --landlock '/usr' -D" 'landlock, nolandlock 0, rules (1)'
 test_case "B9 domain 单值"       "$B_D --domain example.com -D" 'example.com'
@@ -116,8 +138,11 @@ test_case "B16 --tmpfs-size"     "$B_D --tmpfs-size 512 -D" 'tmpfs_size_mb: 512'
 # ------------------------------------------------------------------
 echo "=== C. CLI 组合场景 ==="
 
-test_case "C1 mount-tmpfs + tmpfs-size" \
-	"$B_D --mount-tmpfs /tmp --tmpfs-size 512 -D" 'tmpfs_size_mb: 512'
+# C1/C1b: --mount-tmpfs /tmp 与 --tmpfs-size 是同一 /tmp 大小旋钮, 任一重复/混用都冲突 (S4)
+test_case "C1 /tmp 两拼写混用冲突" \
+	"$B_D --mount-tmpfs /tmp --tmpfs-size 512 -D" 'may be set only once' 1
+test_case "C1b /tmp 两拼写混用(反向顺序)冲突" \
+	"$B_D --tmpfs-size 512 --mount-tmpfs /tmp:128 -D" 'may be set only once' 1
 test_case "C2 mount-tmpfs /tmp + /data" \
 	"$B_D --mount-tmpfs /tmp:128 --mount-tmpfs /data:64 -D" 'mounts (1)'
 test_case "C3 domain + cidr → network_mode" \
@@ -130,6 +155,23 @@ test_case "C5 全选所有选项" \
 	'network_mode: filter'
 test_case "C6 -D 放最后（无需 command）" \
 	"$B_D --mount /usr --domain a.com -D" 'mounts (1)'
+
+# C7-C10: S4 — /tmp 大小旋钮 at-most-once: 任一拼写重复/混用都报冲突; 0 物化默认256
+test_case "C7 重复 --tmpfs-size 冲突" "$B_D --tmpfs-size 64 --tmpfs-size 128 -D" 'may be set only once' 1
+test_case "C8 重复 --tmpfs-size 同值也冲突" "$B_D --tmpfs-size 128 --tmpfs-size 128 -D" 'may be set only once' 1
+test_case "C9 --tmpfs-size 0 物化默认256" "$B_D --tmpfs-size 0 -D" 'tmpfs_size_mb: 256' 0
+test_case "C10 重复含 0 也冲突" "$B_D --tmpfs-size 128 --tmpfs-size 0 -D" 'may be set only once' 1
+
+# C11-C17: S5/S6/S7 — 标量旋钮重复冲突 (-c / --seccomp); --seccomp-syscalls 重复=追加 union
+test_case "C11 S5 重复 -c 冲突" "$B_D -c /tmp -c /usr -D" 'conflicting -c workdir (/tmp): -c may be set only once' 1
+# C12: 默认 "/" 与显式 "-c /" 撞车边界 — 单次 -c / 必须放行 (重复检测靠 workdir_set 标记而非内容)
+test_case "C12 S5 单次 -c / 放行" "$B_D -c / -D" 'workdir: /' 0
+test_case "C13 S6 重复 --seccomp 冲突" "$B_D --seccomp default --seccomp script -D" 'conflicting --seccomp profile (default): --seccomp may be set only once' 1
+test_case "C14 S6 同值重复也冲突" "$B_D --seccomp script --seccomp script -D" 'conflicting --seccomp profile (script): --seccomp may be set only once' 1
+test_case "C15 S7 重复 syscalls 追加" "$B_D --seccomp-syscalls read,write --seccomp-syscalls openat,close -D" 'syscalls: read,write,openat,close' 0
+test_case "C16 S7 三段追加" "$B_D --seccomp-syscalls read --seccomp-syscalls exit_group --seccomp-syscalls openat -D" 'syscalls: read,exit_group,openat' 0
+test_case "C17 S7 累计超 511 拒绝" "$B_D --seccomp-syscalls read,write,openat --seccomp-syscalls $(printf 'a%.0s' {1..510}) -D" 'too long' 1
+test_case "C17b S7 单段超 511 拒绝(旧 strncpy 截断 bug)" "$B_D --seccomp-syscalls $(printf 'a%.0s' {1..520}) -D" 'too long' 1
 
 # ------------------------------------------------------------------
 #  D. CLI 错误场景
@@ -179,6 +221,13 @@ test_case "D10 CIDR 前缀负数" "$B_D --cidr '10.0.0.0/-1' -D" 'invalid prefix
 test_case "D11 CIDR 前缀非数字" "$B_D --cidr '10.0.0.0/abc' -D" 'invalid prefix' 1
 # D12: 前缀0 (/0) 会让白名单变成 0.0.0.0/0 -> 放行全部流量, 必须拒绝
 test_case "D12 CIDR 前缀0" "$B_D --cidr '10.0.0.0/0' -D" 'invalid prefix' 1
+# D12b-D12e: 地址段 inet_pton 严格校验 — 旧 inet_addr 对畸形输入静默返回
+# INADDR_NONE(255.255.255.255) 落入白名单 fail-open; 且合法 255.255.255.255
+# 与错误哨兵同值无法区分 — 现畸形显式拒绝, 真 255.255.255.255 照常放行
+test_case "D12b CIDR 地址越界段999" "$B_D --cidr '10.0.0.999/8' -D" 'invalid CIDR address' 1
+test_case "D12c CIDR 地址非数字" "$B_D --cidr 'abc/8' -D" 'invalid CIDR address' 1
+test_case "D12d CIDR 地址简写被拒" "$B_D --cidr '10/8' -D" 'invalid CIDR address' 1
+test_case "D12e CIDR 255.255.255.255/32 放行" "$B_D --cidr 255.255.255.255/32 -D" '255.255.255.255/32' 0
 test_case "D13 seccomp 互斥(profile先)" \
 	"$B_D --seccomp default --seccomp-syscalls read" 'mutually exclusive' 1
 test_case "D14 seccomp 互斥(syscalls先)" \
@@ -186,7 +235,8 @@ test_case "D14 seccomp 互斥(syscalls先)" \
 
 test_case "D15 mount 无效后缀" "$B_D --mount /x:invalid -D" "invalid mount option" 1
 test_case "D16 mount-tmpfs 负数" "$B_D --mount-tmpfs /x:-1" "invalid tmpfs size" 1
-test_case "D17 domain 空字符串" "$B_D --domain '' -D" "empty domain" 1
+test_case "D17 domain 空字符串" "$B_D --domain '' -D" "empty --domain argument" 1
+test_case "D17b cidr 空字符串" "$B_D --cidr '' -D" "empty --cidr argument" 1
 test_case "D18 seccomp 未知profile" "$B_D --seccomp unknown -- echo hello" "unknown seccomp profile" 1
 test_case "D19 seccomp-syscalls 空串" "$B_D --seccomp-syscalls '' -D" "cannot be empty" 1
 # D20: mount 路径超长(≥256) 曾因 strncpy 静默截断成错误路径, 现在必须显式拒绝
@@ -196,6 +246,18 @@ test_case "D20 mount 路径超长" "$B_D --mount '/$(printf 'a%.0s' {1..300})' -
 test_case "D21 mount 边界255+option" "$B_D --mount '/$(printf 'a%.0s' {1..254}):rw' -D" 'mounts (1)' 0
 # D22: landlock 路径超长(≥256) 曾被静默截断成错误路径授权, 现在必须显式拒绝
 test_case "D22 landlock 路径超长" "$B_D --landlock '/$(printf 'a%.0s' {1..300}):read' -D" 'landlock path too long' 1
+
+# D23-D27: 同 dest 重复挂载一律拒绝 (parse_args 收尾统一去重)
+test_case "D23 同 dest 重复(选项重复)" "$B_D --mount /usr:ro --mount /usr:rw -D" 'duplicate mount destination: /usr' 1
+test_case "D24 同 dest 重复(逗号撞车)" "$B_D --mount-tmpfs '/d1:100,/d1:200' -D" 'duplicate mount destination: /d1' 1
+test_case "D25 同 dest 重复(bind+tmpfs 撞车)" "$B_D --mount /usr:ro --mount-tmpfs /usr:64 -D" 'duplicate mount destination: /usr' 1
+test_case "D26 同 dest 重复(重复 tmpfs 选项)" "$B_D --mount-tmpfs /d:100 --mount-tmpfs /d:200 -D" 'duplicate mount destination: /d' 1
+test_case "D27 /tmp 拼写重复冲突" "$B_D --mount-tmpfs /tmp:64 --mount-tmpfs /tmp:128 -D" 'may be set only once' 1
+# D28: 逗号展开逐段计上限 (33 段, 第 33 段撞 MAX_MOUNTS=32, dup 检查在超限之后不会先触发)
+MV_OVER=""
+for i in $(seq 1 33); do MV_OVER+="/mv$i:$i,"; done
+MV_OVER="${MV_OVER%,}"
+test_overflow "D28 mount-tmpfs 逗号超限" 'too many --mount entries' 1 "$B_D" --mount-tmpfs "$MV_OVER" -D
 
 # ------------------------------------------------------------------
 #  E. 互斥检查
@@ -344,12 +406,29 @@ echo "=== H. YAML Policy 错误场景 ==="
 
 test_exit "H1 文件不存在" "$B_D --policy /nonexist_xyz.yaml -- echo" 1
 
-put_yaml h2.yaml "mount: [broken: yaml: trailing"
+# H2: 语法错误用未闭合引号触发 — 流式解析会先撞未知键门禁再达 stream 尾,
+# 故换 tokenizer 阶段即报 parse error 的输入 (见 S13 unknown-key 门禁)
+put_yaml h2.yaml 'seccomp: "unclosed'
 test_case "H2 YAML 语法错误" "$B_D --policy $TMPDIR/h2.yaml -- echo" 'parse error' 1
 
 put_yaml h3.yaml "network:
   cidrs: [10.0.0.0]"
 test_case "H3 CIDR 无前缀" "$B_D --policy $TMPDIR/h3.yaml -- echo" 'invalid CIDR' 1
+
+# H3b-H3d: 地址段 inet_pton 严格校验 (对齐 CLI D12b-); H3d 即 #6 场景 —
+# 超长地址段(≥63) 旧实现 strncpy 进 buf[64] 不补 NUL 致 strchr 越读栈
+put_yaml h3b.yaml "network:
+  cidrs: ['10.0.0.999/8']"
+test_case "H3b CIDR 地址越界段999" "$B_D --policy $TMPDIR/h3b.yaml -- echo" 'invalid CIDR address' 1
+
+put_yaml h3c.yaml "network:
+  cidrs: ['255.255.255.255/32']"
+test_case "H3c CIDR 255.255.255.255/32 放行" "$B_D -D --policy $TMPDIR/h3c.yaml" '255.255.255.255/32' 0
+
+H3D_LONG="$(printf 'a%.0s' $(seq 1 70))"
+put_yaml h3d.yaml "network:
+  cidrs: ['${H3D_LONG}/8']"
+test_case "H3d CIDR 超长地址拒绝(#6 回归)" "$B_D --policy $TMPDIR/h3d.yaml -- echo" 'invalid CIDR' 1
 
 H4_DOMAINS=""
 for i in $(seq 1 17); do
@@ -378,6 +457,44 @@ put_yaml h6.yaml "mount:
 $H6_MOUNTS"
 test_case "H6 mount 超限" "$B_D --policy $TMPDIR/h6.yaml -- echo" 'too many mounts' 1
 
+# H7/H8: S11/S12 — policy 侧漏校验补上 (对齐 CLI 与 usage-guide schema)
+put_yaml h7.yaml "seccomp:
+  profile: default
+  syscalls: [read, write]"
+test_case "H7 YAML profile+syscalls 互斥" "$B_D --policy $TMPDIR/h7.yaml -- echo" "'profile' and 'syscalls' are mutually exclusive" 1
+
+put_yaml h8.yaml "mount:
+  - {type: invalid_type, src: /usr}"
+test_case "H8 YAML mount type 非法" "$B_D --policy $TMPDIR/h8.yaml -- echo" "invalid mount type 'invalid_type'" 1
+# H8b: type 省略 = 缺省 bind (usage-guide), 仍放行
+put_yaml h8b.yaml "mount:
+  - {src: /usr}"
+test_case "H8b YAML mount type 省略缺省 bind" "$B_D --policy $TMPDIR/h8b.yaml -D" 'type=bind' 0
+
+# H9: S13 — 未知键一律报错 (拼错/design-doc 遗留不再静默空跑)
+put_yaml h9.yaml "foo: bar"
+test_case "H9 顶层未知键" "$B_D --policy $TMPDIR/h9.yaml -- echo" "unknown key 'foo'" 1
+put_yaml h9b.yaml "network:
+  enabled: 'yes'"
+test_case "H9b network.enabled 遗留键被拒" "$B_D --policy $TMPDIR/h9b.yaml -- echo" "unknown key 'enabled'" 1
+put_yaml h9c.yaml "seccomp:
+  profiel: default"
+test_case "H9c 拼错字段被拒" "$B_D --policy $TMPDIR/h9c.yaml -- echo" "unknown key 'profiel'" 1
+# H9d: 完整合法 YAML (usage-guide 完整格式) 不受白名单门禁误伤
+put_yaml h9d.yaml "name: demo
+version: 1
+mount:
+  - {type: bind, src: /usr, readonly: true}
+landlock:
+  - {path: /usr, access: [read]}
+network:
+  mode: filter
+  domains: [a.com]
+  cidrs: [10.0.0.0/8]
+seccomp:
+  profile: default"
+test_case "H9d 完整合法 YAML 放行" "$B_D --policy $TMPDIR/h9d.yaml -D" 'network_mode: filter' 0
+
 # ------------------------------------------------------------------
 #  I. 特殊边界场景
 # ------------------------------------------------------------------
@@ -388,12 +505,103 @@ LONG_DOMAIN="$(python3 -c "print('a'*127 + '.com')" 2>/dev/null || echo "a...lon
 # I1: 域名超长(≥128) 曾被 strncpy 静默截断成另一个域名, 现在必须显式拒绝
 test_case "I1 domain 超长被拒" "$B_D --domain '$LONG_DOMAIN' -D" 'domain too long' 1
 
-# I2: 同名 mount 重复，两条都加入（当前无去重）
-test_case "I3 同名 mount 重复" \
-	"$B_D --mount /usr:ro --mount /usr:rw -D" 'mounts (2)'
+# I2/I3: 同 dest 重复挂载 = 歧义配置, parse_args 收尾统一去重拒绝 (2026-09-03 决策,
+# 不再走 bwrap 内核叠挂; 见 usage-guide "同一 dest 只能挂载一次")
+test_case "I3 同名 mount 重复报错" \
+	"$B_D --mount /usr:ro --mount /usr:rw -D" 'duplicate mount destination: /usr' 1
 
 # I4: 多个 -D
 test_case "I4 多个-D" "$B_D -D -D -D" 'workdir: /'
+
+# ------------------------------------------------------------------
+#  J. bind/tmpfs 挂载安全限制 (bind 只收 src + 禁 '..' 逃逸停泊根 /oldroot)
+# ------------------------------------------------------------------
+echo ""
+echo "=== J. bind/tmpfs 挂载安全限制 ==="
+
+# J1: CLI 路径含 '..' 被拒 (--mount /../oldroot 曾可叠回停泊根逃逸)
+test_case "J1 CLI --mount 含 .. 被拒" \
+	"$B_D --mount /../oldroot:rw -D" "invalid --mount path" 1
+
+# J2: CLI 路径含 '.'/'//' 被拒
+test_case "J2 CLI --mount 含 . 被拒" \
+	"$B_D --mount /usr/./bin:ro -D" "invalid --mount path" 1
+
+# J3: CLI 正常同路径仍放行
+test_case "J3 CLI --mount 正常放行" \
+	"$B_D --mount /usr:ro -D" "mounts (1)" 0
+
+# J4: YAML bind 显式 dest (src!=dest, 曾指向 /oldroot 逃逸) 被拒
+put_yaml j4.yaml "mount:
+  - type: bind
+    src: /tmp
+    dest: /oldroot"
+test_case "J4 YAML bind dest 被拒" \
+	"$B_D -D --policy $TMPDIR/j4.yaml" "takes only 'src'" 1
+
+# J5: YAML bind 即使 dest==src 也不允许 dest 字段
+put_yaml j5.yaml "mount:
+  - type: bind
+    src: /usr
+    dest: /usr"
+test_case "J5 YAML bind dest==src 仍拒" \
+	"$B_D -D --policy $TMPDIR/j5.yaml" "takes only 'src'" 1
+
+# J6: YAML bind 路径含 '..' 被拒
+put_yaml j6.yaml "mount:
+  - type: bind
+    src: /../oldroot"
+test_case "J6 YAML bind 含 .. 被拒" \
+	"$B_D -D --policy $TMPDIR/j6.yaml" "invalid mount path" 1
+
+# J7: YAML bind 只给 src 放行 (dest 恒 = src)
+put_yaml j7.yaml "mount:
+  - type: bind
+    src: /usr
+    readonly: true"
+test_case "J7 YAML bind 只收 src 放行" \
+	"$B_D -D --policy $TMPDIR/j7.yaml" "mounts (1)" 0
+
+# J8: YAML tmpfs 出现 src 被拒
+put_yaml j8.yaml "mount:
+  - type: tmpfs
+    src: /tmp
+    dest: /data"
+test_case "J8 YAML tmpfs 带 src 被拒" \
+	"$B_D -D --policy $TMPDIR/j8.yaml" "takes only 'dest'" 1
+
+# J9: YAML bind 缺 src 被拒
+put_yaml j9.yaml "mount:
+  - type: bind"
+test_case "J9 YAML bind 缺 src 被拒" \
+	"$B_D -D --policy $TMPDIR/j9.yaml" "requires 'src'" 1
+
+# J10: CLI bind/tmpfs 命中 /oldroot 被拒 (bind 字面叠层也逃逸, tmpfs 更直接)
+test_case "J10 CLI --mount /oldroot 被拒" \
+	"$B_D --mount /oldroot:rw -D" "invalid --mount path" 1
+test_case "J10b CLI --mount-tmpfs /oldroot 被拒" \
+	"$B_D --mount-tmpfs /oldroot:64 -D" "invalid --mount-tmpfs path" 1
+
+# J11: YAML bind src=/oldroot 被拒
+put_yaml j11.yaml "mount:
+  - type: bind
+    src: /oldroot"
+test_case "J11 YAML bind /oldroot 被拒" \
+	"$B_D -D --policy $TMPDIR/j11.yaml" "invalid mount path" 1
+
+# J12: YAML tmpfs dest=/oldroot 被拒
+put_yaml j12.yaml "mount:
+  - type: tmpfs
+    dest: /oldroot"
+test_case "J12 YAML tmpfs /oldroot 被拒" \
+	"$B_D -D --policy $TMPDIR/j12.yaml" "invalid mount path" 1
+
+# J13: YAML tmpfs 正常路径放行
+put_yaml j13.yaml "mount:
+  - type: tmpfs
+    dest: /data"
+test_case "J13 YAML tmpfs 正常放行" \
+	"$B_D -D --policy $TMPDIR/j13.yaml" "mounts (1)" 0
 
 # ------------------------------------------------------------------
 #  汇总
