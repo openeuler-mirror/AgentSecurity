@@ -10,6 +10,9 @@ modules.order
 # User-space binaries
 dyn-sandbox
 dyn-sandbox-dns
+# test 辅助二进制 (构建产物, 顶层 make all 会移入 dist/)
+test/seccomp_test
+test/thread_auth
 
 .claude
 .agents

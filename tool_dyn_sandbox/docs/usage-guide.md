@@ -46,10 +46,12 @@ dyn-sandbox --mount /usr -D
 | `--mount-tmpfs` | 无 | `/path[:MB]` | 256 MB | 最多 32 个（含 `--mount`） | 挂载 tmpfs。size 省略或 `:0` = 默认 256 支持逗号分隔多值 |
 | `--tmpfs-size` | 无 | MB | 256 | — | 单独指定 `/tmp` tmpfs 大小；`0` 亦为默认 256（解析物化为 256） |
 | `--landlock` | 无 | `/path:perm1+perm2` | 仅路径，无权限 | 最多 64 条 | Landlock 路径访问规则。不支持 `~` 或环境变量展开 |
+| `--no-landlock` | 无 | — | 否 | 与 `--landlock` 互斥；仅在 Landlock 启用构建（`LANDLOCK_ENABLE=1`）中可用 | 完全跳过 Landlock，只保留文件系统/网络隔离 |
 | `--seccomp` | 无 | profile | — | 与 `--seccomp-syscalls` 互斥；只能设置一次 | 使用预置 seccomp profile。可选值：`default` / `file_access` / `script` |
 | `--seccomp-syscalls` | 无 | syscall1,syscall2,... | — | 与 `--seccomp` 互斥；累计 ≤511 字符 | 自定义 syscall 白名单，逗号分隔。重复 = 追加合并（union，对齐 YAML `syscalls` 追加语义），超长报 `too long` |
 | `--domain` | 无 | domain | — | 最多 16 个，单个最长 127 字符 | DNS 域名白名单，可重复或逗号分隔多值（空段一律拒绝，同 `--mount` 多值形式） |
 | `--cidr` | 无 | x.x.x.x/prefix | — | 最多 16 个，prefix 1-32（`/0` 拒绝：会放行全部流量） | IP CIDR 白名单，可重复或逗号分隔多值（空段一律拒绝，同 `--mount` 多值形式）；地址须标准点分十进制（`inet_pton` 校验，拒绝简写 `10/8`、八进制、越界段如 `10.0.0.999`，畸形一律报 `invalid CIDR address`） |
+| `--share-net` | 无 | — | — | 与 `--domain`/`--cidr` 互斥；可重复（幂等） | 共享宿主网络命名空间与 DNS（不加 `CLONE_NEWNET`，见设计文档 §4.2.3） |
 | `--policy` | 无 | file | — | 与所有 CLI 参数互斥 | 从 YAML 策略文件加载完整配置 |
 | _（工作目录）_ | `-c` | /path | `/` | 只能设置一次 | 设置命令工作目录（重复报 `conflicting -c workdir`） |
 | `--dump-config` | `-D` | — | — | 豁免互斥检查 | 打印 `sandbox_config` 所有字段后退出，不启动沙箱 |
@@ -277,9 +279,11 @@ dyn-sandbox --mount /usr:ro --mount /tmp:rw \
 
 | Profile | Syscall 数量 | 说明 | 典型用途 |
 |---------|-------------|------|---------|
-| default | ~31 | 保守白名单，含 glibc 启动必需 + 基本文件 IO + 信号 | 运行基本命令（`ls`, `echo`, `cat`） |
-| file_access | ~28 | 含 execve + mprotect + access，可运行动态链接的文件工具 | 文件读写工具 |
-| script | ~75 | 含进程管理 + 网络 socket + 文件系统查询 + 时间，支持 shell/Python | 脚本执行（bash, python3） |
+| default | 37 | 保守白名单，含 glibc 启动必需 + 基本文件 IO + 信号 | 运行基本命令（`ls`, `echo`, `cat`） |
+| file_access | 32 | 含 execve + mprotect + access，可运行动态链接的文件工具 | 文件读写工具 |
+| script | 93 | 含进程管理 + 网络 socket + 文件系统查询 + 时间，支持 shell/Python | 脚本执行（bash, python3） |
+
+> 计数为 x86_64 展开后的数组条目数（含 glibc 启动必需项）；aarch64 因 `access`/`vfork`/`poll`/`select`/`stat`/`readlink`/`time`/`arch_prctl` 等 syscall 不存在而略少。
 
 自定义 syscall 白名单通过 `--seccomp-syscalls` 或 `seccomp.syscalls` 指定，支持的 syscall 名称见 `seccomp_profiles.c` 的 `syscall_names` 映射表（约 80 个常见 syscall）。
 
@@ -290,7 +294,7 @@ dyn-sandbox --mount /usr:ro --mount /tmp:rw \
 | mount 条目 | 32 | 含 bind 和 tmpfs 合计 |
 | landlock 规则 | 64 | — |
 | 域名白名单 | 16 | 每个不超过 127 字符 |
-| CIDR 白名单 | 16 | prefix 范围 0-32 |
+| CIDR 白名单 | 16 | prefix 范围 1-32（`/0` 拒绝：会放行全部流量） |
 | 自定义 syscall | 128 | — |
 | seccomp profile | 3 种预置 | default / file_access / script |
 | YAML 嵌套深度 | 32 层 | 超出报错 |

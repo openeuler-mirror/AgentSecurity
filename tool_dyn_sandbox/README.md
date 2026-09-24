@@ -36,8 +36,8 @@
 ## 快速开始
 
 ```bash
-# 加载内核模块
-sudo insmod driver/dyn_sandbox.ko
+# 加载内核模块（make 后产物在 dist/）
+sudo insmod dist/dyn_sandbox.ko
 
 # 基本命令
 dyn-sandbox --mount /usr:ro --seccomp default -- echo hello
@@ -68,7 +68,7 @@ make
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
-| Linux 内核 | >= 5.13 | Landlock ABI 1 |
+| Linux 内核 | >= 6.2 | Landlock ABI 3（`handled_access_fs` 含 TRUNCATE 位）；`--no-landlock` 时无此要求 |
 | `CONFIG_USER_NS=y` | | user namespace |
 | `CONFIG_NET_NS=y` | | network namespace |
 | `CONFIG_SECCOMP_FILTER=y` | | seccomp-bpf |
@@ -82,32 +82,17 @@ make
 
 ```
 ├── dyn-sandbox/          # 沙箱用户态二进制
-│   ├── dyn-sandbox.c     # 主逻辑
-│   ├── seccomp_profiles.c # seccomp BPF profile
-│   ├── landlock.c        # Landlock 规则管理
-│   ├── policy_parser.c   # YAML 策略解析
-│   └── param_parse.c     # CLI 参数解析
 ├── driver/               # 内核模块 dyn_sandbox.ko
-│   ├── sandbox_main.c    # 字符设备 /dev/dyn-sandbox
-│   ├── sandbox_net.c     # 网络管理 (veth/nftables)
-│   ├── sandbox_file.c    # 文件动态授权 (kprobe)
-│   └── sandbox_landlock.c # Landlock 内核辅助
 ├── dyn-sandbox-dns/        # DNS 代理 (域名白名单)
 ├── test/                 # 集成测试
 └── docs/                 # 设计文档
-    ├── dyn-sandbox-design.md  # 详细设计
-    └── usage-guide.md         # 使用指南
 ```
 
 ## 详细文档
 
-- [使用指南](docs/usage-guide.md) — CLI 参数、YAML 策略、使用示例
-- [设计文档](docs/dyn-sandbox-design.md) — 架构、流程、接口、依赖
-
-## 附录
-
 - [使用指南](docs/usage-guide.md) — CLI 参数参考、YAML 策略格式、场景示例
-- [默认沙箱策略](docs/default-landlock-permissions.md) — 根文件系统布局、Landlock 默认权限集
+- [设计文档](docs/dyn-sandbox-design.md) — 架构、流程、接口、依赖
+- [默认沙箱策略](docs/default-filesystem-permissions.md) — 根文件系统布局、Landlock 默认权限集
 
 ## License
 
