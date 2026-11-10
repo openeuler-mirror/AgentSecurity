@@ -1,0 +1,1738 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentMoss 安全策略管控台</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<style>
+/* ===== OpenDesk --ag- design tokens（浅色玻璃态 + dark mode）===== */
+:root {
+  --ag-bg: #f5f5f7;
+  --ag-card-bg: rgba(255,255,255,.72);
+  --ag-card-border: rgba(255,255,255,.5);
+  --ag-text: #1d1d1f;
+  --ag-text-secondary: #6e6e73;
+  --ag-text-tertiary: #aeaeb2;
+  --ag-text-heading: #1d1d1f;
+  --ag-accent: #007AFF;
+  --ag-accent-hover: #005EC4;
+  --ag-red: #FF3B30;
+  --ag-green: #34C759;
+  --ag-orange: #FF9500;
+  --ag-purple: #AF52DE;
+  --ag-teal: #5AC8FA;
+  --ag-yellow: #FFCC00;
+  --ag-input-bg: rgba(255,255,255,.6);
+  --ag-input-border: rgba(0,0,0,.08);
+  --ag-input-focus-ring: rgba(0,122,255,.3);
+  --ag-divider: rgba(0,0,0,.06);
+  --ag-code-bg: rgba(0,0,0,.04);
+  --ag-danger-bg: rgba(255,59,48,.06);
+  --ag-danger-border: rgba(255,59,48,.18);
+  --ag-tab-active-border: #007AFF;
+  --ag-tab-inactive: #aeaeb2;
+  --ag-badge-deny-bg: rgba(255,59,48,.12);
+  --ag-badge-allow-bg: rgba(52,199,89,.12);
+}
+[data-theme="dark"] {
+  --ag-bg: #1c1c1e;
+  --ag-card-bg: rgba(44,44,46,.75);
+  --ag-card-border: rgba(255,255,255,.08);
+  --ag-text: #e5e5e7;
+  --ag-text-secondary: #98989d;
+  --ag-text-tertiary: #636366;
+  --ag-text-heading: #e5e5e7;
+  --ag-accent: #0A84FF;
+  --ag-accent-hover: #409CFF;
+  --ag-input-bg: rgba(255,255,255,.08);
+  --ag-input-border: rgba(255,255,255,.1);
+  --ag-input-focus-ring: rgba(10,132,255,.35);
+  --ag-divider: rgba(255,255,255,.08);
+  --ag-code-bg: rgba(255,255,255,.06);
+  --ag-danger-bg: rgba(255,69,58,.12);
+  --ag-badge-deny-bg: rgba(255,69,58,.18);
+  --ag-badge-allow-bg: rgba(48,209,88,.18);
+  --ag-tab-active-border: #0A84FF;
+  --ag-tab-inactive: #636366;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--ag-bg); color: var(--ag-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased; font-size: 14px;
+}
+.ag-wrap { display: flex; flex-direction: column; min-height: 100vh; }
+.ag-tabs { display: flex; align-items: flex-end; border-bottom: 1px solid var(--ag-divider); padding: 20px 20px 0; gap: 4px; }
+.ag-tab { padding: 8px 16px 7px; font-size: 13px; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent; user-select: none; color: var(--ag-tab-inactive); transition: color .2s; }
+.ag-tab:hover { color: var(--ag-text); }
+.ag-tab.active { color: var(--ag-accent); border-bottom-color: var(--ag-tab-active-border); }
+.ag-tab-spacer { flex: 1; }
+.ag-theme-btn { padding: 6px 12px; font-size: 12px; cursor: pointer; background: var(--ag-input-bg); border: 1px solid var(--ag-input-border); border-radius: 8px; color: var(--ag-text-secondary); }
+.ag-panel { flex: 1; overflow: auto; padding: 20px; max-width: 1100px; margin: 0 auto; width: 100%; }
+.ag-panel.hidden { display: none; }
+.ag-card { background: var(--ag-card-bg); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-radius: 14px; border: 1px solid var(--ag-card-border); box-shadow: 0 2px 8px rgba(0,0,0,.04); padding: 16px; margin-bottom: 16px; }
+.ag-section-title { font-size: 13px; font-weight: 600; color: var(--ag-text-heading); margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
+.ag-section-title::before { content: ''; display: block; width: 3px; height: 14px; background: var(--ag-accent); border-radius: 2px; }
+.ag-section-desc { font-size: 12px; color: var(--ag-text-secondary); line-height: 1.5; margin: 0 0 14px; }
+.ag-label { display: block; font-size: 12px; font-weight: 500; color: var(--ag-text-secondary); margin-bottom: 6px; }
+.ag-input, .ag-select, textarea.ag-input { width: 100%; padding: 8px 10px; font-size: 13px; border: 1px solid var(--ag-input-border); border-radius: 8px; background: var(--ag-input-bg); color: var(--ag-text); outline: none; transition: border-color .2s, box-shadow .2s; -webkit-appearance: none; font-family: inherit; }
+.ag-input:focus, .ag-select:focus { border-color: var(--ag-accent); box-shadow: 0 0 0 3px var(--ag-input-focus-ring); }
+
+/* Toggle */
+.ag-toggle { position: relative; width: 42px; height: 24px; border-radius: 12px; border: none; background: #d1d5db; cursor: pointer; transition: background .22s ease; padding: 0; flex-shrink: 0; }
+[data-theme="dark"] .ag-toggle { background: #48484a; }
+.ag-toggle.on { background: var(--ag-accent); }
+.ag-toggle.disabled { opacity: .4; cursor: not-allowed; }
+.ag-toggle-knob { position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.15); transition: transform .22s ease; }
+.ag-toggle.on .ag-toggle-knob { transform: translateX(18px); }
+.ag-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ag-toggle-row-label { font-size: 13px; font-weight: 500; color: var(--ag-text); }
+.ag-toggle-row-desc { font-size: 11px; color: var(--ag-text-tertiary); margin-top: 2px; }
+.ag-env-badge { font-size: 10px; color: var(--ag-orange); margin-left: 8px; }
+.ag-env-override-badge { background: var(--ag-red); color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-top: 4px; display: inline-block; }
+
+/* 按钮 */
+.ag-btn { display: inline-flex; align-items: center; padding: 6px 14px; font-size: 12px; font-weight: 500; border-radius: 8px; cursor: pointer; transition: all .2s; border: none; gap: 6px; }
+.ag-btn-primary { background: var(--ag-accent); color: #fff; }
+.ag-btn-primary:hover { background: var(--ag-accent-hover); }
+.ag-btn-ghost { background: transparent; color: var(--ag-accent); border: 1px solid var(--ag-accent); }
+.ag-btn-danger { background: transparent; color: var(--ag-red); border: 1px solid var(--ag-red); }
+.ag-btn-danger:hover { background: var(--ag-danger-bg); }
+.ag-btn-sm { padding: 4px 10px; font-size: 11px; border-radius: 6px; }
+.ag-btn-sm.active { background: var(--ag-accent); color: #fff; border: 1px solid var(--ag-accent); }
+
+/* 分类可折叠 + 大类总开关 */
+.ag-cat-header { display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 4px 0 8px; border-bottom: 1px solid var(--ag-divider); }
+.ag-cat-name { font-size: 13px; font-weight: 600; color: var(--ag-text-heading); display: flex; align-items: center; gap: 8px; }
+.ag-cat-count { font-size: 11px; color: var(--ag-text-secondary); background: var(--ag-code-bg); padding: 1px 8px; border-radius: 10px; }
+.ag-cat-controls { display: flex; align-items: center; gap: 12px; }
+.ag-expand-icon { font-size: 12px; color: var(--ag-text-tertiary); transition: transform .2s; display: inline-block; }
+.ag-expand-icon.open { transform: rotate(180deg); }
+.ag-rule-list { padding: 6px 0; }
+
+/* 规则项卡片化 */
+.ag-rule-item { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px; margin: 6px 0; font-size: 13px; border: 1px solid var(--ag-divider); border-radius: 8px; background: var(--ag-card-bg); transition: border-color .15s, box-shadow .15s; }
+.ag-rule-item:hover { border-color: var(--ag-accent); box-shadow: 0 2px 8px rgba(0,122,255,.08); }
+.ag-rule-body { flex: 1; min-width: 0; }
+.ag-rule-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.ag-rule-pattern { font-family: 'SF Mono', 'Consolas', monospace; font-size: 12px; color: var(--ag-text); word-break: break-all; line-height: 1.5; }
+.ag-rule-reason { font-family: 'SF Mono', 'Consolas', monospace; font-size: 12px; color: var(--ag-text-secondary); word-break: break-all; line-height: 1.5; margin-top: 3px; }
+.ag-rule-field-label { color: var(--ag-text-heading); font-family: inherit; margin-right: 2px; }
+.ag-rule-id { color: var(--ag-text-tertiary); font-size: 11px; font-family: monospace; margin-top: 3px; }
+.ag-rule-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+/* Badge */
+.ag-badge { display: inline-block; min-width: 48px; text-align: center; padding: 2px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; line-height: 1.4; }
+.ag-badge-critical { background: var(--ag-badge-deny-bg); color: var(--ag-red); }
+.ag-badge-high { background: rgba(255,149,0,.12); color: var(--ag-orange); }
+.ag-badge-medium, .ag-badge-low { background: var(--ag-code-bg); color: var(--ag-text-secondary); }
+.ag-badge-allow { background: var(--ag-badge-allow-bg); color: var(--ag-green); }
+.ag-badge-deny { background: var(--ag-badge-deny-bg); color: var(--ag-red); }
+.ag-badge-builtin { background: var(--ag-code-bg); color: var(--ag-text-secondary); font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+.ag-badge-custom { background: rgba(0,122,255,.12); color: var(--ag-accent); font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+.ag-badge-removed { background: rgba(255,149,0,.12); color: var(--ag-orange); font-size: 10px; padding: 1px 6px; border-radius: 3px; border: 1px solid rgba(255,149,0,.3); }
+
+/* 风险类型标签（左边框彩色） */
+.ag-risk-type { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 500; border-left: 3px solid; background: var(--ag-code-bg); color: var(--ag-text); }
+.ag-risk-type::before { content: "🏷 "; opacity: 0.7; }
+.ag-rt-script_execution { border-left-color: #6366f1; }
+.ag-rt-file_access { border-left-color: #0ea5e9; }
+.ag-rt-data_exfiltration { border-left-color: #f59e0b; }
+.ag-rt-privilege_escalation { border-left-color: #dc2626; }
+.ag-rt-persistence { border-left-color: #7c3aed; }
+.ag-rt-lateral_movement { border-left-color: #db2777; }
+.ag-rt-config_tampering { border-left-color: #ea580c; }
+.ag-rt-supply_chain { border-left-color: #16a34a; }
+.ag-rt-resource_exhaustion { border-left-color: #0891b2; }
+.ag-rt-intent_deviation { border-left-color: #9333ea; }
+
+/* deny_mode badge 三色 */
+.ag-deny-mode { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+.ag-deny-mode.deny-both { background: rgba(175,82,222,.12); color: var(--ag-purple); }
+.ag-deny-mode.deny-write { background: rgba(52,199,89,.12); color: var(--ag-green); }
+.ag-deny-mode.deny-read { background: rgba(255,149,0,.12); color: var(--ag-orange); }
+.ag-source-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: rgba(10,132,255,.08); color: var(--ag-accent); font-weight: 500; }
+.ag-overridden-hint { font-size: 10px; color: var(--ag-red); font-weight: 500; }
+
+/* deny_mode select */
+.ag-deny-select { font-size: 11px; padding: 2px 4px; border: 1px solid var(--ag-input-border); border-radius: 4px; background: var(--ag-input-bg); color: var(--ag-text); cursor: pointer; max-width: 100px; }
+.ag-deny-select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* skip_l3 checkbox */
+.ag-skip-l3 { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--ag-text-secondary); cursor: pointer; white-space: nowrap; }
+.ag-skip-l3:hover { color: var(--ag-text); }
+.ag-skip-l3 input { width: 14px; height: 14px; cursor: pointer; accent-color: var(--ag-accent); }
+
+/* 搜索结果层标识 */
+.ag-layer-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; color: #fff; }
+.ag-layer-l1 { background: #6366f1; }
+.ag-layer-l2 { background: #0ea5e9; }
+.ag-layer-l3 { background: #14b8a6; }
+.ag-status-text { font-size: 11px; font-weight: 500; }
+.ag-status-on { color: var(--ag-green); }
+.ag-status-off { color: var(--ag-text-tertiary); }
+.ag-search-cat { font-size: 11px; color: var(--ag-text-tertiary); }
+
+/* 统计卡片 */
+.ag-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.ag-stat-card { background: var(--ag-code-bg); border-radius: 10px; padding: 12px; }
+.ag-stat-card .label { font-size: 11px; color: var(--ag-text-secondary); }
+.ag-stat-card .value { font-size: 22px; font-weight: 600; color: var(--ag-text-heading); margin-top: 4px; }
+
+/* 进度条行 */
+.ag-progress-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; font-size: 13px; }
+.ag-progress-label { color: var(--ag-text-secondary); min-width: 100px; }
+.ag-progress-value { color: var(--ag-text-heading); font-weight: 600; }
+.ag-progress-pct { font-size: 11px; color: var(--ag-text-tertiary); }
+.ag-progress-bar { flex: 1; background: var(--ag-divider); height: 6px; border-radius: 3px; margin-left: 8px; overflow: hidden; }
+.ag-progress-fill { background: var(--ag-accent); height: 6px; border-radius: 3px; }
+.ag-progress-fill.green { background: var(--ag-green); }
+
+/* 日期选择器 */
+.ag-date-input { padding: 3px 8px; font-size: 12px; height: 24px; border: 1px solid var(--ag-input-border); border-radius: 4px; background: var(--ag-input-bg); color: var(--ag-text); font-family: inherit; box-sizing: border-box; }
+.ag-date-input:focus { outline: none; border-color: var(--ag-accent); box-shadow: 0 0 0 2px var(--ag-input-focus-ring); }
+.ag-date-sep { color: var(--ag-text-tertiary); font-size: 12px; padding: 0 4px; }
+
+.ag-search { margin-bottom: 12px; }
+.ag-empty { color: var(--ag-text-tertiary); font-size: 12px; padding: 12px 0; text-align: center; }
+#token-trend-chart { width: 100%; height: 320px; }
+.ag-link { color: var(--ag-accent); cursor: pointer; text-decoration: none; font-size: 12px; }
+.ag-link:hover { text-decoration: underline; }
+
+/* Toast */
+.ag-toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,.15); animation: ag-slide-in .3s ease; }
+.ag-toast-success { background: var(--ag-green); color: #fff; }
+.ag-toast-error { background: var(--ag-red); color: #fff; }
+.ag-toast-warning { background: var(--ag-orange); color: #fff; }
+@keyframes ag-slide-in { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* Modal */
+.ag-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 100; }
+.ag-modal-overlay.show { display: flex; }
+.ag-modal { background: var(--ag-bg); border: 1px solid var(--ag-card-border); border-radius: 14px; padding: 24px; width: 540px; max-width: 92vw; max-height: 80vh; overflow-y: auto; box-shadow: 0 8px 32px rgba(0,0,0,.2); }
+.ag-modal.ag-modal-wide { width: 820px; }
+.ag-modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+/* Confirm 弹窗（替代浏览器原生 confirm） */
+.ag-modal-confirm { width: 420px; }
+.ag-confirm-body { font-size: 13px; line-height: 1.7; color: var(--ag-text-secondary); white-space: pre-wrap; word-break: break-word; padding: 4px 0 8px; }
+/* Prompt 弹窗（替代浏览器原生 prompt） */
+.ag-prompt-body { padding: 4px 0 8px; }
+.ag-prompt-message { font-size: 13px; line-height: 1.7; color: var(--ag-text-secondary); margin-bottom: 12px; }
+.ag-modal-title { font-size: 15px; font-weight: 600; color: var(--ag-text-heading); }
+.ag-modal-close { width: 28px; height: 28px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 18px; line-height: 1; color: var(--ag-text-tertiary); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.ag-modal-close:hover { background: var(--ag-code-bg); color: var(--ag-text); }
+.ag-form-group { margin-bottom: 12px; }
+.ag-form-label { font-size: 13px; font-weight: 500; margin-bottom: 4px; color: var(--ag-text); }
+.ag-form-label .ag-required { color: var(--ag-red); margin-left: 2px; }
+.ag-form-hint { font-size: 11px; color: var(--ag-text-tertiary); margin-top: 3px; line-height: 1.5; }
+.ag-form-hint code { background: var(--ag-code-bg); padding: 1px 4px; border-radius: 3px; font-family: 'SF Mono', monospace; }
+.ag-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* Skill 详情 */
+.ag-skill-detail-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.ag-skill-detail-id { font-size: 17px; font-weight: 700; color: var(--ag-text-heading); font-family: 'SF Mono', monospace; word-break: break-all; }
+.ag-skill-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--ag-divider); }
+.ag-skill-meta-item { font-size: 12px; color: var(--ag-text-secondary); background: var(--ag-code-bg); padding: 3px 10px; border-radius: 4px; border: 1px solid var(--ag-divider); }
+.ag-skill-meta-item strong { color: var(--ag-text); font-weight: 600; }
+.ag-skill-content { font-family: 'SF Mono', monospace; font-size: 12.5px; line-height: 1.7; color: var(--ag-text); white-space: pre-wrap; word-break: break-word; }
+.ag-skill-content pre { background: #1e293b; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; overflow-x: auto; margin: 12px 0; font-size: 12.5px; line-height: 1.65; }
+.ag-skill-content pre code { background: transparent; color: inherit; padding: 0; }
+
+/* 表格 */
+.ag-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+.ag-table th { padding: 6px; text-align: left; border-bottom: 1px solid var(--ag-divider); color: var(--ag-text-secondary); font-weight: 500; }
+.ag-table td { padding: 6px; border-bottom: 1px solid var(--ag-divider); }
+</style>
+</head>
+<body>
+<div class="ag-wrap">
+  <div class="ag-tabs" id="tabs">
+    <div class="ag-tab active" data-page="overview">概览</div>
+    <div class="ag-tab" data-page="search">搜索规则</div>
+    <div class="ag-tab" data-page="l1">L1 规则</div>
+    <div class="ag-tab" data-page="l2">L2 规则</div>
+    <div class="ag-tab" data-page="l3">L3 Skills</div>
+    <div class="ag-tab" data-page="agents">Agent 定制</div>
+    <div class="ag-tab" data-page="scenarios">场景定制</div>
+    <div class="ag-tab" data-page="token">Token</div>
+    <div class="ag-tab" data-page="settings">设置</div>
+    <div class="ag-tab-spacer"></div>
+    <button class="ag-theme-btn" id="theme-btn">🌙 暗色</button>
+  </div>
+  <div class="ag-panel" id="page-overview"></div>
+  <div class="ag-panel hidden" id="page-search"></div>
+  <div class="ag-panel hidden" id="page-l1"></div>
+  <div class="ag-panel hidden" id="page-l2"></div>
+  <div class="ag-panel hidden" id="page-l3"></div>
+  <div class="ag-panel hidden" id="page-agents"></div>
+  <div class="ag-panel hidden" id="page-scenarios"></div>
+  <div class="ag-panel hidden" id="page-token"></div>
+  <div class="ag-panel hidden" id="page-settings"></div>
+</div>
+
+<!-- Modal -->
+<div class="ag-modal-overlay" id="modal-overlay">
+  <div class="ag-modal" id="modal">
+    <div class="ag-modal-header">
+      <div class="ag-modal-title" id="modal-title"></div>
+      <button class="ag-modal-close" onclick="closeModal()" title="关闭">✕</button>
+    </div>
+    <div id="modal-body"></div>
+    <div class="ag-form-actions" id="modal-actions">
+      <button class="ag-btn ag-btn-ghost" onclick="closeModal()">取消</button>
+      <button class="ag-btn ag-btn-primary" id="modal-submit" onclick="submitModal()">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm 弹窗（替代浏览器原生 confirm） -->
+<div class="ag-modal-overlay" id="confirm-overlay">
+  <div class="ag-modal ag-modal-confirm" id="confirm-modal">
+    <div class="ag-modal-header">
+      <div class="ag-modal-title" id="confirm-title"></div>
+      <button class="ag-modal-close" onclick="closeConfirm()" title="关闭">✕</button>
+    </div>
+    <div class="ag-confirm-body" id="confirm-body"></div>
+    <div class="ag-form-actions" id="confirm-actions">
+      <button class="ag-btn ag-btn-ghost" onclick="closeConfirm()">取消</button>
+      <button class="ag-btn ag-btn-danger" id="confirm-ok" onclick="resolveConfirm()">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Prompt 弹窗（替代浏览器原生 prompt，用于 token 输入等） -->
+<div class="ag-modal-overlay" id="prompt-overlay">
+  <div class="ag-modal ag-modal-confirm" id="prompt-modal">
+    <div class="ag-modal-header">
+      <div class="ag-modal-title" id="prompt-title"></div>
+      <button class="ag-modal-close" onclick="closePrompt()" title="关闭">✕</button>
+    </div>
+    <div class="ag-prompt-body" id="prompt-body"></div>
+    <div class="ag-form-actions" id="prompt-actions">
+      <button class="ag-btn ag-btn-ghost" onclick="closePrompt()">取消</button>
+      <button class="ag-btn ag-btn-primary" id="prompt-ok" onclick="submitPrompt()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== i18n =====
+// 语言来源优先级：URL ?lang=en > ?lang=zh > 系统/文档语言。默认 zh。
+// en 模式下所有用户可见文案翻译为英文；数据契约 key（deny_write/critical/分类key/风险类型key）
+// 保持原样，它们是接口取值，翻错会破坏与后端对接。
+function detectLang() {
+  const params = new URLSearchParams(window.location.search);
+  const q = params.get('lang');
+  if (q === 'en' || q === 'zh') return q;
+  const docLang = (document.documentElement.lang || '').toLowerCase();
+  return docLang.indexOf('zh') === 0 ? 'zh' : 'zh'; // 默认中文
+}
+const LANG = detectLang();
+const isEn = LANG === 'en';
+/** t(zh, en)：中文为默认回退，en 模式下返回英文翻译。 */
+function t(zh, en) { return isEn ? (en != null && en !== '' ? en : zh) : zh; }
+function applyTitle() { document.title = t('AgentMoss 安全策略管控台', 'AgentMoss Policy Console'); }
+document.documentElement.lang = isEn ? 'en' : 'zh-CN';
+
+// ===== API client =====
+const TOKEN_KEY = 'am_console_token';
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+function authHeaders() {
+  const t_ = getToken();
+  return t_ ? { 'Authorization': 'Bearer ' + t_ } : {};
+}
+async function api(path, opts = {}) {
+  const res = await fetch('/console/api/' + path, {
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    ...opts,
+  });
+  if (res.status === 401) {
+    const t_ = await agPrompt(t('需要访问凭据', 'Access Token Required'), {
+      message: t('服务端开启了访问认证，需要 Bearer token 才能访问安全策略管控台：', 'The server requires a Bearer token to access the policy console:'),
+      placeholder: t('输入服务端配置的 token', 'Enter the server-configured token'),
+      value: getToken(),
+      okText: t('保存并重试', 'Save & Retry'),
+    });
+    if (t_) { localStorage.setItem(TOKEN_KEY, t_); return api(path, opts); }
+    throw new Error(t('未授权', 'Unauthorized'));
+  }
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    throw new Error(d.detail || res.statusText);
+  }
+  return res.json();
+}
+function apiPut(path, body) { return api(path, { method: 'PUT', body: JSON.stringify(body) }); }
+function apiPost(path, body) { return api(path, { method: 'POST', body: JSON.stringify(body) }); }
+function apiDelete(path, body) { return api(path, { method: 'DELETE', body: JSON.stringify(body) }); }
+/** 拉取并解包 env 覆盖映射（/api/env-overrides 返回 {overrides: {...}}，此处解出净映射）。 */
+async function loadEnvOverrides() {
+  const resp = await api('env-overrides');
+  return resp?.overrides || {};
+}
+
+let state = { config: {}, envOverrides: {}, currentPage: 'overview' };
+const expandedCats = new Set();
+let currentModalAction = null;
+
+// ===== 静态文案 / i18n 名称字典 =====
+const LAYER_NAMES = {
+  L1_heuristic: { name: t('L1 静态检测', 'L1 Heuristic Detection'), desc: t('正则/关键词匹配，仅看下一步动作', 'Regex/keyword matching; only inspects the next action') },
+  L2_logic_rules: { name: t('L2 逻辑规则', 'L2 Logic Rules'), desc: t('read_before_write + 授权检测使用历史动作序列，敏感路径/危险模式仅匹配下一步', 'read_before_write + authorization checks use historical action sequences; sensitive paths/dangerous patterns match only the next action') },
+  L3_llm_analysis: { name: t('L3 LLM 分析', 'L3 LLM Analysis'), desc: t('Skill 匹配 + LLM 语义判断', 'Skill matching + LLM semantic judgment') },
+  agent_rules_enabled: { name: t('Agent 定制规则', 'Agent Custom Rules'), desc: t('各 agent 专属规则总开关（xiaoo/opendesk 等分区）', 'Master switch for per-agent custom rules (xiaoo/opendesk partitions)') },
+  scenario_rules_enabled: { name: t('场景定制规则', 'Scenario Custom Rules'), desc: t('各场景专属规则总开关（bank 等部署级分区）', 'Master switch for per-scenario custom rules (bank etc.)') },
+};
+const L1_CATEGORY_NAMES = {
+  dangerous_commands: t('⚡ 危险命令检测', '⚡ Dangerous Commands'),
+  injection_detection: t('🎯 注入攻击检测', '🎯 Injection Attack Detection'),
+  sensitive_path_access: t('🛡️ 敏感路径访问', '🛡️ Sensitive Path Access'),
+  user_custom: t('🔧 用户自定义', '🔧 User Custom'),
+};
+const L2_CATEGORY_NAMES = {
+  intent_consistency: t('🎯 意图一致性 📋对比原始意图', '🎯 Intent Consistency 📋vs original intent'),
+  password_modify_consent: t('🔑 密码修改授权 📋涉及历史分析', '🔑 Password Modify Consent 📋uses history'),
+  user_deletion_consent: t('👤 用户删除授权 📋涉及历史分析', '👤 User Deletion Consent 📋uses history'),
+  read_before_write: t('📄 读写一致性 📋涉及历史分析', '📄 Read-before-Write 📋uses history'),
+  user_custom: t('🔧 用户自定义', '🔧 User Custom'),
+};
+const L3_CATEGORY_NAMES = {
+  file_operations: t('📁 文件操作', '📁 File Operations'),
+  network_security: t('🌐 网络安全', '🌐 Network Security'),
+  persistence_supply_chain: t('🔒 持久化/供应链', '🔒 Persistence/Supply Chain'),
+  intent_and_general: t('🎯 意图/通用', '🎯 Intent/General'),
+  resource: t('💻 资耗', '💻 Resource Exhaustion'),
+  user_custom: t('🔧 用户自定义', '🔧 User Custom'),
+};
+const RISK_TYPE_NAMES = {
+  script_execution: t('脚本执行', 'Script Execution'), file_access: t('文件访问', 'File Access'), data_exfiltration: t('数据外泄', 'Data Exfiltration'),
+  privilege_escalation: t('提权', 'Privilege Escalation'), persistence: t('持久化后门', 'Persistence Backdoor'), lateral_movement: t('横向移动', 'Lateral Movement'),
+  config_tampering: t('配置篡改', 'Config Tampering'), supply_chain: t('供应链', 'Supply Chain'), resource_exhaustion: t('资源耗尽', 'Resource Exhaustion'),
+  intent_deviation: t('意图偏离', 'Intent Deviation'),
+};
+const RISK_TOOLTIPS = {
+  critical: t('严重：必须拒绝，不可逆破坏或提权操作', 'Critical: must reject; irreversible damage or privilege escalation'),
+  high: t('高危：强烈建议拒绝，需人工审核', 'High: strongly recommend rejecting; requires human review'),
+  medium: t('中危：需谨慎评估，结合意图判断', 'Medium: evaluate carefully; judge with intent'),
+  low: t('低危：常规操作，可按需放行', 'Low: normal operation; may allow as needed'),
+};
+const DENY_MODE_LABELS = { deny_write: t('仅拦截写入', 'Block Write Only'), deny_read: t('仅拦截读取', 'Block Read Only'), deny_both: t('读写均拦截', 'Block Both Read & Write') };
+
+function riskTypeName(tt) { if (!tt) return ''; return RISK_TYPE_NAMES[tt] || tt; }
+function denyModeLabel(m) { return DENY_MODE_LABELS[m] || m; }
+function denyModeClass(m) { return ({ deny_write: 'deny-write', deny_read: 'deny-read', deny_both: 'deny-both' })[m] || ''; }
+
+// ===== Helpers =====
+function el(id) { return document.getElementById(id); }
+function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function riskBadge(level) {
+  const cls = ['low','medium','high','critical'].includes(level) ? 'ag-badge-' + level : 'ag-badge-low';
+  const tip = RISK_TOOLTIPS[level] || RISK_TOOLTIPS.low;
+  return `<span class="ag-badge ${cls}" title="${tip}">${level || 'low'}</span>`;
+}
+function riskTypeBadge(tt) {
+  if (!tt) return '';
+  return `<span class="ag-risk-type ag-rt-${escapeHtml(tt)}" title="${t('风险类型: ', 'Risk type: ')}${escapeHtml(tt)}">${escapeHtml(riskTypeName(tt))}</span>`;
+}
+function builtinBadge(builtin) {
+  return builtin !== false ? '<span class="ag-badge ag-badge-builtin">' + t('内置', 'Built-in') + '</span>' : '<span class="ag-badge ag-badge-custom">' + t('自定义', 'Custom') + '</span>';
+}
+function removedBadge(removed) { return removed ? '<span class="ag-badge ag-badge-removed" title="' + t('此规则已从当前默认规则集移除，仅作历史保留；如需可手动启用', 'This rule has been removed from the current default set and is kept for history; you can enable it manually') + '">' + t('已移除', 'Removed') + '</span>' : ''; }
+function denyModeBadge(mode) {
+  const m = mode || 'deny_write';
+  return `<span class="ag-deny-mode ${denyModeClass(m)}" title="${t('拦截模式: ', 'Interception mode: ')}${denyModeLabel(m)}">${denyModeLabel(m)}</span>`;
+}
+function sourceDenyModeBadges(rule) {
+  if (rule.builtin !== false && rule.source_deny_mode) {
+    let h = `<span class="ag-source-badge" title="${t('源码出厂的原始拦截模式。当前模式与之不同时表示已被用户覆盖', 'Source default interception mode. A different current mode means the user has overridden it')}">${t('原始: ', 'Source: ')}${denyModeLabel(rule.source_deny_mode)}</span>`;
+    if (rule.deny_mode && rule.deny_mode !== rule.source_deny_mode) {
+      h += '<span class="ag-overridden-hint" title="' + t('当前拦截模式已偏离源码默认值', 'Current mode deviates from the source default') + '">' + t('已覆盖', 'Overridden') + '</span>';
+    }
+    return h;
+  }
+  return '';
+}
+function toggle(on, disabled, onclick) {
+  return `<button class="ag-toggle ${on ? 'on' : ''} ${disabled ? 'disabled' : ''}" ${disabled ? 'disabled' : ''} onclick="${disabled ? '' : onclick}"><span class="ag-toggle-knob"></span></button>`;
+}
+function formatTokens(n) {
+  if (n >= 1e8) return (n / 1e8).toFixed(1) + t('亿', 'B');
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + t('万', 'W');
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n || 0);
+}
+function showToast(msg, type) {
+  if (!type) type = 'success';
+  const tt = document.createElement('div');
+  tt.className = 'ag-toast ag-toast-' + type;
+  tt.textContent = msg;
+  document.body.appendChild(tt);
+  setTimeout(() => tt.remove(), 3000);
+}
+function openModal(title, bodyHtml, showActions) {
+  el('modal-title').textContent = title;
+  el('modal-body').innerHTML = bodyHtml;
+  el('modal-actions').style.display = showActions !== false ? '' : 'none';
+  el('modal-overlay').classList.add('show');
+}
+function closeModal() {
+  el('modal-overlay').classList.remove('show');
+  el('modal').classList.remove('ag-modal-wide');
+  currentModalAction = null;
+}
+
+// ===== Confirm 弹窗（替代浏览器原生 confirm，统一样式）=====
+let confirmResolve = null;
+function closeConfirm() {
+  el('confirm-overlay').classList.remove('show');
+  if (confirmResolve) { confirmResolve(false); confirmResolve = null; }
+}
+function resolveConfirm() {
+  el('confirm-overlay').classList.remove('show');
+  if (confirmResolve) { confirmResolve(true); confirmResolve = null; }
+}
+/**
+ * 弹出带样式的确认框，返回 Promise<boolean>。
+ * @param {string} title 标题
+ * @param {string} message 正文（支持 \n，自动转义为纯文本）
+ * @param {string} [okText] 确认按钮文案（默认 "确认"）
+ * @param {string} [okClass] 确认按钮样式类（默认 ag-btn-danger）
+ */
+function agConfirm(title, message, okText, okClass) {
+  return new Promise(resolve => {
+    confirmResolve = resolve;
+    el('confirm-title').textContent = title;
+    el('confirm-body').textContent = message;
+    const okBtn = el('confirm-ok');
+    okBtn.className = 'ag-btn ' + (okClass || 'ag-btn-danger');
+    okBtn.textContent = okText || t('确认', 'Confirm');
+    el('confirm-overlay').classList.add('show');
+  });
+}
+
+// ===== Prompt 弹窗（替代浏览器原生 prompt，用于 token 输入等）=====
+let promptResolve = null;
+function closePrompt() {
+  el('prompt-overlay').classList.remove('show');
+  if (promptResolve) { promptResolve(null); promptResolve = null; }
+}
+function submitPrompt() {
+  const val = el('prompt-input').value;
+  el('prompt-overlay').classList.remove('show');
+  if (promptResolve) { promptResolve(val); promptResolve = null; }
+}
+/**
+ * 弹出带样式的输入框，返回 Promise<string|null>（取消返回 null）。
+ * @param {string} title 标题
+ * @param {Object} opts
+ * @param {string} [opts.message] 说明文案
+ * @param {string} [opts.placeholder] 输入框占位文案
+ * @param {string} [opts.value] 初始值
+ * @param {string} [opts.okText] 确认按钮文案（默认 "确认"）
+ */
+function agPrompt(title, opts = {}) {
+  return new Promise(resolve => {
+    promptResolve = resolve;
+    el('prompt-title').textContent = title;
+    el('prompt-body').innerHTML =
+      (opts.message ? `<div class="ag-prompt-message">${escapeHtml(opts.message)}</div>` : '') +
+      `<input class="ag-input" id="prompt-input" type="password" style="width:100%" placeholder="${escapeHtml(opts.placeholder || '')}" value="${escapeHtml(opts.value || '')}" autocomplete="off">`;
+    el('prompt-ok').textContent = opts.okText || t('确认', 'Confirm');
+    el('prompt-overlay').classList.add('show');
+    const input = el('prompt-input');
+    input.focus();
+    input.select();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submitPrompt(); }
+      if (e.key === 'Escape') { e.preventDefault(); closePrompt(); }
+    });
+  });
+}
+
+// ===== Pages =====
+async function refreshConfig() {
+  state.config = await api('config');
+  state.envOverrides = await loadEnvOverrides();
+  state.agentRules = await api('agents');
+  // 场景定制规则：后端按 AGENT_MOSS_SCENARIO env 过滤（无 env 返回空 → 场景页显示"未启用"提示）
+  state.scenarioRules = await api('scenarios');
+  // 探测当前进程的 instance（AGENT_MOSS_INSTANCE，如 opendesk/xiaoo）。
+  // 有 instance 时 Agent Rules 页只显示当前 agent 的定制规则，避免出现别的 agent 的规则造成困惑；
+  // 无 instance（本地独立起服务/非 agent 调用）则显示全部。
+  state.instance = '';
+  try {
+    const h = await fetch('/api/v1/health', { signal: AbortSignal.timeout(2000) });
+    if (h.ok) {
+      const hd = await h.json();
+      state.instance = hd?.instance || '';
+    }
+  } catch { /* health 不可达，instance 保持空（显示全部） */ }
+  // 探测服务端是否开启了 console 访问 token 认证（AGENT_MOSS_CONSOLE_TOKEN）。
+  // 不带 token 裸请求一个 API 端点：返回 401 说明开启了认证 → 设置页显示"访问 Token"卡片；
+  // 返回 200 说明本机免认证 → 隐藏该卡片（单机使用无需配置，避免误导）。
+  state.consoleAuthRequired = false;
+  try {
+    const probe = await fetch('/console/api/env-overrides', { signal: AbortSignal.timeout(2000) });
+    state.consoleAuthRequired = probe.status === 401;
+  } catch { /* 探测失败，默认不显示 token 卡片 */ }
+  renderCurrent();
+}
+function renderCurrent() {
+  const pages = ['overview','search','l1','l2','l3','agents','scenarios','token','settings'];
+  pages.forEach(p => {
+    const panel = el('page-' + p);
+    if (panel) panel.classList.toggle('hidden', p !== state.currentPage);
+  });
+  const fn = window['render_' + state.currentPage];
+  if (fn) fn();
+}
+
+// ===== 概览页 =====
+function render_overview() {
+  const layers = state.config.layers || {};
+  const eo = state.envOverrides || {};
+  const envBadge = k => eo[k] && eo[k].overridden ? `<span class="ag-env-badge">⚠ ${t('已被 env 覆盖', 'Overridden by env')}</span>` : '';
+  const envOverrideBox = k => {
+    if (!eo[k] || !eo[k].overridden) return '';
+    return `<div class="ag-env-override-badge">⚠️ ${t('环境变量', 'Env var')} ${eo[k].env_var || ''}=1 ${t('强制禁用', 'forced disabled')}</div>`;
+  };
+  el('page-overview').innerHTML = `
+    <div class="ag-card">
+      <div class="ag-section-title">${t('层级全局开关', 'Layer Master Switches')}</div>
+      ${Object.entries(LAYER_NAMES).map(([key, info]) => {
+        const enabled = layers[key] !== false;
+        const overridden = eo[key] && eo[key].overridden;
+        const click = overridden ? '' : `toggleLayer('${key}')`;
+        return `<div class="ag-toggle-row"><div><div class="ag-toggle-row-label">${info.name} ${envBadge(key)}</div><div class="ag-toggle-row-desc">${info.desc}</div>${envOverrideBox(key)}</div>${toggle(enabled, overridden, click)}</div>`;
+      }).join('')}
+    </div>
+    <div class="ag-card">
+      <div class="ag-section-title">${t('规则统计', 'Rule Statistics')}</div>
+      <div class="ag-stat-grid">
+        <div class="ag-stat-card"><div class="label">${t('L1 规则启用', 'L1 Rules Enabled')}</div><div class="value">${countEnabled(state.config.L1_rules, 'L1_heuristic')}/${countRules(state.config.L1_rules)}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('L2 规则启用', 'L2 Rules Enabled')}</div><div class="value">${countEnabledL2()}/${countRulesL2()}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('L3 Skills 启用', 'L3 Skills Enabled')}</div><div class="value">${countEnabledSkills(state.config.L3_skills, 'L3_llm_analysis')}/${countSkills(state.config.L3_skills)}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('Agent 定制规则', 'Agent custom rules')}</div><div class="value">${countRules(state.agentRules?.agents || {})}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('场景定制规则', 'Scenario custom rules')}</div><div class="value">${(state.scenarioRules?.scenarios ? countRules(state.scenarioRules.scenarios) : 0)}</div></div>
+      </div>
+      <div style="font-size:11px;color:var(--ag-text-secondary);margin-top:6px">
+        ${t('说明：LTL 时序规则属 L2（开关在 L2 页）；Agent/场景为按 id 分区的定制规则，有独立总开关。', 'Note: LTL timing rules belong to L2 (toggle on L2 page); Agent/Scenario are id-partitioned custom rules with their own master switches.')}
+      </div>
+    </div>
+    <div class="ag-card">
+      <div class="ag-section-title">${t('Token 用量统计', 'Token Usage')
+        }
+        <div style="margin-left:auto;display:flex;gap:6px">
+          <button class="ag-btn ag-btn-sm" data-days="1" onclick="loadOverviewToken(1)">${t('今日', 'Today')}</button>
+          <button class="ag-btn ag-btn-sm active" data-days="7" onclick="loadOverviewToken(7)">${t('近7天', '7 days')}</button>
+          <button class="ag-btn ag-btn-sm" data-days="0" onclick="loadOverviewToken(0)">${t('全部', 'All')}</button>
+        </div>
+      </div>
+      <div id="overview-token-summary" class="ag-empty">${t('加载中...', 'Loading...')}</div>
+      <div id="overview-token-breakdown" style="margin-top:16px"></div>
+    </div>`;
+  loadOverviewToken(7);
+}
+async function loadOverviewToken(days) {
+  document.querySelectorAll('#page-overview [data-days]').forEach(b => b.classList.toggle('active', b.dataset.days === String(days)));
+  try {
+    const s = await api('token-stats?days=' + days);
+    el('overview-token-summary').innerHTML = `
+      <div class="ag-stat-grid">
+        <div class="ag-stat-card"><div class="label">${t('总 Token', 'Total Tokens')}</div><div class="value">${formatTokens(s.total_tokens)}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('输入 Token', 'Prompt Tokens')}</div><div class="value">${formatTokens(s.total_prompt_tokens)}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('输出 Token', 'Completion Tokens')}</div><div class="value">${formatTokens(s.total_completion_tokens)}</div></div>
+        <div class="ag-stat-card"><div class="label">${t('LLM 调用次数', 'LLM Calls')}</div><div class="value">${s.total_calls}</div></div>
+      </div>`;
+    const byStep = s.by_step || {};
+    const known = [{ key: 'L3_security_judge', name: t('L3 安全判断', 'L3 Security Judge') }, { key: 'step2_policy_gen', name: t('策略生成', 'Policy Generation') }];
+    const rendered = new Set();
+    let html = '';
+    for (const { key, name } of known) {
+      const v = byStep[key] || { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, calls: 0 };
+      rendered.add(key);
+      html += `<div class="ag-progress-row"><span class="ag-progress-label">${name}</span><span class="ag-progress-value">${formatTokens(v.total_tokens)}</span><span class="ag-progress-pct">(${v.calls} ${t('次', 'calls')}, ${t('输入', 'in')} ${formatTokens(v.prompt_tokens)}, ${t('输出', 'out')} ${formatTokens(v.completion_tokens)})</span></div>`;
+    }
+    for (const [step, v] of Object.entries(byStep)) {
+      if (rendered.has(step)) continue;
+      html += `<div class="ag-progress-row"><span class="ag-progress-label">${step}</span><span class="ag-progress-value">${formatTokens(v.total_tokens)}</span><span class="ag-progress-pct">(${v.calls} ${t('次', 'calls')})</span></div>`;
+    }
+    el('overview-token-breakdown').innerHTML = html || `<div class="ag-empty">${t('无分项数据', 'No breakdown data')}</div>`;
+  } catch { el('overview-token-summary').innerHTML = `<div class="ag-empty">${t('无数据', 'No data')}</div>`; }
+}
+function countRules(lr) { if (!lr) return 0; return Object.values(lr).reduce((s, c) => s + (c.rules ? c.rules.length : 0), 0); }
+// 统计"启用"的规则数，口径与后端执行一致：层级开 && 大类开 && 单条规则开。
+// layerKey 为层级总开关（如 L1_heuristic），关闭时返回 0。
+function countEnabled(lr, layerKey) {
+  if (!lr) return 0;
+  if (layerKey && state.config.layers?.[layerKey] === false) return 0;
+  return Object.values(lr).reduce((s, c) => s + ((c.rules || []).filter(r => r.enabled && c.category_enabled !== false).length), 0);
+}
+function countSkills(ls) { if (!ls) return 0; return Object.values(ls).reduce((s, c) => s + (c.skills ? c.skills.length : 0), 0); }
+// 同 countEnabled：层级关闭时 L3 skills 启用数归 0。
+function countEnabledSkills(ls, layerKey) {
+  if (!ls) return 0;
+  if (layerKey && state.config.layers?.[layerKey] === false) return 0;
+  return Object.values(ls).reduce((s, c) => s + ((c.skills || []).filter(s => s.enabled && c.category_enabled !== false).length), 0);
+}
+// 方案B：L2 总规则数 = 文本规则 + LTL 时序规则（都属 L2 大类）
+function countRulesL2() {
+  const text = countRules(state.config.L2_rules);
+  const ltl = (state.config.L2_2?.ltl_rules || []).length;
+  return text + ltl;
+}
+// L2 启用数 = 文本启用 + LTL 启用（层级总开关关闭时 LTL 归 0，与引擎 gating 一致）
+function countEnabledL2() {
+  const text = countEnabled(state.config.L2_rules, 'L2_logic_rules');
+  const layerOn = state.config.layers?.L2_logic_rules !== false;
+  const catOn = state.config.L2_2?.category_enabled !== false;
+  const ltlOn = (layerOn && catOn) ? (state.config.L2_2?.ltl_rules || []).filter(r => r.enabled !== false).length : 0;
+  return text + ltlOn;
+}
+
+// ===== 层级开关 =====
+async function toggleLayer(key) {
+  try {
+    const cur = state.config.layers[key] !== false;
+    // PUT /api/layers 只返回 {layers, env_overrides}（不含规则数据），
+    // 不能用它整体覆盖 state.config，否则 L1/L2/L3 规则会丢失变成 0/0。
+    await apiPut('layers', { layer_key: key, enabled: !cur });
+    // 重新拉取完整 config，保证规则统计/列表不丢
+    await refreshConfig();
+    showToast(`${LAYER_NAMES[key]?.name || key} ${!cur ? t('已启用', 'enabled') : t('已禁用', 'disabled')}`);
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+
+// ===== 分类开关 =====
+async function toggleCategory(layer, category) {
+  try {
+    const cur = state.config[layer]?.[category]?.category_enabled !== false;
+    state.config = await apiPut('categories/enabled', { layer, category, enabled: !cur });
+    renderCurrent();
+    showToast(t('分类已', 'Category ') + (!cur ? t('启用', 'enabled') : t('禁用', 'disabled')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+// LTL 大类开关（L2.2 的 category_enabled 存于 view 的顶层，而非 category dict 内）
+async function toggleLtlCategory(en) {
+  try {
+    state.config = await apiPut('categories/enabled', { layer: 'L2_2', category: 'ltl_rules', enabled: en });
+    renderCurrent();
+    showToast(t('LTL 大类已', 'LTL category ') + (en ? t('启用', 'enabled') : t('禁用', 'disabled')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+async function toggleSkillCategory(category) {
+  try {
+    const cur = state.config.L3_skills?.[category]?.category_enabled !== false;
+    state.config = await apiPut('skill-categories/enabled', { category, enabled: !cur });
+    renderCurrent();
+    showToast(t('Skill 分类已', 'Skill category ') + (!cur ? t('启用', 'enabled') : t('禁用', 'disabled')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+
+// ===== 折叠展开 =====
+function toggleExpand(id) {
+  const list = el('list-' + id);
+  const icon = el('expand-' + id);
+  if (!list) return;
+  const willOpen = list.style.display === 'none';
+  list.style.display = willOpen ? '' : 'none';
+  if (icon) icon.classList.toggle('open', willOpen);
+  if (willOpen) expandedCats.add(id); else expandedCats.delete(id);
+}
+
+// ===== L1/L2 规则页 =====
+// 规则层容器 -> 层级总开关 key 的映射（用于大类开关随层级开关联动）
+const LAYER_SWITCH_KEY = { L1_rules: 'L1_heuristic', L2_rules: 'L2_logic_rules', L3_skills: 'L3_llm_analysis' };
+function renderRuleLayer(layerKey, containerId, categoryNames, append = false, showAddBtn = true, strict = false) {
+  const layer = state.config[layerKey] || {};
+  // 层级总开关：关闭时整层大类开关随动显示为关（仅 UI 联动，不改后端数据）
+  const layerSwitchKey = LAYER_SWITCH_KEY[layerKey];
+  const layerEnabled = layerSwitchKey ? state.config.layers?.[layerSwitchKey] !== false : true;
+  // strict：只渲染 categoryNames 白名单内的分类（不兜底 runtime 里多的 key），
+  // 供 render_l2 三段式（内置类 + 用户自定义分开）避免重复/英文透出。
+  let orderedEntries;
+  if (strict) {
+    orderedEntries = Object.keys(categoryNames)
+      .filter(k => k in layer)
+      .map(k => [k, layer[k]]);
+  } else {
+    orderedEntries = [
+      ...Object.keys(categoryNames).filter(k => k in layer).map(k => [k, layer[k]]),
+      ...Object.entries(layer).filter(([k]) => !(k in categoryNames)),
+    ];
+  }
+  let html = showAddBtn
+    ? `<div class="ag-card" style="padding:8px 16px"><button class="ag-btn ag-btn-primary" onclick="showAddRuleModal('${layerKey}')">＋ ${t('新增规则', 'Add Rule')}</button></div>`
+    : '';
+  for (const [catName, catData] of orderedEntries) {
+    const displayName = categoryNames[catName] || catName;
+    const rules = catData.rules || [];
+    const catEnabled = catData.category_enabled !== false;
+    // 大类总开关显示状态 = 层级开 && 大类开；层级关时大类开关需禁用（无意义）
+    const catSwitchOn = layerEnabled && catEnabled;
+    const catSwitchDisabled = !layerEnabled;
+    // 大类计数与后端执行口径一致：大类总开关关闭时启用数归 0（分母仍为规则总数）
+    const enabledCount = catSwitchOn ? rules.filter(r => r.enabled).length : 0;
+    const expanded = expandedCats.has(`${containerId}-${catName}`);
+    html += `<div class="ag-card">
+      <div class="ag-cat-header" onclick="toggleExpand('${containerId}-${catName}')">
+        <div class="ag-cat-name">${escapeHtml(displayName)} <span class="ag-cat-count">${enabledCount}/${rules.length} ${t('启用', 'enabled')}</span></div>
+        <div class="ag-cat-controls">
+          <div onclick="event.stopPropagation();toggleCategory('${layerKey}','${catName}')">${toggle(catSwitchOn, catSwitchDisabled, '')}</div>
+          <span class="ag-expand-icon ${expanded ? 'open' : ''}" id="expand-${containerId}-${catName}">▼</span>
+        </div>
+      </div>
+      <div class="ag-rule-list" id="list-${containerId}-${catName}" style="display:${expanded ? '' : 'none'}">`;
+    if (!rules.length) {
+      html += `<div class="ag-empty">${t('无规则', 'No rules')}</div>`;
+    } else {
+      for (const r of rules) {
+        html += renderRuleItem(layerKey, catName, r);
+      }
+    }
+    html += '</div></div>';
+  }
+  const cont = el(containerId);
+  if (!cont) return;
+  if (append) cont.insertAdjacentHTML('beforeend', html);
+  else cont.innerHTML = html;
+}
+function renderRuleItem(layerKey, catName, r) {
+  const isL2 = layerKey === 'L2_rules';
+  const isL2Sensitive = isL2 && catName === 'sensitive_path_access';
+  let patternDisplay = r.pattern || r.keyword || r.path || (r.intent_keywords && r.intent_keywords.join(', ')) || r.reason || r.id || '';
+  let reasonDisplay = r.reason || r.desc || '';
+  let patternLabel = t('规则', 'Rule');
+  if (isL2) {
+    if (r.intent_keywords) patternLabel = t('触发关键词', 'Trigger Keywords');
+    else if (r.path) patternLabel = t('敏感路径', 'Sensitive Path');
+    else if (r.pattern) patternLabel = t('检测模式', 'Detection Pattern');
+  }
+  const reasonLabel = isL2 ? t('规则说明', 'Rule Description') : t('原因', 'Reason');
+  const tooltip = `${patternLabel}: ${patternDisplay}\n${reasonLabel}: ${reasonDisplay || t('(无)', '(none)')}\nID: ${r.id}`;
+  const denyModeSelect = isL2Sensitive ? `<select class="ag-deny-select" onchange="updateDenyMode('${layerKey}','${catName}','${r.id}',this.value)" ${r.enabled ? '' : 'disabled'}>
+      <option value="deny_write" ${(r.deny_mode || 'deny_write') === 'deny_write' ? 'selected' : ''}>${t('仅拦截写入', 'Block Write Only')}</option>
+      <option value="deny_read" ${(r.deny_mode || 'deny_write') === 'deny_read' ? 'selected' : ''}>${t('仅拦截读取', 'Block Read Only')}</option>
+      <option value="deny_both" ${(r.deny_mode || 'deny_write') === 'deny_both' ? 'selected' : ''}>${t('读写均拦截', 'Block Both')}</option>
+    </select>` : '';
+  const skipL3 = isL2 ? `<label class="ag-skip-l3" title="${t('禁用该规则时，L3 对相关路径/关键词做豁免放行（但仍分析命令其他部分的安全风险）。关闭则 L3 可能独立拦截', 'When this rule is disabled, L3 exempts the related path/keyword (but still analyzes other parts of the command). Turning off lets L3 block independently')}"><input type="checkbox" ${r.skip_l3_on_disabled ? 'checked' : ''} onchange="updateSkipL3('${layerKey}','${catName}','${r.id}',this.checked)"> ${t('禁用时豁免L3', 'Exempt L3 when disabled')}</label>` : '';
+  const deleteBtn = (r.builtin === false || r.source_removed) ? `<button class="ag-btn ag-btn-danger ag-btn-sm" onclick="deleteRule('${layerKey}','${catName}','${r.id}')" title="${r.source_removed ? t('此规则已从默认规则集移除，可删除清理', 'This rule was removed from the default set; you may delete it') : t('删除自定义规则', 'Delete custom rule')}">${t('删除', 'Delete')}</button>` : '';
+  return `<div class="ag-rule-item" title="${escapeHtml(tooltip)}">
+    <div class="ag-rule-body">
+      <div class="ag-rule-tags">${builtinBadge(r.builtin)} ${removedBadge(r.source_removed)} ${riskBadge(r.risk_level)} ${riskTypeBadge(r.risk_type)}${isL2Sensitive ? ' ' + denyModeBadge(r.deny_mode) + ' ' + sourceDenyModeBadges(r) : ''}</div>
+      <div class="ag-rule-pattern"><span class="ag-rule-field-label">${patternLabel}:</span> ${escapeHtml(patternDisplay)}</div>
+      ${reasonDisplay ? `<div class="ag-rule-reason"><span class="ag-rule-field-label">${reasonLabel}:</span> ${escapeHtml(reasonDisplay)}</div>` : ''}
+      <div class="ag-rule-id">ID: ${escapeHtml(r.id)}</div>
+    </div>
+    <div class="ag-rule-controls">${denyModeSelect}${toggle(r.enabled, false, `toggleRule('${layerKey}','${catName}','${r.id}',${!r.enabled})`)}${skipL3}${deleteBtn}</div>
+  </div>`;
+}
+function render_l1() { renderRuleLayer('L1_rules', 'page-l1', L1_CATEGORY_NAMES); }
+function render_l2() {
+  // 顺序：内置 L2 类 → LTL 时序规则卡 → 用户自定义（永远最后）
+  // strict=true：三段各渲染自己的白名单，避免兜底把别的类目用英文透出（去重 bug）
+  const builtin = Object.fromEntries(Object.entries(L2_CATEGORY_NAMES).filter(([k]) => k !== 'user_custom'));
+  const customOnly = { user_custom: L2_CATEGORY_NAMES.user_custom };
+  renderRuleLayer('L2_rules', 'page-l2', builtin, false, true, true);
+  renderLtlCard('page-l2');
+  renderRuleLayer('L2_rules', 'page-l2', customOnly, true, false, true);
+}
+// LTL 时序攻击模式规则卡（L2.2，并入 L2 页展示；数据源 state.config.L2_2.ltl_rules）
+function renderLtlCard(containerId) {
+  const l22 = state.config.L2_2 || {};
+  const ltl = l22.ltl_rules || [];
+  const isL2On = state.config.layers?.L2_logic_rules !== false;
+  const catOn = l22.category_enabled !== false;
+  // 与其他分类一致：默认折叠，用户展开过则保持（expandedCats）
+  const expanded = expandedCats.has(`${containerId}-ltl_rules`);
+  // 大类总开关显示状态 = 层级开 && 大类开；大类关时内部单条规则开关禁用（无意义）
+  const catSwitchOn = isL2On && catOn;
+  const enabledCount = catSwitchOn ? ltl.filter(r => r.enabled !== false).length : 0;
+  let html = `<div class="ag-card">
+    <div class="ag-cat-header" onclick="toggleExpand('${containerId}-ltl_rules')">
+      <div class="ag-cat-name">${t('⏱️ 时序攻击模式 (LTL)', '⏱️ Timing Attack Patterns (LTL)')} <span class="ag-cat-count">${enabledCount}/${ltl.length} ${t('启用', 'enabled')}</span></div>
+      <div class="ag-cat-controls">
+        <div onclick="event.stopPropagation()">${toggle(catSwitchOn, !isL2On, `toggleLtlCategory(${!catOn})`)}</div>
+        <span class="ag-expand-icon ${expanded ? 'open' : ''}" id="expand-${containerId}-ltl_rules">▼</span>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--ag-text-secondary);padding:0 16px 8px">${t('检测历史动作序列中的攻击模式：先发生 A、后发生 B（受 L2 层开关控制，当前', 'Detects attack patterns in history: A then B (gated by L2 layer switch, currently')} <b>${isL2On ? t('启用', 'enabled') : t('禁用', 'disabled')}</b>）</div>
+    <div class="ag-rule-list" id="list-${containerId}-ltl_rules" style="display:${expanded ? '' : 'none'}">`;
+  if (!ltl.length) {
+    html += `<div class="ag-empty">${t('无', 'None')}</div>`;
+  } else {
+    for (const r of ltl) {
+      const action = r.action === 'block' ? t('拦截', 'Block') : (r.action === 'approval' ? t('审批', 'Approval') : t(r.action || '', r.action || ''));
+      const itemOn = catSwitchOn && r.enabled !== false;
+      html += `<div class="ag-rule-item"><div class="ag-rule-body">
+        <div class="ag-rule-tags">${riskBadge(r.risk_level)}</div>
+        <div class="ag-rule-pattern"><span class="ag-rule-field-label">${t('检测', 'Detects')}:</span> ${escapeHtml(r.human || r.reason || r.id)}</div>
+        <div class="ag-rule-reason"><span class="ag-rule-field-label">${t('规则说明', 'Description')}:</span> ${escapeHtml(r.reason || '')} <span class="ag-rule-id">[${escapeHtml(r.id)}]</span></div>
+        <div class="ag-rule-id">${t('动作', 'Action')}: ${action}</div>
+      </div><div class="ag-rule-controls">${toggle(itemOn, !catSwitchOn, `toggleRule('L2_2','ltl_rules','${r.id}',${!(r.enabled !== false)})`)}</div></div>`;
+    }
+  }
+  html += '</div></div>';
+  const cont = el(containerId);
+  if (cont) cont.insertAdjacentHTML('beforeend', html);
+}
+async function toggleRule(layer, cat, id, en) {
+  try {
+    state.config = await apiPut('rules/enabled', { layer, category: cat, rule_id: id, enabled: en });
+    renderCurrent(); if (state.currentPage === 'search') searchRules();
+    showToast(t('规则 ', 'Rule ') + id + t(' 已', ' ') + (en ? t('启用', 'enabled') : t('禁用', 'disabled')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+async function updateDenyMode(layer, cat, id, mode) {
+  try {
+    state.config = await apiPut('rules/deny_mode', { layer, category: cat, rule_id: id, deny_mode: mode });
+    renderCurrent(); if (state.currentPage === 'search') searchRules();
+    showToast(t('拦截模式已更新为 ', 'Interception mode updated to ') + denyModeLabel(mode));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+async function updateSkipL3(layer, cat, id, skip) {
+  try {
+    state.config = await apiPut('rules/skip_l3', { layer, category: cat, rule_id: id, skip_l3_on_disabled: skip });
+    renderCurrent(); if (state.currentPage === 'search') searchRules();
+    showToast(t('规则 ', 'Rule ') + id + t(' 禁用时豁免L3 已', ' disable-exempt-L3 ') + (skip ? t('开启', 'ON') : t('关闭', 'OFF')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+async function deleteRule(layer, cat, id) {
+  const layerData = (state.config[layer] || {})[cat] || {};
+  const rule = (layerData.rules || []).find(r => r.id === id) || {};
+  const isRemoved = rule.source_removed;
+  const title = t('删除规则', 'Delete Rule');
+  const msg = isRemoved
+    ? t('确定删除已移除的规则 "', 'Delete removed rule "') + id + t('"？\n（此规则已从默认规则集移除，删除可清理历史保留。下次升级不会再恢复）', '"?\n(This rule was removed from the default set. Deleting cleans up the historical entry. It will not be restored on the next upgrade.)')
+    : t('确定删除自定义规则 "', 'Delete custom rule "') + id + t('"？', '"?');
+  const ok = await agConfirm(title, msg, t('删除', 'Delete'));
+  if (!ok) return;
+  try {
+    state.config = await apiDelete('rules', { layer, category: cat, rule_id: id });
+    renderCurrent(); showToast(t('规则 ', 'Rule ') + id + t(' 已删除', ' deleted'));
+  } catch (e) { showToast(t('删除失败: ', 'Delete failed: ') + e.message, 'error'); }
+}
+
+// ===== Agent 定制规则页 =====
+const AGENT_CATEGORY_NAMES = {
+  builtin_safe_action_types: t('安全操作白名单（跳 L2+L3）', 'Safe Action Whitelist (skip L2+L3)'),
+  builtin_safe_skills: t('信任内置 Skill（跳 L2+L3）', 'Trusted Built-in Skills (skip L2+L3)'),
+  extra_command_patterns: t('专属危险命令正则（L1 追加）', 'Dedicated Dangerous Command Regex (L1 extra)'),
+  extra_injection_keywords: t('专属注入关键词（L1 追加）', 'Dedicated Injection Keywords (L1 extra)'),
+  extra_sensitive_paths: t('专属敏感路径（L1 追加）', 'Dedicated Sensitive Paths (L1 extra)'),
+};
+function render_agents() {
+  const agents = (state.agentRules && state.agentRules.agents) || {};
+  // 有 instance（当前是某 agent 调用）时，只显示该 agent 的定制规则（即使无规则也显示空，
+  // 避免出现别的 agent 的规则造成困惑）；无 instance（本地独立起/非 agent 调用）显示全部。
+  let ids;
+  if (state.instance) {
+    ids = agents[state.instance] ? [state.instance] : [];
+  } else {
+    ids = Object.keys(agents);
+  }
+  if (!ids.length) {
+    el('page-agents').innerHTML = `<div class="ag-card"><div class="ag-empty">${t('无 agent 定制规则', 'No agent custom rules')}</div></div>`;
+    return;
+  }
+  let html = '';
+  for (const agentId of ids) {
+    const cats = agents[agentId] || {};
+    html += `<div class="ag-card"><div class="ag-section-title">Agent: ${escapeHtml(agentId)}</div>`;
+    const ordered = [
+      ...Object.keys(AGENT_CATEGORY_NAMES).filter(k => k in cats).map(k => [k, cats[k]]),
+      ...Object.entries(cats).filter(([k]) => !(k in AGENT_CATEGORY_NAMES)),
+    ];
+    for (const [catName, catData] of ordered) {
+      const rules = catData.rules || [];
+      const catEnabled = catData.category_enabled !== false;
+      const expanded = expandedCats.has(`agents-${agentId}-${catName}`);
+      // 大类计数与后端执行口径一致：大类总开关关闭时启用数归 0
+      const enCount = catEnabled ? rules.filter(r => r.enabled).length : 0;
+      html += `<div class="ag-cat-header" onclick="toggleExpand('agents-${agentId}-${catName}')">
+        <div class="ag-cat-name">${escapeHtml(AGENT_CATEGORY_NAMES[catName] || catName)} <span class="ag-cat-count">${enCount}/${rules.length} ${t('启用', 'enabled')}</span></div>
+        <div class="ag-cat-controls"><div onclick="event.stopPropagation();toggleAgentCategory('${agentId}','${catName}')">${toggle(catEnabled, false, '')}</div><span class="ag-expand-icon ${expanded ? 'open' : ''}">▼</span></div>
+      </div>
+      <div class="ag-rule-list" id="list-agents-${agentId}-${catName}" style="display:${expanded ? '' : 'none'}">`;
+      if (!rules.length) {
+        html += `<div class="ag-empty">${t('无规则', 'No rules')}</div>`;
+      } else {
+        for (const r of rules) html += renderAgentRuleItem(agentId, catName, r);
+      }
+      html += `<div style="padding:8px 0"><button class="ag-btn ag-btn-ghost" onclick="showAddAgentRuleModal('${agentId}','${catName}')">＋ ${t('新增', 'Add')}</button></div>`;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  el('page-agents').innerHTML = html;
+}
+function renderAgentRuleItem(agentId, catName, r) {
+  const isValue = catName === 'builtin_safe_action_types' || catName === 'builtin_safe_skills';
+  const patternDisplay = r.value || r.pattern || r.keyword || r.path || r.id || JSON.stringify(r).slice(0, 60);
+  const reasonDisplay = r.reason || r.desc || r.lang || '';
+  const tagLine = (r.builtin !== false ? `<span class="ag-badge ag-badge-builtin" title="${t('源码内置规则', 'Built-in source rule')}">${t('内置', 'Built-in')}</span>` : `<span class="ag-badge ag-badge-custom">${t('自定义', 'Custom')}</span>`)
+    + (r.source_removed ? `<span class="ag-badge ag-badge-removed" title="${t('此规则已从默认规则集移除，仅作历史保留', 'This rule was removed from the default set and is kept as history')}">${t('已移除', 'Removed')}</span>` : '')
+    + (isValue ? '' : (riskBadge(r.risk_level) + (r.risk_type ? riskTypeBadge(r.risk_type) : '')));
+  const patternLabel = isValue ? t('白名单', 'Whitelist') : (r.path ? t('敏感路径', 'Sensitive Path') : (r.keyword ? t('触发关键词', 'Trigger Keywords') : t('规则', 'Rule')));
+  const reasonLabel = r.reason || r.desc ? t('原因', 'Reason') : (r.lang ? t('语言', 'Language') : t('说明', 'Description'));
+  const tooltip = `${patternLabel}: ${patternDisplay}\n${reasonLabel}: ${reasonDisplay || t('(无)', '(none)')}`;
+  const delBtn = r.builtin ? '' : `<button class="ag-btn ag-btn-ghost ag-btn-sm" onclick="deleteAgentRule('${agentId}','${catName}',${JSON.stringify(r).replace(/"/g,'&quot;')})">${t('删除', 'Delete')}</button>`;
+  return `<div class="ag-rule-item" title="${escapeHtml(tooltip)}">
+    <div class="ag-rule-body">
+      <div class="ag-rule-tags">${tagLine}</div>
+      <div class="ag-rule-pattern"><span class="ag-rule-field-label">${patternLabel}:</span> ${escapeHtml(patternDisplay)}</div>
+      ${reasonDisplay ? `<div class="ag-rule-reason"><span class="ag-rule-field-label">${reasonLabel}:</span> ${escapeHtml(reasonDisplay)}</div>` : ''}
+        ${r.id ? `<div class="ag-rule-id">ID: ${escapeHtml(r.id)}</div>` : ''}
+    </div>
+    <div class="ag-rule-controls">${toggle(r.enabled, false, `toggleAgentRule('${agentId}','${catName}',${JSON.stringify(r).replace(/"/g,'&quot;')},${!r.enabled})`)}${delBtn}</div>
+  </div>`;
+}
+async function toggleAgentRule(agentId, cat, r, en) {
+  const fp = { value: r.value, pattern: r.pattern, keyword: r.keyword, path: r.path };
+  try {
+    state.agentRules = await apiPut('agents/rules/enabled', { agent_id: agentId, category: cat, ...fp, enabled: en });
+    render_agents();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+async function toggleAgentCategory(agentId, cat) {
+  const cats = (state.agentRules.agents || {})[agentId] || {};
+  const en = cats[cat]?.category_enabled === false;
+  try {
+    state.agentRules = await apiPut('agents/categories/enabled', { agent_id: agentId, category: cat, enabled: en });
+    render_agents();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+async function deleteAgentRule(agentId, cat, r) {
+  const fp = { value: r.value, pattern: r.pattern, keyword: r.keyword, path: r.path };
+  const ok = await agConfirm(
+    t('删除规则', 'Delete Rule'),
+    t('确定删除规则 "', 'Delete rule "') + (r.value || r.pattern || r.keyword || r.path || '') + t('"？', '"?'),
+    t('删除', 'Delete')
+  );
+  if (!ok) return;
+  try {
+    state.agentRules = await apiDelete('agents/rules', { agent_id: agentId, category: cat, ...fp });
+    render_agents();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+function showAddAgentRuleModal(agentId, cat) {
+  const isValueCat = cat === 'builtin_safe_action_types' || cat === 'builtin_safe_skills';
+  const body = isValueCat
+    ? `<input class="ag-input" id="ar-value" placeholder="${t('值（前缀尾随 - 或精确工具名）', 'Value (prefix/suffix - or exact tool name)')}" style="width:100%">`
+    : `<input class="ag-input" id="ar-pattern" placeholder="${t('正则/关键词/路径', 'Regex/keyword/path')}" style="width:100%;margin-bottom:8px">
+       <input class="ag-input" id="ar-risk_level" placeholder="risk_level (high/medium/...)" style="width:100%">`;
+  openModal(t('新增 ', 'Add ') + agentId + ' / ' + cat + t(' 规则', ' rule'), body, true);
+  currentModalAction = { type: 'agent_rule', agentId, cat, isValueCat };
+}
+
+// ===== 场景定制规则页 =====
+// 场景规则（agent_moss/scenarios/<id>/rules.json）与 agent 规则同构（都是
+// AgentExtensions 结构），复用 agent 卡片的类别模板/开关/增删交互；唯一区别是
+// 启用由 AGENT_MOSS_SCENARIO env 决定（后端 /api/scenarios 已过滤，无 env 返回空）。
+function render_scenarios() {
+  const resp = state.scenarioRules || {};
+  const scenarios = resp.scenarios || {};
+  const enabled = resp.enabled || [];
+  const noEnv = enabled.length === 0;
+  if (noEnv) {
+    el('page-scenarios').innerHTML = `<div class="ag-card"><div class="ag-empty">${t(
+      '未启用任何场景（未设置 AGENT_MOSS_SCENARIO 环境变量）。设置后此处显示场景定制规则并可在线编辑。',
+      'No scenario enabled (AGENT_MOSS_SCENARIO env not set). Set it to view and edit scenario rules here.'
+    )}</div></div>`;
+    return;
+  }
+  if (!Object.keys(scenarios).length) {
+    el('page-scenarios').innerHTML = `<div class="ag-card"><div class="ag-empty">${t(
+      '已设置 AGENT_MOSS_SCENARIO，但没有对应的场景规则（检查 agent_moss/scenarios/ 目录）。',
+      'AGENT_MOSS_SCENARIO is set but no matching scenario rules found (check agent_moss/scenarios/).'
+    )}</div></div>`;
+    return;
+  }
+  let html = '';
+  for (const scenarioId of Object.keys(scenarios)) {
+    const cats = scenarios[scenarioId] || {};
+    html += `<div class="ag-card"><div class="ag-section-title">${t('场景', 'Scenario')}: ${escapeHtml(scenarioId)}</div>`;
+    const ordered = [
+      ...Object.keys(AGENT_CATEGORY_NAMES).filter(k => k in cats).map(k => [k, cats[k]]),
+      ...Object.entries(cats).filter(([k]) => !(k in AGENT_CATEGORY_NAMES)),
+    ];
+    for (const [catName, catData] of ordered) {
+      const rules = catData.rules || [];
+      const catEnabled = catData.category_enabled !== false;
+      const expanded = expandedCats.has(`scenarios-${scenarioId}-${catName}`);
+      const enCount = catEnabled ? rules.filter(r => r.enabled).length : 0;
+      html += `<div class="ag-cat-header" onclick="toggleExpand('scenarios-${scenarioId}-${catName}')">
+        <div class="ag-cat-name">${escapeHtml(AGENT_CATEGORY_NAMES[catName] || catName)} <span class="ag-cat-count">${enCount}/${rules.length} ${t('启用', 'enabled')}</span></div>
+        <div class="ag-cat-controls"><div onclick="event.stopPropagation();toggleScenarioCategory('${scenarioId}','${catName}')">${toggle(catEnabled, false, '')}</div><span class="ag-expand-icon ${expanded ? 'open' : ''}">▼</span></div>
+      </div>
+      <div class="ag-rule-list" id="list-scenarios-${scenarioId}-${catName}" style="display:${expanded ? '' : 'none'}">`;
+      if (!rules.length) {
+        html += `<div class="ag-empty">${t('无规则', 'No rules')}</div>`;
+      } else {
+        for (const r of rules) html += renderScenarioRuleItem(scenarioId, catName, r);
+      }
+      html += `<div style="padding:8px 0"><button class="ag-btn ag-btn-ghost" onclick="showAddScenarioRuleModal('${scenarioId}','${catName}')">＋ ${t('新增', 'Add')}</button></div>`;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  el('page-scenarios').innerHTML = html;
+}
+function renderScenarioRuleItem(scenarioId, catName, r) {
+  const patternDisplay = r.value || r.pattern || r.keyword || r.path || r.id || JSON.stringify(r).slice(0, 60);
+  const reasonDisplay = r.reason || r.desc || r.lang || '';
+  const tagLine = (r.builtin !== false ? `<span class="ag-badge ag-badge-builtin" title="${t('源码内置规则', 'Built-in source rule')}">${t('内置', 'Built-in')}</span>` : `<span class="ag-badge ag-badge-custom">${t('自定义', 'Custom')}</span>`)
+    + (r.source_removed ? `<span class="ag-badge ag-badge-removed" title="${t('此规则已从默认规则集移除，仅作历史保留', 'This rule was removed from the default set and is kept as history')}">${t('已移除', 'Removed')}</span>` : '')
+    + (r.pattern ? riskBadge(r.risk_level) + (r.risk_type ? riskTypeBadge(r.risk_type) : '') : '');
+  const patternLabel = r.path ? t('敏感路径', 'Sensitive Path') : (r.keyword ? t('触发关键词', 'Trigger Keywords') : t('规则', 'Rule'));
+  const tooltip = `${patternLabel}: ${patternDisplay}\n${t('原因', 'Reason')}: ${reasonDisplay || t('(无)', '(none)')}`;
+  const delBtn = r.builtin ? '' : `<button class="ag-btn ag-btn-ghost ag-btn-sm" onclick="deleteScenarioRule('${scenarioId}','${catName}',${JSON.stringify(r).replace(/"/g,'&quot;')})">${t('删除', 'Delete')}</button>`;
+  return `<div class="ag-rule-item" title="${escapeHtml(tooltip)}">
+    <div class="ag-rule-body">
+      <div class="ag-rule-tags">${tagLine}</div>
+      <div class="ag-rule-pattern"><span class="ag-rule-field-label">${patternLabel}:</span> ${escapeHtml(patternDisplay)}</div>
+      ${reasonDisplay ? `<div class="ag-rule-reason"><span class="ag-rule-field-label">${t('原因', 'Reason')}:</span> ${escapeHtml(reasonDisplay)}</div>` : ''}
+    </div>
+    <div class="ag-rule-controls">${toggle(r.enabled, false, `toggleScenarioRule('${scenarioId}','${catName}',${JSON.stringify(r).replace(/"/g,'&quot;')},${!r.enabled})`)}${delBtn}</div>
+  </div>`;
+}
+async function toggleScenarioRule(scenarioId, cat, r, en) {
+  const fp = { value: r.value, pattern: r.pattern, keyword: r.keyword, path: r.path };
+  try {
+    state.scenarioRules = await apiPut('scenarios/rules/enabled', { scenario_id: scenarioId, category: cat, ...fp, enabled: en });
+    render_scenarios();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+async function toggleScenarioCategory(scenarioId, cat) {
+  const cats = (state.scenarioRules?.scenarios || {})[scenarioId] || {};
+  const en = cats[cat]?.category_enabled === false;
+  try {
+    state.scenarioRules = await apiPut('scenarios/categories/enabled', { scenario_id: scenarioId, category: cat, enabled: en });
+    render_scenarios();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+async function deleteScenarioRule(scenarioId, cat, r) {
+  const fp = { value: r.value, pattern: r.pattern, keyword: r.keyword, path: r.path };
+  const ok = await agConfirm(
+    t('删除规则', 'Delete Rule'),
+    t('确定删除规则 "', 'Delete rule "') + (r.value || r.pattern || r.keyword || r.path || '') + t('"？', '"?'),
+    t('删除', 'Delete')
+  );
+  if (!ok) return;
+  try {
+    state.scenarioRules = await apiDelete('scenarios/rules', { scenario_id: scenarioId, category: cat, ...fp });
+    render_scenarios();
+  } catch (e) { showToast(String(e), 'error'); }
+}
+function showAddScenarioRuleModal(scenarioId, cat) {
+  const body = `<input class="ag-input" id="ar-pattern" placeholder="${t('正则/关键词/路径', 'Regex/keyword/path')}" style="width:100%;margin-bottom:8px">
+     <input class="ag-input" id="ar-risk_level" placeholder="risk_level (high/medium/...)" style="width:100%">`;
+  openModal(t('新增场景规则 ', 'Add scenario rule ') + scenarioId + ' / ' + cat, body, true);
+  currentModalAction = { type: 'scenario_rule', scenarioId, cat };
+}
+
+// ===== L3 Skills 页 =====
+function render_l3() {
+  const l3 = state.config.L3_skills || {};
+  // 层级总开关：关闭时 L3 大类开关随动显示为关（仅 UI 联动，不改后端数据）
+  const layerEnabled = state.config.layers?.['L3_llm_analysis'] !== false;
+  let html = `<div class="ag-card" style="padding:8px 16px"><button class="ag-btn ag-btn-primary" onclick="showAddSkillModal()">＋ ${t('新增 Skill', 'Add Skill')}</button></div>`;
+  for (const [catName, catData] of Object.entries(l3)) {
+    const displayName = L3_CATEGORY_NAMES[catName] || catName;
+    const skills = catData.skills || [];
+    const catEnabled = catData.category_enabled !== false;
+    // 大类总开关显示状态 = 层级开 && 大类开；层级关时大类开关需禁用（无意义）
+    const catSwitchOn = layerEnabled && catEnabled;
+    const catSwitchDisabled = !layerEnabled;
+    // 大类计数与后端执行口径一致：大类总开关关闭时启用数归 0
+    const enabledCount = catSwitchOn ? skills.filter(s => s.enabled).length : 0;
+    const expanded = expandedCats.has('page-l3-' + catName);
+    html += `<div class="ag-card">
+      <div class="ag-cat-header" onclick="toggleExpand('page-l3-${catName}')">
+        <div class="ag-cat-name">${escapeHtml(displayName)} <span class="ag-cat-count">${enabledCount}/${skills.length} ${t('启用', 'enabled')}</span></div>
+        <div class="ag-cat-controls">
+          <div onclick="event.stopPropagation();toggleSkillCategory('${catName}')">${toggle(catSwitchOn, catSwitchDisabled, '')}</div>
+          <span class="ag-expand-icon ${expanded ? 'open' : ''}" id="expand-page-l3-${catName}">▼</span>
+        </div>
+      </div>
+      <div class="ag-rule-list" id="list-page-l3-${catName}" style="display:${expanded ? '' : 'none'}">`;
+    if (!skills.length) {
+      html += `<div class="ag-empty">${t('无 skill', 'No skill')}</div>`;
+    } else {
+      for (const s of skills) {
+        const kw = (s.keywords || []).join(', ');
+        const deleteBtn = s.builtin === false ? `<button class="ag-btn ag-btn-danger ag-btn-sm" onclick="deleteSkill('${s.id}','${catName}')">${t('删除', 'Delete')}</button>` : '';
+        html += `<div class="ag-rule-item">
+          <div class="ag-rule-body">
+            <div class="ag-rule-tags">${builtinBadge(s.builtin)} <strong>${escapeHtml(s.id)}</strong></div>
+            <div class="ag-rule-reason"><span class="ag-rule-field-label">${t('触发关键词:', 'Trigger keywords: ')}</span> ${escapeHtml(kw)}</div>
+          </div>
+          <div class="ag-rule-controls">${toggle(s.enabled, false, `toggleSkill('${s.id}',${!s.enabled})`)}<button class="ag-btn ag-btn-ghost ag-btn-sm" onclick="showSkillDetail('${s.id}')">${t('详情', 'Details')}</button>${deleteBtn}</div>
+        </div>`;
+      }
+    }
+    html += '</div></div>';
+  }
+  el('page-l3').innerHTML = html;
+}
+async function toggleSkill(skillId, en) {
+  try {
+    state.config = await apiPut('skills/enabled', { skill_id: skillId, enabled: en });
+    renderCurrent(); if (state.currentPage === 'search') searchRules();
+    showToast('Skill ' + skillId + t(' 已', ' ') + (en ? t('启用', 'enabled') : t('禁用', 'disabled')));
+  } catch (e) { showToast(t('操作失败: ', 'Operation failed: ') + e.message, 'error'); }
+}
+async function deleteSkill(skillId, cat) {
+  const ok = await agConfirm(
+    t('删除 Skill', 'Delete Skill'),
+    t('确定删除自定义 Skill "', 'Delete custom Skill "') + skillId + t('"？', '"?'),
+    t('删除', 'Delete')
+  );
+  if (!ok) return;
+  try {
+    state.config = await apiDelete('skills', { skill_id: skillId, category: cat });
+    renderCurrent(); showToast('Skill ' + skillId + t(' 已删除', ' deleted'));
+  } catch (e) { showToast(t('删除失败: ', 'Delete failed: ') + e.message, 'error'); }
+}
+async function showSkillDetail(skillId) {
+  openModal(t('🤖 Skill 详情', '🤖 Skill Details'), `<p style="color:var(--ag-text-tertiary);padding:8px 0">${t('加载中...', 'Loading...')}</p>`, false);
+  el('modal').classList.add('ag-modal-wide');
+  try {
+    const data = await api('skills/' + encodeURIComponent(skillId) + '/content');
+    el('modal-body').innerHTML = renderSkillContent(data.content || '', skillId, data.path || '');
+  } catch (e) {
+    el('modal-body').innerHTML = `<p style="color:var(--ag-red);padding:8px 0">${t('加载失败: ', 'Load failed: ')}${escapeHtml(e.message)}</p>`;
+  }
+}
+function renderSkillContent(md, skillId, filePath) {
+  const lines = (md || '').split('\n');
+  let html = '<div class="ag-skill-detail-header"><span class="ag-skill-detail-id">' + escapeHtml(skillId) + '</span></div><div class="ag-skill-meta"><span class="ag-skill-meta-item">📄 <strong>' + escapeHtml(filePath || t('(未知)', '(unknown)')) + '</strong></span><span class="ag-skill-meta-item">📏 <strong>' + lines.length + '</strong> ' + t('行', 'lines') + '</span></div><div class="ag-skill-content">';
+  let inCode = false, codeBuf = [], textBuf = [];
+  const flushText = () => { if (textBuf.length) { html += escapeHtml(textBuf.join('\n')); textBuf = []; } };
+  const flushCode = () => { if (codeBuf.length) { html += '<pre><code>' + escapeHtml(codeBuf.join('\n')) + '</code></pre>'; codeBuf = []; } };
+  for (const line of lines) {
+    if (/^```/.test(line.trim())) {
+      if (inCode) { flushText(); flushCode(); inCode = false; }
+      else { flushText(); inCode = true; }
+      continue;
+    }
+    if (inCode) codeBuf.push(line); else textBuf.push(line);
+  }
+  flushText(); if (inCode) flushCode();
+  html += '</div>';
+  return html;
+}
+
+// ===== 搜索页 =====
+function render_search() {
+  el('page-search').innerHTML = `
+    <div class="ag-card">
+      <div class="ag-section-title">${t('全局规则搜索', 'Global Rule Search')}</div>
+      <div style="display:flex;gap:8px">
+        <input class="ag-input" id="search-input" placeholder="${t('输入关键词搜索规则，如: sysfs, rm -rf, /etc/shadow, 数据外泄...', 'Search rules by keyword, e.g. sysfs, rm -rf, /etc/shadow, data exfiltration...')}" oninput="searchRules()" style="flex:1">
+        <button class="ag-btn ag-btn-primary" onclick="searchRules()">${t('搜索', 'Search')}</button>
+        <button class="ag-btn ag-btn-ghost" onclick="clearSearch()">${t('清空', 'Clear')}</button>
+      </div>
+      <div class="ag-form-hint" style="margin-top:8px">${t('搜索范围：L1 规则的正则/原因/风险类型、L2 规则的路径/描述、L3 Skill 的关键词/ID。命中后可直接启用或禁用对应规则。', 'Search scope: L1 rule regex/reason/risk type, L2 rule path/description, L3 Skill keyword/ID. You can enable or disable the matching rule directly.')}</div>
+    </div>
+    <div class="ag-card" id="search-results-card" style="display:none">
+      <div class="ag-section-title">${t('搜索结果', 'Search Results')} <span class="ag-cat-count" id="search-count">0 ${t('条', 'results')}</span></div>
+      <div id="search-results"></div>
+    </div>`;
+  setTimeout(() => { const inp = el('search-input'); if (inp) inp.focus(); }, 0);
+}
+function searchRules() {
+  const q = (el('search-input') ? el('search-input').value : '').trim().toLowerCase();
+  const card = el('search-results-card'), list = el('search-results'), cnt = el('search-count');
+  if (!q) { card.style.display = 'none'; list.innerHTML = ''; return; }
+  const results = [];
+  for (const [cat, cd] of Object.entries(state.config.L1_rules || {})) {
+    for (const r of (cd.rules || [])) {
+      const hay = [r.id, r.pattern, r.keyword, r.reason, r.risk_type, r.risk_level].filter(Boolean).join(' ').toLowerCase();
+      if (hay.includes(q)) results.push({ layer: 'L1_rules', layerName: 'L1', category: cat, ...r });
+    }
+  }
+  for (const [cat, cd] of Object.entries(state.config.L2_rules || {})) {
+    for (const r of (cd.rules || [])) {
+      const hay = [r.id, r.path, r.pattern, r.desc, r.reason, r.risk_type, r.risk_level].filter(Boolean).join(' ').toLowerCase();
+      if (hay.includes(q)) results.push({ layer: 'L2_rules', layerName: 'L2', category: cat, ...r });
+    }
+  }
+  for (const [cat, cd] of Object.entries(state.config.L3_skills || {})) {
+    for (const s of (cd.skills || [])) {
+      const hay = [s.id, (s.keywords || []).join(' ')].filter(Boolean).join(' ').toLowerCase();
+      if (hay.includes(q)) results.push({ layer: 'L3_skills', layerName: 'L3', category: cat, ...s, isSkill: true });
+    }
+  }
+  cnt.textContent = results.length + ' ' + t('条', 'results');
+  card.style.display = '';
+  if (!results.length) { list.innerHTML = `<div class="ag-empty">${t('未找到匹配的规则', 'No matching rules found')}</div>`; return; }
+  list.innerHTML = results.map(renderSearchItem).join('');
+}
+function renderSearchItem(r) {
+  const isL2Sensitive = r.layer === 'L2_rules' && r.category === 'sensitive_path_access';
+  let ruleText = r.pattern || r.path || r.keyword || (r.keywords && r.keywords.join(', ')) || (r.intent_keywords && r.intent_keywords.join(', ')) || r.reason || r.desc || '';
+  const reason = r.reason || r.desc || '';
+  const tooltip = t('规则: ', 'Rule: ') + ruleText + t('\n原因: ', '\nReason: ') + (reason || t('(无)', '(none)')) + '\nID: ' + r.id;
+  const toggleFn = r.isSkill ? "toggleSkill('" + r.id + "'," + (!r.enabled) + ")" : "toggleRule('" + r.layer + "','" + r.category + "','" + r.id + "'," + (!r.enabled) + ")";
+  const denyModeSelect = isL2Sensitive ? `<select class="ag-deny-select" onchange="updateDenyMode('${r.layer}','${r.category}','${r.id}',this.value)" ${r.enabled ? '' : 'disabled'}>
+    <option value="deny_write" ${(r.deny_mode || 'deny_write') === 'deny_write' ? 'selected' : ''}>${t('仅拦截写入', 'Block Write Only')}</option>
+    <option value="deny_read" ${(r.deny_mode || 'deny_write') === 'deny_read' ? 'selected' : ''}>${t('仅拦截读取', 'Block Read Only')}</option>
+    <option value="deny_both" ${(r.deny_mode || 'deny_write') === 'deny_both' ? 'selected' : ''}>${t('读写均拦截', 'Block Both')}</option>
+  </select>` : '';
+  const skipL3 = r.layer === 'L2_rules' ? `<label class="ag-skip-l3"><input type="checkbox" ${r.skip_l3_on_disabled ? 'checked' : ''} onchange="updateSkipL3('${r.layer}','${r.category}','${r.id}',this.checked)"> ${t('禁用时豁免L3', 'Exempt L3 when disabled')}</label>` : '';
+  return `<div class="ag-rule-item" title="${escapeHtml(tooltip)}">
+    <div class="ag-rule-body">
+      <div class="ag-rule-tags">
+        <span class="ag-layer-badge ag-layer-${r.layerName.toLowerCase()}">${r.layerName}</span>
+        ${builtinBadge(r.builtin)} ${removedBadge(r.source_removed)} ${riskBadge(r.risk_level)} ${riskTypeBadge(r.risk_type)}
+        ${isL2Sensitive ? denyModeBadge(r.deny_mode) + ' ' + sourceDenyModeBadges(r) : ''}
+        <span class="ag-search-cat">${t('分类: ', 'Category: ')}${escapeHtml(r.category)}</span>
+      </div>
+      <div class="ag-rule-pattern"><span class="ag-rule-field-label">${t('规则:', 'Rule:')}</span> ${escapeHtml(ruleText)}</div>
+      ${reason ? `<div class="ag-rule-reason"><span class="ag-rule-field-label">${t('原因:', 'Reason:')}</span> ${escapeHtml(reason)}</div>` : ''}
+      <div class="ag-rule-id">ID: ${escapeHtml(r.id)}</div>
+    </div>
+    <div class="ag-rule-controls">
+      ${denyModeSelect}
+      <span class="ag-status-text ${r.enabled ? 'ag-status-on' : 'ag-status-off'}">${r.enabled ? t('已启用', 'Enabled') : t('已禁用', 'Disabled')}</span>
+      ${toggle(r.enabled, false, toggleFn)}
+      ${skipL3}
+    </div>
+  </div>`;
+}
+function clearSearch() {
+  const inp = el('search-input');
+  if (inp) inp.value = '';
+  searchRules();
+}
+
+// ===== Token 页 =====
+let tokenStatsDays = 7;
+let tokenRefreshTimer = null;
+let trendChartInstance = null;
+function render_token() {
+  tokenRecentPage = 1; // 切到 Token 页时重置最近调用分页到第 1 页
+  el('page-token').innerHTML = `
+    <div class="ag-card">
+      <div class="ag-section-title">${t('Token 用量详细统计', 'Detailed Token Statistics')
+        }
+        <div style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <button class="ag-btn ag-btn-sm" data-days="1" onclick="loadTokenStats(1)">${t('今日', 'Today')}</button>
+          <button class="ag-btn ag-btn-sm" data-days="7" onclick="loadTokenStats(7)">${t('近7天', '7 days')}</button>
+          <button class="ag-btn ag-btn-sm" data-days="30" onclick="loadTokenStats(30)">${t('近30天', '30 days')}</button>
+          <button class="ag-btn ag-btn-sm" data-days="0" onclick="loadTokenStats(0)">${t('全部', 'All')}</button>
+          <span style="width:1px;height:20px;background:var(--ag-divider);margin:0 4px"></span>
+          <input type="date" id="token-date-from" class="ag-date-input" title="${t('开始日期', 'Start date')}">
+          <span class="ag-date-sep">${t('至', 'to')}</span>
+          <input type="date" id="token-date-to" class="ag-date-input" title="${t('结束日期', 'End date')}">
+          <button class="ag-btn ag-btn-sm" onclick="loadTokenStatsByRange()">${t('查询', 'Query')}</button>
+        </div>
+      </div>
+      <div id="token-summary" class="ag-empty">${t('加载中...', 'Loading...')}</div>
+    </div>
+    <div class="ag-card"><div class="ag-section-title">${t('按步骤分组', 'By Step')}</div><div id="token-by-step"></div></div>
+    <div class="ag-card"><div class="ag-section-title">${t('按模型分组', 'By Model')}</div><div id="token-by-model"></div></div>
+    <div class="ag-card"><div class="ag-section-title">${t('Token 消耗趋势（按模型）', 'Token Consumption Trend (by Model)')}</div><div id="token-trend-chart"></div></div>
+    <div class="ag-card"><div class="ag-section-title">${t('最近调用记录', 'Recent Calls')}</div><div id="token-recent" class="ag-empty">${t('加载中...', 'Loading...')}</div></div>`;
+  startTokenAutoRefresh();
+}
+function startTokenAutoRefresh() {
+  stopTokenAutoRefresh();
+  if (tokenStatsDays == null) tokenStatsDays = 7;
+  loadTokenStats(tokenStatsDays);
+  tokenRefreshTimer = setInterval(() => loadTokenStats(tokenStatsDays), 10000);
+}
+function stopTokenAutoRefresh() {
+  if (tokenRefreshTimer) { clearInterval(tokenRefreshTimer); tokenRefreshTimer = null; }
+}
+async function loadTokenStats(days) {
+  tokenStatsDays = days;
+  document.querySelectorAll('#page-token [data-days]').forEach(b => b.classList.toggle('active', b.dataset.days === String(days)));
+  const fromEl = el('token-date-from'), toEl = el('token-date-to');
+  if (fromEl) fromEl.value = ''; if (toEl) toEl.value = '';
+  try {
+    const s = await api('token-stats?days=' + days);
+    renderTokenSummary(s);
+    renderTokenByStep(s);
+    renderTokenByModel(s);
+    loadTokenTrend(days);
+    loadTokenRecent();
+  } catch (e) { console.warn('Token stats load failed:', e); }
+}
+async function loadTokenStatsByRange() {
+  const from = el('token-date-from') ? el('token-date-from').value : '';
+  const to = el('token-date-to') ? el('token-date-to').value : '';
+  if (!from || !to) { showToast(t('请选择开始和结束日期', 'Please select start and end dates'), 'error'); return; }
+  if (from > to) { showToast(t('开始日期不能晚于结束日期', 'Start date cannot be later than end date'), 'error'); return; }
+  document.querySelectorAll('#page-token [data-days]').forEach(b => b.classList.remove('active'));
+  stopTokenAutoRefresh();
+  try {
+    const params = new URLSearchParams({ start_date: from, end_date: to });
+    const s = await api('token-stats?' + params);
+    tokenStatsDays = null;
+    renderTokenSummary(s);
+    renderTokenByStep(s);
+    renderTokenByModel(s);
+    loadTokenTrend(null, from, to);
+    loadTokenRecent();
+  } catch (e) { showToast(t('查询失败: ', 'Query failed: ') + e.message, 'error'); }
+}
+function renderTokenSummary(s) {
+  el('token-summary').innerHTML = '<div class="ag-stat-grid">' +
+    '<div class="ag-stat-card"><div class="label">' + t('总 Token', 'Total Tokens') + '</div><div class="value">' + formatTokens(s.total_tokens) + '</div></div>' +
+    '<div class="ag-stat-card"><div class="label">' + t('输入 Token', 'Prompt Tokens') + '</div><div class="value">' + formatTokens(s.total_prompt_tokens) + '</div></div>' +
+    '<div class="ag-stat-card"><div class="label">' + t('输出 Token', 'Completion Tokens') + '</div><div class="value">' + formatTokens(s.total_completion_tokens) + '</div></div>' +
+    '<div class="ag-stat-card"><div class="label">' + t('调用次数', 'Calls') + '</div><div class="value">' + s.total_calls + '</div></div></div>';
+}
+function renderTokenByStep(s) {
+  const byStep = s.by_step || {};
+  const known = [{ key: 'L3_security_judge', name: t('L3 安全判断', 'L3 Security Judge') }, { key: 'step2_policy_gen', name: t('策略生成', 'Policy Generation') }];
+  const rendered = new Set();
+  let html = '';
+  const total = s.total_tokens || 0;
+  for (const { key, name } of known) {
+    const v = byStep[key] || { total_tokens: 0, calls: 0 };
+    rendered.add(key);
+    const pct = total > 0 ? (v.total_tokens / total * 100).toFixed(1) : 0;
+    html += '<div class="ag-progress-row"><span class="ag-progress-label">' + name + '</span><span class="ag-progress-value">' + formatTokens(v.total_tokens) + '</span><span class="ag-progress-pct">' + pct + '% (' + v.calls + ' ' + t('次', 'calls') + ')</span><div class="ag-progress-bar"><div class="ag-progress-fill" style="width:' + pct + '%"></div></div></div>';
+  }
+  for (const [step, v] of Object.entries(byStep)) {
+    if (rendered.has(step)) continue;
+    const pct = total > 0 ? (v.total_tokens / total * 100).toFixed(1) : 0;
+    html += '<div class="ag-progress-row"><span class="ag-progress-label">' + step + '</span><span class="ag-progress-value">' + formatTokens(v.total_tokens) + '</span><span class="ag-progress-pct">' + pct + '% (' + v.calls + ' ' + t('次', 'calls') + ')</span><div class="ag-progress-bar"><div class="ag-progress-fill" style="width:' + pct + '%"></div></div></div>';
+  }
+  el('token-by-step').innerHTML = html || `<div class="ag-empty">${t('无分项数据', 'No breakdown data')}</div>`;
+}
+function renderTokenByModel(s) {
+  const byModel = s.by_model || {};
+  const total = s.total_tokens || 0;
+  let html = '';
+  for (const [model, v] of Object.entries(byModel)) {
+    const pct = total > 0 ? (v.total_tokens / total * 100).toFixed(1) : 0;
+    html += '<div class="ag-progress-row"><span class="ag-progress-label">' + escapeHtml(model) + '</span><span class="ag-progress-value">' + formatTokens(v.total_tokens) + '</span><span class="ag-progress-pct">' + pct + '% (' + v.calls + ' ' + t('次', 'calls') + ')</span><div class="ag-progress-bar"><div class="ag-progress-fill green" style="width:' + pct + '%"></div></div></div>';
+  }
+  el('token-by-model').innerHTML = html || `<div class="ag-empty">${t('无分模型数据', 'No per-model data')}</div>`;
+}
+async function loadTokenTrend(days, fromOverride, toOverride) {
+  const trendEl = el('token-trend-chart');
+  if (!trendEl) return;
+  let params;
+  if (fromOverride && toOverride) params = new URLSearchParams({ start_date: fromOverride, end_date: toOverride });
+  else if (days != null) params = new URLSearchParams({ days: days });
+  else { const end = new Date(), start = new Date(end.getTime() - 6 * 86400000); const fmt = d => d.toISOString().slice(0, 10); params = new URLSearchParams({ start_date: fmt(start), end_date: fmt(end) }); }
+  try {
+    const data = await api('token-stats/trend?' + params);
+    renderTokenTrend(data);
+  } catch (e) { console.warn('Token trend load failed:', e); }
+}
+const TREND_COLORS = ['#007AFF','#FF3B30','#34C759','#FF9500','#AF52DE','#5AC8FA','#FFCC00','#64D2FF'];
+function renderTokenTrend(data) {
+  const dom = el('token-trend-chart');
+  if (!dom || !window.echarts) return;
+  if (dom.offsetWidth === 0) dom.style.width = '100%';
+  if (!trendChartInstance) trendChartInstance = echarts.init(dom);
+  trendChartInstance.resize();
+  const dates = data.dates || [], models = data.models || [], series = data.series || {};
+  const fmtTokens = (n) => { if (n >= 1e8) return (n / 1e8).toFixed(1) + t('亿', 'B'); if (n >= 1e4) return (n / 1e4).toFixed(1) + t('万', 'W'); return String(n || 0); };
+  let xMin, xMax;
+  if (dates.length > 0) { const d = 86400000; xMin = new Date(dates[0]).getTime() - d; xMax = new Date(dates[dates.length - 1]).getTime() + d; }
+  trendChartInstance.setOption({
+    color: TREND_COLORS,
+    tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'line' } },
+    legend: { data: models, top: 5, type: 'scroll' },
+    grid: { left: 60, right: 20, top: 50, bottom: 30 },
+    xAxis: { type: "time", min: xMin, max: xMax, axisLabel: { fontSize: 11 } },
+    yAxis: { type: 'value', axisLabel: { fontSize: 11, formatter: fmtTokens } },
+    series: models.map((m, i) => ({
+      name: m, type: 'line', smooth: false, symbol: 'circle', symbolSize: 6,
+      areaStyle: { opacity: 0.1 }, lineStyle: { width: 2 },
+      itemStyle: { color: TREND_COLORS[i % TREND_COLORS.length] },
+      label: { show: true, position: 'top', fontSize: 11, formatter: ({ value }) => value[1] == null ? '' : fmtTokens(value[1]) },
+      connectNulls: true,
+      data: dates.map(d => { const v = series[m] && series[m][d]; return [d, v == null ? null : v]; }),
+    })),
+  }, true);
+}
+// Token 最近调用分页状态
+let tokenRecentPage = 1;
+const TOKEN_RECENT_PAGE_SIZE = 10;
+let tokenRecentTotal = 0; // 最近调用总条数（供跳转页时计算总页数）
+async function loadTokenRecent() {
+  const recentEl = el('token-recent');
+  if (!recentEl) return;
+  try {
+    const offset = (tokenRecentPage - 1) * TOKEN_RECENT_PAGE_SIZE;
+    const data = await api(`token-stats/recent?limit=${TOKEN_RECENT_PAGE_SIZE}&offset=${offset}`);
+    const records = Array.isArray(data) ? data : (data?.records || []);
+    const total = Array.isArray(data) ? records.length : (data?.total ?? records.length);
+    tokenRecentTotal = total; // 供跳转页时计算总页数
+    if (!records || records.length === 0) { recentEl.innerHTML = `<div class="ag-empty">${t('暂无记录', 'No records yet')}</div>`; return; }
+    let html = '<table class="ag-table"><tr><th>' + t('时间', 'Time') + '</th><th>' + t('步骤', 'Step') + '</th><th>' + t('模型', 'Model') + '</th><th>' + t('输入', 'Input') + '</th><th>' + t('输出', 'Output') + '</th><th>' + t('总计', 'Total') + '</th></tr>';
+    for (const r of records.reverse()) {
+      const stepName = r.step === 'L3_security_judge' ? t('L3 安全判断', 'L3 Security Judge') : r.step === 'step2_policy_gen' ? t('策略生成', 'Policy Generation') : escapeHtml(r.step);
+      // timestamp 是 UTC ISO（带 Z），转本地时区显示
+      let ts = '';
+      try { ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : ''; } catch { ts = r.timestamp || ''; }
+      html += '<tr><td>' + escapeHtml(ts) + '</td><td>' + stepName + '</td><td style="color:var(--ag-text-secondary)">' + escapeHtml(r.model || '') + '</td><td>' + r.prompt_tokens + '</td><td>' + r.completion_tokens + '</td><td><strong>' + r.total_tokens + '</strong></td></tr>';
+    }
+    html += '</table>';
+    // 分页控制条：上一页 / 页码显示 / 输入页码跳转 / 下一页
+    const totalPages = Math.max(1, Math.ceil(total / TOKEN_RECENT_PAGE_SIZE));
+    html += `<div style="margin-top:10px;display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <button class="ag-btn ag-btn-sm" onclick="tokenRecentPage<=1?null:loadTokenRecentPage(${tokenRecentPage - 1})" ${tokenRecentPage <= 1 ? 'disabled' : ''}>${t('上一页', 'Prev')}</button>
+      <span style="font-size:var(--fs-md);color:var(--ag-text-secondary)">${t('第 ', 'Page ')}${tokenRecentPage} / ${totalPages}${t('（共 ', ' (total ')}${total}${t(' 条）', ')')}</span>
+      <input id="token-recent-goto" type="number" min="1" max="${totalPages}" value="${tokenRecentPage}" style="width:60px;padding:3px 6px;font-size:var(--fs-md);border:1px solid var(--ag-input-border);border-radius:6px;background:var(--ag-input-bg);color:var(--ag-text);" placeholder="${tokenRecentPage}">
+      <button class="ag-btn ag-btn-sm" onclick="goTokenRecentPage()">${t('跳转', 'Go')}</button>
+      <button class="ag-btn ag-btn-sm" onclick="tokenRecentPage>=${totalPages}?null:loadTokenRecentPage(${tokenRecentPage + 1})" ${tokenRecentPage >= totalPages ? 'disabled' : ''}>${t('下一页', 'Next')}</button>
+    </div>`;
+    recentEl.innerHTML = html;
+  } catch (e) { recentEl.innerHTML = `<div class="ag-empty">${t('加载失败', 'Load failed')}</div>`; }
+}
+function loadTokenRecentPage(page) {
+  tokenRecentPage = page;
+  loadTokenRecent();
+}
+/** 跳转到用户输入的页码 */
+async function goTokenRecentPage() {
+  const input = el('token-recent-goto');
+  if (!input) return;
+  const page = parseInt(input.value, 10);
+  if (!page || page < 1) { showToast(t('页码无效', 'Invalid page number'), 'error'); return; }
+  // 计算总页数，超出则跳到最后一页
+  const totalPages = Math.max(1, Math.ceil(tokenRecentTotal / TOKEN_RECENT_PAGE_SIZE));
+  const target = Math.min(page, totalPages);
+  tokenRecentPage = target;
+  loadTokenRecent();
+}
+async function resetTokenStats() {
+  const ok = await agConfirm(
+    t('清除 Token 统计', 'Clear Token Statistics'),
+    t('确定清除所有 Token 统计数据？', 'Clear all Token statistics?'),
+    t('清除', 'Clear')
+  );
+  if (!ok) return;
+  try { await apiPost('token-stats/reset'); showToast(t('Token 统计已清除', 'Token statistics cleared')); loadTokenStats(7); }
+  catch (e) { showToast(t('清除失败: ', 'Clear failed: ') + e.message, 'error'); }
+}
+async function resetToFactory() {
+  const ok = await agConfirm(
+    t('重置到出厂默认', 'Reset to Factory Defaults'),
+    t('确定重置所有规则到出厂默认？所有自定义规则和开关设置将丢失。', 'Reset all rules to factory defaults? All custom rules and switch settings will be lost.'),
+    t('重置', 'Reset')
+  );
+  if (!ok) return;
+  try {
+    state.config = await apiPost('reset');
+    state.envOverrides = await loadEnvOverrides();
+    renderCurrent();
+    showToast(t('配置已重置到出厂默认', 'Configuration reset to factory defaults'));
+  } catch (e) { showToast(t('重置失败: ', 'Reset failed: ') + e.message, 'error'); }
+}
+
+// ===== 设置页 =====
+function render_settings() {
+  const eo = state.envOverrides || {};
+  let envHtml = '';
+  if (Object.keys(eo).length === 0) {
+    envHtml = `<div class="ag-empty">${t('当前没有环境变量覆盖', 'No environment variable overrides currently')}</div>`;
+  } else {
+    for (const [k, v] of Object.entries(eo)) {
+      const layerName = LAYER_NAMES[k]?.name || k;
+      envHtml += '<div class="ag-rule-item"><span class="ag-badge ' + (v.overridden ? 'ag-badge-critical' : 'ag-badge-low') + '">' + (v.overridden ? t('强制禁用', 'Forced disabled') : t('无覆盖', 'No override')) + '</span><span style="font-size:13px">' + layerName + ': ' + escapeHtml(v.env_var || '') + '=' + escapeHtml(v.env_value || '') + '</span></div>';
+    }
+  }
+  el('page-settings').innerHTML = `
+    ${Object.keys(eo).length > 0 ? `
+    <div class="ag-card">
+      <div class="ag-section-title">${t('环境变量覆盖', 'Environment Variable Overrides')}</div>
+      <div class="ag-section-desc">${t('环境变量优先级最高，会覆盖 Web UI 的设置。清除环境变量后 Web 设置才能生效。', 'Environment variables take highest priority and override Web UI settings. Web settings take effect only after clearing the environment variables.')}</div>
+      ${envHtml}
+    </div>` : ''}
+    <div class="ag-card">
+      <div class="ag-section-title">${t('配置文件', 'Config File')}</div>
+      <div class="ag-section-desc">${t('你在本控制台做的所有修改（层级开关、各类规则、Agent 定制）都会自动保存到下面的配置文件中。它是策略的“存档”，可备份、迁移，或复制到其他机器复用同一套安全策略。', 'All your changes here (layer switches, rules, agent customizations) are saved automatically to the config file below. It is the "source of truth" for your policy — you can back it up, migrate it, or copy it to another machine to reuse the same security policy.')}</div>
+      <div style="font-size:13px;line-height:1.8">
+        <code>~/.config/agentmoss/agent_moss_runtime.json</code>
+      </div>
+    </div>
+    ${state.consoleAuthRequired ? `
+    <div class="ag-card">
+      <div class="ag-section-title">${t('访问 Token', 'Access Token')}</div>
+      <div class="ag-section-desc">${t('服务端已开启访问认证（设置了 AGENT_MOSS_CONSOLE_TOKEN）。在此填入服务端配置的 token，浏览器会用它访问控制台；token 不匹配则无法查看或修改规则。', 'The server requires an access token (AGENT_MOSS_CONSOLE_TOKEN is set). Enter the token configured on the server; the browser will send it with every console request. An invalid token blocks viewing or editing rules.')}</div>
+      <input class="ag-input" id="settings-token" placeholder="${t('输入服务端配置的 token', 'Enter the server-configured token')}" value="${getToken()}">
+      <div style="margin-top:8px"><button class="ag-btn ag-btn-primary" onclick="localStorage.setItem('am_console_token',document.getElementById('settings-token').value);showToast(t('已保存','Saved'))">${t('保存', 'Save')}</button></div>
+    </div>` : ''}
+    <div class="ag-card">
+      <div class="ag-section-title">${t('危险操作', 'Danger Zone')}</div>
+      <button class="ag-btn ag-btn-danger" onclick="resetToFactory()">${t('重置规则到出厂默认', 'Reset Rules to Factory Defaults')}</button>
+      <button class="ag-btn ag-btn-danger" style="margin-left:8px" onclick="resetTokenStats()">${t('清除 Token 统计', 'Clear Token Statistics')}</button>
+    </div>`;
+}
+
+// ===== Modal 新增规则/新增 Skill =====
+function showAddRuleModal(layer) {
+  currentModalAction = { type: 'add_rule', layer };
+  const isL1 = layer === 'L1_rules', isL2 = layer === 'L2_rules';
+  const title = isL1 ? t('新增 L1 静态规则', 'Add L1 Static Rule') : t('新增 L2 规则', 'Add L2 Rule');
+  let formHtml = '';
+  if (isL1) {
+    formHtml = `<div class="ag-form-group"><div class="ag-form-label">${t('规则类型', 'Rule Type')}<span class="ag-required">*</span></div><select class="ag-select" id="rule-type" onchange="updateRuleForm()"><option value="pattern">${t('正则模式匹配', 'Regex pattern matching')}</option><option value="keyword">${t('关键词匹配', 'Keyword matching')}</option></select><div class="ag-form-hint">${t('正则模式：用正则表达式匹配命令（如 ', 'Regex mode: match the command with a regex (e.g. ')}<code>\\brm\\s+-rf</code>${t('）；关键词匹配：命令中包含指定文字即命中。', '); keyword mode: command containing the text matches.')}</div></div>
+      <div class="ag-form-group" id="form-pattern"><div class="ag-form-label">${t('正则 Pattern', 'Regex Pattern')}<span class="ag-required">*</span></div><input class="ag-input" id="input-pattern" placeholder="${t('如: ', 'e.g. ')}${'\\brm\\s+-rf'}"><div class="ag-form-hint">${t('Python 正则表达式，命中该正则的命令会触发本规则。', 'Python regex. Commands matching this regex trigger this rule.')}</div></div>
+      <div class="ag-form-group" id="form-keyword" style="display:none"><div class="ag-form-label">${t('关键词', 'Keyword')}<span class="ag-required">*</span></div><input class="ag-input" id="input-keyword" placeholder="${t('如: ignore previous instructions', 'e.g. ignore previous instructions')}"><div class="ag-form-hint">${t('命令文本中包含此关键词即命中（不区分大小写）。', 'Command text containing this keyword matches (case-insensitive).')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('风险等级', 'Risk Level')}<span class="ag-required">*</span></div><select class="ag-select" id="input-risk-level"><option value="critical">Critical（${t('严重', 'Critical')}）</option><option value="high">High（${t('高危', 'High')}）</option><option value="medium">Medium（${t('中危', 'Medium')}）</option><option value="low">Low（${t('低危', 'Low')}）</option></select><div class="ag-form-hint"><strong>critical / high</strong>：${t('在 L1 层直接拦截（Deny），命令不会执行；', 'block directly at L1 (Deny), the command will not run;')}<br><strong>medium / low</strong>：${t('不在 L1 拦截，转交 L3 LLM 深度分析判断。', 'not blocked at L1; handed to L3 LLM deep analysis.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('风险类型', 'Risk Type')}</div><input class="ag-input" id="input-risk-type" placeholder="${t('如: script_execution, file_access, data_exfiltration', 'e.g. script_execution, file_access, data_exfiltration')}"><div class="ag-form-hint">${t('风险分类标签，用于统计与展示。可选值：script_execution（脚本执行）、file_access（文件访问）、data_exfiltration（数据外泄）等，可自定义。', 'Risk classification label for stats and display. Options: script_execution, file_access, data_exfiltration, etc. Custom values allowed.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('拦截原因', 'Block Reason')}<span class="ag-required">*</span></div><input class="ag-input" id="input-reason" placeholder="${t('描述为什么这条规则要拦截', 'Describe why this rule blocks')}"><div class="ag-form-hint">${t('命中时展示给用户的说明文字，应写清为什么危险。L3 分析时也会参考此原因。', 'Text shown to the user on match; explain why it is dangerous. L3 analysis also references this reason.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('语言（仅关键词类型）', 'Language (keyword type only)')}</div><select class="ag-select" id="input-lang"><option value="en">English</option><option value="zh">中文</option></select><div class="ag-form-hint">${t('关键词的语言，影响匹配时的分词处理。', 'The language of the keyword affects tokenization during matching.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('所属分类', 'Category')}</div><select class="ag-select" id="input-category"><option value="user_custom">${t('用户自定义', 'User custom')}</option><option value="dangerous_commands">${t('危险命令检测', 'Dangerous commands')}</option><option value="injection_detection">${t('注入攻击检测', 'Injection detection')}</option></select></div>`;
+  } else if (isL2) {
+    formHtml = `<div class="ag-form-group"><div class="ag-form-label">${t('规则类型', 'Rule Type')}<span class="ag-required">*</span></div><select class="ag-select" id="rule-type-l2" onchange="updateL2RuleForm()"><option value="path">${t('敏感路径', 'Sensitive path')}</option><option value="pattern">${t('正则模式', 'Regex pattern')}</option></select><div class="ag-form-hint">${t('敏感路径：匹配文件路径（如 ', 'Sensitive path: match a file path (e.g. ')}<code>/etc/shadow</code>${t('）；正则模式：用正则匹配命令文本。', '); regex mode: match command text with regex.')}</div></div>
+      <div class="ag-form-group" id="form-l2-path"><div class="ag-form-label">${t('路径', 'Path')}<span class="ag-required">*</span></div><input class="ag-input" id="input-l2-path" placeholder="${t('如: /etc/shadow, .ssh/id_rsa', 'e.g. /etc/shadow, .ssh/id_rsa')}"><div class="ag-form-hint">${t('要拦截的文件路径，多个用英文逗号分隔。命令访问到这些路径即命中。', 'File paths to block; separate multiple with commas. Commands accessing these paths match.')}</div></div>
+      <div class="ag-form-group" id="form-l2-pattern" style="display:none"><div class="ag-form-label">${t('正则 Pattern', 'Regex Pattern')}<span class="ag-required">*</span></div><input class="ag-input" id="input-l2-pattern" placeholder="${t('如: ', 'e.g. ')}${'\\bpasswd\\s+--stdin'}"><div class="ag-form-hint">${t('Python 正则表达式，命中即触发。', 'Python regex; triggers on match.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('描述', 'Description')}<span class="ag-required">*</span></div><input class="ag-input" id="input-l2-desc" placeholder="${t('路径/规则的中文描述', 'Chinese description of the path/rule')}"><div class="ag-form-hint">${t('命中时展示给用户的说明。', 'Description shown to the user on match.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('风险等级', 'Risk Level')}<span class="ag-required">*</span></div><select class="ag-select" id="input-l2-risk-level"><option value="critical">Critical（${t('严重', 'Critical')}）</option><option value="high">High（${t('高危', 'High')}）</option><option value="medium">Medium（${t('中危', 'Medium')}）</option><option value="low">Low（${t('低危', 'Low')}）</option></select><div class="ag-form-hint"><strong>critical / high</strong>：${t('在 L2 层直接拦截；', 'block directly at L2;')}<br><strong>medium / low</strong>：${t('不在 L2 拦截，转交 L3 LLM 判断。', 'not blocked at L2; handed to L3 LLM.')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('拦截模式', 'Interception Mode')}</div><select class="ag-select" id="input-l2-deny-mode"><option value="deny_write">${t('仅拦截写入', 'Block Write Only')}</option><option value="deny_read">${t('仅拦截读取', 'Block Read Only')}</option><option value="deny_both">${t('读写均拦截', 'Block Both')}</option></select><div class="ag-form-hint">${t('选择该路径的拦截模式：仅拦截写入（默认）、仅拦截读取（如 /dev/random）、读写均拦截（凭据文件）。', 'Choose interception mode: block write only (default), block read only (e.g. /dev/random), block both (credential files).')}</div></div>
+      <div class="ag-form-group"><div class="ag-form-label">${t('所属分类', 'Category')}</div><select class="ag-select" id="input-l2-category"><option value="sensitive_path_access">${t('敏感路径访问', 'Sensitive path access')}</option><option value="password_modify_consent">${t('密码修改授权', 'Password modify consent')}</option><option value="user_deletion_consent">${t('用户删除授权', 'User deletion consent')}</option><option value="intent_consistency">${t('意图一致性', 'Intent consistency')}</option></select></div>`;
+  }
+  openModal(title, formHtml);
+}
+function showAddSkillModal() {
+  currentModalAction = { type: 'add_skill' };
+  openModal(t('新增 L3 Skill', 'Add L3 Skill'), `<div class="ag-form-group"><div class="ag-form-label">${t('Skill ID（文件名）', 'Skill ID (file name)')}</div><input class="ag-input" id="input-skill-id" placeholder="${t('如: my_custom_guard', 'e.g. my_custom_guard')}"><div class="ag-form-hint">${t('Skill 文件名（不含扩展名），英文+下划线。会成为该 Skill 的唯一标识。', 'Skill file name (without extension), letters + underscores. Becomes the Skill’s unique ID.')}</div></div>
+    <div class="ag-form-group"><div class="ag-form-label">${t('触发关键词', 'Trigger Keywords')}<span class="ag-required">*</span></div><input class="ag-input" id="input-skill-keywords" placeholder="${t('逗号分隔, 如: custom, 特殊, special', 'comma-separated, e.g. custom, special')}"><div class="ag-form-hint">${t('命令/动作中包含这些关键词时，该 Skill 会被匹配并注入 L3 的 LLM prompt。', 'When the command/action contains these keywords, the Skill matches and is injected into the L3 LLM prompt.')}</div></div>
+    <div class="ag-form-group"><div class="ag-form-label">${t('Skill 内容（Markdown）', 'Skill Content (Markdown)')}<span class="ag-required">*</span></div><textarea class="ag-input" id="input-skill-content" rows="4" placeholder="# Skill 规则标题\n\n## 适用场景\n..."></textarea><div class="ag-form-hint">${t('Markdown 格式的规则说明。命中关键词后会作为提示注入 LLM。', 'Markdown rule description. Injected into the LLM prompt on keyword match.')}</div></div>
+    <div class="ag-form-group"><div class="ag-form-label">${t('所属分类', 'Category')}</div><select class="ag-select" id="input-skill-category"><option value="user_custom">${t('用户自定义', 'User custom')}</option><option value="file_operations">${t('文件操作', 'File operations')}</option><option value="network_security">${t('网络安全', 'Network security')}</option><option value="intent_and_general">${t('意图/通用', 'Intent/general')}</option></select></div>`);
+}
+function updateRuleForm() {
+  const tt = document.getElementById('rule-type')?.value;
+  const p = document.getElementById('form-pattern'), k = document.getElementById('form-keyword');
+  if (p) p.style.display = tt === 'pattern' ? '' : 'none';
+  if (k) k.style.display = tt === 'keyword' ? '' : 'none';
+}
+function updateL2RuleForm() {
+  const tt = document.getElementById('rule-type-l2')?.value;
+  const p = document.getElementById('form-l2-path'), k = document.getElementById('form-l2-pattern');
+  if (p) p.style.display = tt === 'path' ? '' : 'none';
+  if (k) k.style.display = tt === 'pattern' ? '' : 'none';
+}
+async function submitModal() {
+  if (!currentModalAction) return;
+  try {
+    if (currentModalAction.type === 'add_rule') {
+      const layer = currentModalAction.layer;
+      const isL1 = layer === 'L1_rules', isL2 = layer === 'L2_rules';
+      let body = { layer };
+      if (isL1) {
+        const ruleType = document.getElementById('rule-type')?.value || 'pattern';
+        body.category = document.getElementById('input-category')?.value || 'user_custom';
+        body.risk_level = document.getElementById('input-risk-level')?.value;
+        body.risk_type = document.getElementById('input-risk-type')?.value || undefined;
+        body.reason = document.getElementById('input-reason')?.value;
+        if (ruleType === 'pattern') body.pattern = document.getElementById('input-pattern')?.value;
+        else { body.keyword = document.getElementById('input-keyword')?.value; body.lang = document.getElementById('input-lang')?.value; }
+      } else if (isL2) {
+        const ruleType = document.getElementById('rule-type-l2')?.value || 'path';
+        body.category = document.getElementById('input-l2-category')?.value || 'sensitive_path_access';
+        body.risk_level = document.getElementById('input-l2-risk-level')?.value;
+        body.desc = document.getElementById('input-l2-desc')?.value;
+        const dm = document.getElementById('input-l2-deny-mode')?.value;
+        if (dm) body.deny_mode = dm;
+        if (ruleType === 'path') body.path = document.getElementById('input-l2-path')?.value;
+        else { body.pattern = document.getElementById('input-l2-pattern')?.value; body.risk_type = 'script_execution'; }
+      }
+      state.config = await apiPost('rules', body);
+      showToast(t('规则已添加', 'Rule added'));
+    } else if (currentModalAction.type === 'add_skill') {
+      const keywords = (document.getElementById('input-skill-keywords')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
+      state.config = await apiPost('skills', {
+        skill_id: document.getElementById('input-skill-id')?.value,
+        category: document.getElementById('input-skill-category')?.value || 'user_custom',
+        keywords,
+        content: document.getElementById('input-skill-content')?.value,
+      });
+      showToast(t('Skill 已添加', 'Skill added'));
+    } else if (currentModalAction.type === 'agent_rule') {
+      const { agentId, cat, isValueCat } = currentModalAction;
+      const payload = { agent_id: agentId, category: cat };
+      if (isValueCat) {
+        payload.value = el('ar-value').value.trim();
+        if (!payload.value) { showToast(t('值不能为空', 'Value cannot be empty'), 'error'); return; }
+      } else {
+        payload.pattern = el('ar-pattern').value.trim();
+        payload.risk_level = el('ar-risk_level').value.trim() || undefined;
+      }
+      state.agentRules = await apiPost('agents/rules', payload);
+      showToast(t('Agent 规则已添加', 'Agent rule added'));
+    } else if (currentModalAction.type === 'scenario_rule') {
+      const { scenarioId, cat } = currentModalAction;
+      const payload = { scenario_id: scenarioId, category: cat };
+      payload.pattern = el('ar-pattern').value.trim();
+      if (!payload.pattern) { showToast(t('规则不能为空', 'Rule cannot be empty'), 'error'); return; }
+      payload.risk_level = el('ar-risk_level').value.trim() || undefined;
+      state.scenarioRules = await apiPost('scenarios/rules', payload);
+      showToast(t('场景规则已添加', 'Scenario rule added'));
+    }
+    renderCurrent();
+    closeModal();
+  } catch (e) { showToast(t('添加失败: ', 'Add failed: ') + e.message, 'error'); }
+}
+
+// ===== Tab nav + theme =====
+document.querySelectorAll('.ag-tab[data-page]').forEach(tab => {
+  tab.onclick = () => {
+    stopTokenAutoRefresh();
+    state.currentPage = tab.dataset.page;
+    document.querySelectorAll('.ag-tab').forEach(x => x.classList.remove('active'));
+    tab.classList.add('active');
+    renderCurrent();
+  };
+});
+function applyTabLabels() {
+  const labels = {
+    overview: t('概览', 'Overview'),
+    search: t('搜索规则', 'Search Rules'),
+    l1: t('L1 规则', 'L1 Rules'),
+    l2: t('L2 规则', 'L2 Rules'),
+    l3: t('L3 Skills', 'L3 Skills'),
+    agents: t('Agent 定制', 'Agent Rules'),
+    token: t('Token', 'Token'),
+    settings: t('设置', 'Settings'),
+  };
+  document.querySelectorAll('.ag-tab[data-page]').forEach(tab => {
+    tab.textContent = labels[tab.dataset.page] || tab.textContent;
+  });
+  const themeBtn = el('theme-btn');
+  if (themeBtn) themeBtn.textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? t('☀️ 浅色', '☀️ Light') : t('🌙 暗色', '🌙 Dark');
+  const closeBtn = document.querySelector('.ag-modal-close');
+  if (closeBtn) closeBtn.setAttribute('title', t('关闭', 'Close'));
+  const cancelBtn = el('modal-actions') ? document.querySelector('#modal-actions .ag-btn-ghost') : null;
+  if (cancelBtn) cancelBtn.textContent = t('取消', 'Cancel');
+  const submitBtn = el('modal-submit');
+  if (submitBtn) submitBtn.textContent = t('确认', 'Confirm');
+  // Confirm 弹窗（替代浏览器原生 confirm）
+  const confirmCancelBtn = document.querySelector('#confirm-actions .ag-btn-ghost');
+  if (confirmCancelBtn) confirmCancelBtn.textContent = t('取消', 'Cancel');
+  const confirmCloseBtn = document.querySelector('#confirm-overlay .ag-modal-close');
+  if (confirmCloseBtn) confirmCloseBtn.setAttribute('title', t('关闭', 'Close'));
+  // Prompt 弹窗（替代浏览器原生 prompt）
+  const promptCancelBtn = document.querySelector('#prompt-actions .ag-btn-ghost');
+  if (promptCancelBtn) promptCancelBtn.textContent = t('取消', 'Cancel');
+  const promptCloseBtn = document.querySelector('#prompt-overlay .ag-modal-close');
+  if (promptCloseBtn) promptCloseBtn.setAttribute('title', t('关闭', 'Close'));
+}
+el('theme-btn').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  el('theme-btn').textContent = next === 'dark' ? t('☀️ 浅色', '☀️ Light') : t('🌙 暗色', '🌙 Dark');
+  if (state.currentPage === 'token') render_token();
+};
+
+// ===== Init =====
+applyTitle();
+applyTabLabels();
+refreshConfig().catch(e => { document.body.innerHTML = '<div style="padding:40px;color:#FF3B30">' + t('加载失败: ', 'Load failed: ') + escapeHtml(e.message) + '</div>'; });
+</script>
+</body>
+</html>

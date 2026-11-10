@@ -1,0 +1,29 @@
+{
+  "agent_id": "opendesk",
+  "description": "OpenDesk 宿主 agent 专属安全规则。OpenDesk 工具按命名空间前缀组织（memory-/todomgr-/planning-/mailbox-/skill-manager-），其中纯数据/只读类操作走 L3 LLM 分析无意义且耗时 1~137s（实测日志），在此白名单豁免。发信类（sendEmail/replyEmail）外传风险保留 L3；skill-*/skill-manager-* 内部工具执行不经网关，本次不动。",
+  "extra_command_patterns": [],
+  "extra_injection_keywords": [],
+  "extra_sensitive_paths": [],
+  "builtin_safe_skills": [],
+  "builtin_safe_action_types": [
+    "memory-",
+    "todomgr-",
+    "planning-",
+    "mailbox-addMailAccount",
+    "mailbox-listMailAccounts",
+    "mailbox-removeMailAccount",
+    "mailbox-switchMailAccount",
+    "mailbox-getEmailList",
+    "mailbox-getEmailContent",
+    "mailbox-searchEmails",
+    "mailbox-markEmailReadStatus",
+    "mailbox-starEmail",
+    "mailbox-deleteEmail",
+    "mailbox-getMailSyncStatus",
+    "mailbox-getCalendarItems",
+    "mailbox-addCalendarItem",
+    "mailbox-deleteCalendarItem",
+    "mailbox-getCurrentTime"
+  ],
+  "extra_skills": []
+}

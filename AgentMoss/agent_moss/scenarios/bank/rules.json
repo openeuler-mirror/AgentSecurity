@@ -1,0 +1,23 @@
+{
+  "scenario_id": "bank",
+  "description": "银行沙箱场景定制规则。客户约束：沙箱用户（sandbox）仅允许读写 /home/sandbox、/opt/sandbox、/tmp 三个目录，其他根目录一律禁止读写；禁止执行 ssh 命令（横向移动/远程访问）。",
+  "extra_command_patterns": [
+    {
+      "pattern": "(?:^|[;\\s>&|@'\"])(/(?!home/sandbox(?:\\s|/|$)|opt/sandbox(?:\\s|/|$)|tmp(?:\\s|/|$))[^\\s;&|>\"]+)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "bank 场景：访问允许目录（/home/sandbox、/opt/sandbox、/tmp）之外的绝对路径"
+    },
+    {
+      "pattern": "(?:^|[;&|:]\\s*)ssh(?:\\s|$)",
+      "risk_level": "critical",
+      "risk_type": "network_access",
+      "reason": "bank 场景：禁止执行 ssh 命令（横向移动/远程访问）"
+    }
+  ],
+  "extra_injection_keywords": [],
+  "extra_sensitive_paths": [],
+  "builtin_safe_skills": [],
+  "builtin_safe_action_types": [],
+  "extra_skills": []
+}

@@ -1,0 +1,8 @@
+openai>=1.0
+httpx>=0.25
+tomli>=2.0; python_version < '3.11'
+pydantic>=2.0
+tenacity>=8.0
+fastapi>=0.100
+uvicorn[standard]>=0.20
+pyyaml>=6.0

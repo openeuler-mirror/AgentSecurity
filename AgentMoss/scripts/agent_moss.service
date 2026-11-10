@@ -1,0 +1,23 @@
+[Unit]
+Description=AgentMoss Security Analysis Service
+After=network.target
+
+[Service]
+Type=simple
+# 服务以 root 运行（通用安装 scripts/install.sh 会把 AGENT_MOSS_DATA_DIR 注入
+# env 文件，指向执行安装的用户目录，数据落当前用户而非 /root）。
+# HTTP TCP 模式（默认）
+ExecStart=__AGENT_MOSS_BIN__ server --host 127.0.0.1 --port 0
+# Unix Socket 模式（同机部署推荐，取消下行注释并注释上行）
+# ExecStart=/usr/local/bin/agent-moss server --mode socket --socket /var/run/agent_moss/agent_moss.sock --config /etc/agent_moss/agent_moss.yaml
+Restart=on-failure
+RestartSec=5
+Environment=AGENT_MOSS_CONFIG_PATH=/etc/agent_moss/agent_moss.yaml
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/agent_moss/agent_moss.env
+# Environment=AGENT_MOSS_DISABLE_LLM=0
+# Environment=AGENT_MOSS_LLM_MODEL=glm-5.0
+# Environment=AGENT_MOSS_LLM_BASE_URL=https://api.nextapi.store/v1
+
+[Install]
+WantedBy=multi-user.target

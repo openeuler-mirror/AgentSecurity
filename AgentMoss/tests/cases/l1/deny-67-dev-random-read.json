@@ -1,0 +1,18 @@
+{
+  "id": "AGENTMOSS-DENY-67",
+  "desc": "/dev/random deny_read 雇读 — 层1 敏感路径拦截",
+  "scenario": "/dev/random 是 deny_read 路径，读操作命中敏感路径规则",
+  "expected_decision": "Deny",
+  "expected_layers": [],
+  "expected_risk_level": "high",
+  "expected_risk_type": "",
+  "input": {
+    "session_id": "test-dev-random",
+    "action_history": [],
+    "a_next": {
+      "action_type": "bash",
+      "action_detail": "head -c 16 /dev/random | xxd"
+    },
+    "reason": "取随机数"
+  }
+}

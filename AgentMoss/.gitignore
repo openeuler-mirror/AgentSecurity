@@ -1,0 +1,67 @@
+# ===== Python =====
+*.egg
+*.egg-info/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# ===== 运行时日志 =====
+agent_moss.log
+
+# ===== Virtual envs / env files =====
+.env
+.venv/
+venv/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Build artifacts =====
+build/
+dist/
+
+# ===== Local infra config (含密钥，勿提交) =====
+agent_moss/infra/agent_moss_settings.json
+agent_moss/infra/config.json
+
+# ===== 凭据与机密 (勿提交) =====
+credentials.yml
+secrets.yml
+*.pem
+*.key
+
+# ===== 二进制 / 打包产物 =====
+*.zip
+
+# ===== tests/bench 生成产物（大体量压测数据，不入 git）=====
+tests/bench/data/
+
+# ===== tests/cases_exec 生成产物（不预生成、不入 git，由 prep.sh/run_all.sh 在客户机生成）=====
+# 注意：prep.sh / clean.sh / run_all.sh / generate_bash_exc.py 是源码，必须提交，勿用通配符
+tests/cases_exec/allow.sh
+tests/cases_exec/deny.sh
+tests/cases_exec/allow-root-only.sh
+tests/cases_exec/deny-root-only.sh
+tests/cases_exec/deny-needs-context.sh
+tests/cases_exec/config.yaml
+tests/cases_exec/.env
+tests/cases_exec/deploy.sh
+tests/cases_exec/deploy.py
+tests/cases_exec/deploy_shift.sh
+# 场景子目录（bank 等）下生成的同名命令集，同样不入 git
+tests/cases_exec/*/allow.sh
+tests/cases_exec/*/deny.sh
+tests/cases_exec/*/allow-root-only.sh
+tests/cases_exec/*/deny-root-only.sh
+tests/cases_exec/*/deny-needs-context.sh
+tests/cases_exec/*/config.yaml
+tests/cases_exec/*/.env
+
+# ===== 兜底：根目录所有隐藏文件/目录，仅保留 .gitignore =====
+# 覆盖 .claude/ .atomcode/ .opendesk/ .mimocode/ .pytest_cache/ 等工具本地缓存
+# 前导 / 限定根目录，不影响子目录如 ts/.gitignore
+/.*
+!/.gitignore
+node_modules/

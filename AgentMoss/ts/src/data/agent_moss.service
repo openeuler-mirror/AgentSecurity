@@ -1,0 +1,14 @@
+[Unit]
+Description=AgentMoss Security Analysis Service (TypeScript)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__AGENT_MOSS_BIN__ server --host 127.0.0.1 --port 0
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/agent_moss/agent_moss.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,68 @@
+# AgentMoss 服务配置文件
+# AgentMoss Configuration Example
+#
+# v2: 新增 os_profile 配置块，增强 server 配置
+
+server:
+  mode: "http"                     # "http" (TCP) 或 "socket" (Unix Domain Socket)
+  http_host: "127.0.0.1"
+  http_port: 9090
+  socket_path: "/var/run/agent_moss/agent_moss.sock"
+  workers: 4
+
+security:
+  enabled: true
+  heuristic:
+    enabled: true
+  logic_rules:
+    enabled: true
+  llm_analysis:
+    enabled: true
+
+# v2 新增：OS Profile 配置
+os_profile:
+  # 操作系统类型：留空自动检测，可手动指定 linux / windows
+  type: ""
+  # Profile 文件目录（预留）
+  dir: ""
+
+llm:
+  provider: "openai"
+  model: "gpt-4o"
+  api_key_env: "AGENT_MOSS_LLM_API_KEY"
+  base_url: "https://api.openai.com/v1"
+  temperature: 0.1
+  max_tokens: 4096
+
+timeout:
+  total_timeout: 90
+  prompt1_timeout: 40
+  prompt2_timeout: 20
+  step_interval: 0
+
+retry:
+  max_retries: 2
+  retry_interval: 2
+
+cache:
+  enabled: true
+  max_size: 1000
+  ttl_secs: 3600
+
+policy:
+  llm_generation_enabled: false
+
+logging:
+  level: "INFO"
+  dir: "/var/log/agent_moss"
+  llm_prompt_log_enabled: false
+
+adapter:
+  enabled: true
+  type: "observable"
+
+# AcTrail integration: write enforcement events to AcTrail's storage
+actrail:
+  enabled: false                    # Set to true or env ACTRAIL_ENABLED=1
+  storage_path: "/tmp/actrail.sqlite"  # AcTrail SQLite DB path
+  timeout_ms: 100                   # Write timeout (non-blocking)
