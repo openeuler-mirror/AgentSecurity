@@ -1,0 +1,870 @@
+{
+  "dangerous_commands": [
+    {
+      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+/(?!\\w)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到递归强制删除根目录 (rm -rf /)"
+    },
+    {
+      "pattern": "\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\s+/(etc|var(?!/tmp)|home|usr|boot|root|opt|srv|sys|proc)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到删除关键系统目录"
+    },
+    {
+      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\\b)",
+      "risk_level": "medium",
+      "risk_type": "script_execution",
+      "reason": "检测到递归删除操作 (rm -r /...)"
+    },
+    {
+      "pattern": "\\brm\\s+-[a-zA-Z]*f[a-zA-Z]*\\s+/(?!tmp/|var/tmp/|run/|dev/shm/)",
+      "risk_level": "medium",
+      "risk_type": "script_execution",
+      "reason": "检测到强制删除文件 (rm -f /...)"
+    },
+    {
+      "pattern": "chmod\\s+(?:(?:-[a-zA-Z]*|--)\\s+)*[0-7]{0,3}7\\b",
+      "risk_level": "critical",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到危险权限设置 (chmod ...7, other 位含写+执行敞口; 含 -R 递归与 -- 分隔符形态)"
+    },
+    {
+      "pattern": "chmod\\s+(?:(?:-[a-zA-Z]*|--)\\s+)*[2-7][0-7]{3}\\b",
+      "risk_level": "critical",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到 setuid/setgid 位设置 (chmod 4xxx/2xxx/6xxx 及 3/5/7xxx 组合位, 提权; 含 -R 递归与 -- 分隔符形态)"
+    },
+    {
+      "pattern": "chmod\\s+[ugoa]\\+s\\b",
+      "risk_level": "critical",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到符号 setuid/setgid 设置 (chmod u+s/g+s/a+s, 提权)"
+    },
+    {
+      "pattern": "chown\\s+root|chown\\s+-R\\s+\\w+:\\w+\\s+/",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "修改所有者为 root / 递归修改根目录所有者"
+    },
+    {
+      "pattern": "sudo\\s+(rm|chmod|chown|dd|mkfs|format|iptables|crontab|passwd|userdel|useradd|groupdel)\\b",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到提权执行高危命令 (sudo + 危险操作)"
+    },
+    {
+      "pattern": "/etc/shadow",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到访问系统密码文件 (/etc/shadow)"
+    },
+    {
+      "pattern": "/etc/gshadow",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到访问系统组密码文件 (/etc/gshadow)"
+    },
+    {
+      "pattern": "\\.ssh/id_rsa(?!\\.pub)",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到访问 SSH 私钥文件 (.ssh/id_rsa)"
+    },
+    {
+      "pattern": "dd\\s+if=/dev/zero.*\\bof\\s*=\\s*/(etc|var|home|usr|boot|root|opt|srv|sys|proc)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到磁盘清零写入关键系统目录 (dd if=/dev/zero of=/系统目录)"
+    },
+    {
+      "pattern": "mkfs\\.\\w+\\s+/dev/(sd|hd|nvme|vd|loop|mapper|md|dm)\\S+",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到格式化块设备 (mkfs /dev/块设备)"
+    },
+    {
+      "pattern": ">\\s*/etc/",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到覆盖写入系统配置目录"
+    },
+    {
+      "pattern": ">\\s*/dev/(sd|hd|nvme|vd|loop|mem|kmsg|port|zero|random|urandom|full|core)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到重定向写入设备文件"
+    },
+    {
+      "pattern": "/var/run/docker\\.sock",
+      "risk_level": "critical",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到访问 Docker socket，可能导致容器逃逸"
+    },
+    {
+      "pattern": "git\\s+push\\s+.*--force",
+      "risk_level": "medium",
+      "risk_type": "script_execution",
+      "reason": "检测到强制推送操作 (git push --force)，可能覆盖远程提交历史"
+    },
+    {
+      "pattern": "curl\\s+.*-X\\s+POST.*\\b(env|environment|secret|key|token|password)\\b",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到通过 curl POST 外传可能包含敏感信息的请求"
+    },
+    {
+      "pattern": "\\b(?:curl|wget)\\b[^;&|\\n]*(?:-T|--upload-file)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|/etc/master\\.passwd|id_rsa|id_dsa|id_ecdsa|id_ed25519|\\.aws/credentials|credentials|known_hosts|[^\\s/]*\\.db|secret[^\\s]*|\\.ssh)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到通过 curl/wget -T/--upload-file 上传敏感文件到外部服务器（数据外传）"
+    },
+    {
+      "pattern": "\\bnmap\\s+",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到网络端口扫描 (nmap)，可能用于横向移动侦察"
+    },
+    {
+      "pattern": "\\b(masscan|zmap|unicornscan)\\s+",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到网络端口扫描工具，可能用于横向移动侦察"
+    },
+    {
+      "pattern": ">>\\s*(~|/home/[^/]+)/(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到修改 Shell 配置文件（~/.bashrc 等），可能用于持久化后门"
+    },
+    {
+      "pattern": ">>\\s*\\S*/(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)\\b",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到修改 Shell 配置文件（.bashrc 等），可能用于持久化后门"
+    },
+    {
+      "pattern": "(?:curl|wget)\\s+.*(?:-o|--output|>)\\s*\\S+\\.(?:sh|bash)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到远程下载脚本到本地 (curl -o script.sh)，存在后续执行风险"
+    },
+    {
+      "pattern": "(?:curl|wget)\\s+\\S+.*\\b(?:chmod|chown)\\s+\\+x\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到远程下载后修改可执行权限，存在远程代码执行风险"
+    },
+    {
+      "pattern": "\\|\\s*passwd\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到管道方式调用 passwd（非交互式密码修改）"
+    },
+    {
+      "pattern": "\\bpasswd\\s+--stdin\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 passwd --stdin 非交互式密码输入"
+    },
+    {
+      "pattern": "\\bchpasswd\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 chpasswd 批量密码修改命令"
+    },
+    {
+      "pattern": "\\b(newusers|lnewusers)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 newusers/lnewusers 批量用户添加命令"
+    },
+    {
+      "pattern": "\\bpasswd\\s+-[a-zA-Z]*d\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除用户密码操作 (passwd -d)"
+    },
+    {
+      "pattern": "\\bpasswd\\s+-[a-zA-Z]*l\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到锁定用户账户操作 (passwd -l)"
+    },
+    {
+      "pattern": "\\blpasswd\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到非交互式密码修改操作 (lpasswd)"
+    },
+    {
+      "pattern": "\\bgpasswd\\s+(?!-[adA])",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到组密码管理操作 (gpasswd)"
+    },
+    {
+      "pattern": "\\bchgpasswd\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到批量修改组密码操作 (chgpasswd)"
+    },
+    {
+      "pattern": "\\buserdel\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除系统用户操作 (userdel)"
+    },
+    {
+      "pattern": "\\bdeluser\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除系统用户操作 (deluser)"
+    },
+    {
+      "pattern": "\\bluserdel\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除系统用户操作 (luserdel)"
+    },
+    {
+      "pattern": "\\bgroupdel\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除用户组操作 (groupdel)"
+    },
+    {
+      "pattern": "\\blgroupdel\\s",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除用户组操作 (lgroupdel)"
+    },
+    {
+      "pattern": "\\b(useradd|luseradd|groupadd|usermod|lusermod|groupmod|lgroupmod)\\b[^&|;]*?\\s-p\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到通过 -p 参数设置或修改密码 (useradd/usermod/groupmod)"
+    },
+    {
+      "pattern": ":\\(\\)\\s*\\{.*:\\|:&.*\\};:",
+      "risk_level": "critical",
+      "risk_type": "resource_exhaustion",
+      "reason": "Fork Bomb"
+    },
+    {
+      "pattern": "curl\\s+.*\\|\\s*bash",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "curl pipe bash 执行 (user_rules)"
+    },
+    {
+      "pattern": "curl\\s+.*\\|\\s*(sh|zsh|dash)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "curl pipe shell 执行"
+    },
+    {
+      "pattern": "wget\\s+.*\\|\\s*(bash|sh)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "wget pipe shell 执行"
+    },
+    {
+      "pattern": "eval\\s+\\$\\(curl|eval\\s+\\$\\(wget",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "eval 远程代码执行"
+    },
+    {
+      "pattern": "base64\\s+-d\\s+.*\\|\\s*bash",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "base64 解码执行 (user_rules)"
+    },
+    {
+      "pattern": "/dev/tcp/|bash\\s+-i\\s+>&",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "反弹 Shell"
+    },
+    {
+      "pattern": "nc\\s+-[el]\\s+.*\\d{1,5}",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "Netcat 反弹连接"
+    },
+    {
+      "pattern": ">\\s*/boot/",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "覆盖写入启动引导目录"
+    },
+    {
+      "pattern": "(?:curl|wget)\\s+.*\\s+&&?\\s*(?:chmod\\s+\\+x|bash|sh)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "下载后执行"
+    },
+    {
+      "pattern": "git\\s+clone\\s+.*\\|.*bash",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "git clone pipe shell"
+    },
+    {
+      "pattern": "pip\\s+install\\s+.*\\|\\s*bash",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "pip install pipe shell"
+    },
+    {
+      "pattern": "npm\\s+install\\s+-g\\s+.*\\|\\s*bash",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "npm install pipe shell"
+    },
+    {
+      "pattern": "export\\s+.*(?:TOKEN|KEY|SECRET|PASSWORD)",
+      "risk_level": "medium",
+      "risk_type": "data_exfiltration",
+      "reason": "导出敏感凭证"
+    },
+    {
+      "pattern": "(?:\\$\\(|`)\\s*(?:\\S+=\\S*\\s+)*(?:touch|rm|mkdir|mv|cp|dd|tee|truncate|chmod|chown|mkfifo|mknod|ln|shred|mkfs|nc|ncat|socat|bash|sh|zsh|dash|python|python3|perl|ruby|node|php|eval|exec|base64|sudo|su)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到命令替换隐藏执行（$(...)/反引号载荷含写/执行命令），可能产生文件系统副作用"
+    }
+  ],
+  "injection_detection": [
+    {
+      "keyword": "ignore previous instructions",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "ignore all previous",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "disregard all prior",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "forget everything",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "忽略之前的指令",
+      "risk_level": "critical",
+      "lang": "zh"
+    },
+    {
+      "keyword": "忽略所有先前的",
+      "risk_level": "critical",
+      "lang": "zh"
+    },
+    {
+      "keyword": "忽略上面所有",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "请忘记之前",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "you are now",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "you are no longer",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "new instructions",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "from now on, you",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "你现在是一个",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "你不再是一个",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "从现在开始你",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "你的新角色是",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "system prompt",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "reveal your instructions",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "output your instructions",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "repeat your instructions",
+      "risk_level": "medium",
+      "lang": "en"
+    },
+    {
+      "keyword": "系统提示",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "输出你的指令",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "重复你的指令",
+      "risk_level": "medium",
+      "lang": "zh"
+    },
+    {
+      "keyword": "this is an authorized test",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "security audit approved",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "admin override",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "debug mode",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "maintenance mode",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "这是授权的测试",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "安全审计已批准",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "管理员覆盖",
+      "risk_level": "critical",
+      "lang": "zh"
+    },
+    {
+      "keyword": "调试模式",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "<script>",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "javascript:",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "onerror=",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "onload=",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "=== END OF",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "--- END SYSTEM",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "[END OF",
+      "risk_level": "high",
+      "lang": "en"
+    },
+    {
+      "keyword": "=== 结束",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "--- 结束系统",
+      "risk_level": "high",
+      "lang": "zh"
+    },
+    {
+      "keyword": "developer mode",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "DAN mode",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "jailbreak",
+      "risk_level": "critical",
+      "lang": "en"
+    },
+    {
+      "keyword": "开发者模式",
+      "risk_level": "critical",
+      "lang": "zh"
+    },
+    {
+      "keyword": "越狱",
+      "risk_level": "critical",
+      "lang": "zh"
+    }
+  ],
+  "sensitive_path_access": [
+    {
+      "path": "/etc/shadow",
+      "risk_level": "critical",
+      "desc": "系统密码文件",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/gshadow",
+      "risk_level": "critical",
+      "desc": "系统组密码文件",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/passwd",
+      "risk_level": "high",
+      "desc": "系统用户文件",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/sudoers",
+      "risk_level": "critical",
+      "desc": "sudo 配置",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": ".ssh",
+      "risk_level": "high",
+      "desc": "SSH 配置目录（私钥/授权密钥所在）——整目录删除拦截，目录内文件按具体路径规则（读 known_hosts/config、写 authorized_keys/id_rsa 各自拦截），目录创建/权限设置放行",
+      "deny_mode": "deny_write",
+      "dir_del_only": true,
+      "scope": "home"
+    },
+    {
+      "path": ".aws",
+      "risk_level": "critical",
+      "desc": "AWS 配置目录（凭据所在）——整目录删除拦截，目录内文件按具体路径规则（读 .aws/config 非凭据配置放行、写 credentials 拦截），目录创建/权限设置放行",
+      "deny_mode": "deny_write",
+      "dir_del_only": true,
+      "scope": "home"
+    },
+    {
+      "path": ".ssh/id_rsa",
+      "risk_level": "critical",
+      "desc": "SSH 私钥",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".ssh/id_ed25519",
+      "risk_level": "critical",
+      "desc": "SSH 私钥 (ed25519)",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".ssh/authorized_keys",
+      "risk_level": "high",
+      "desc": "SSH 授权密钥",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".aws/credentials",
+      "risk_level": "critical",
+      "desc": "AWS 云凭据",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".gitconfig",
+      "risk_level": "medium",
+      "desc": "Git 配置",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".gnupg",
+      "risk_level": "high",
+      "desc": "GPG 密钥目录",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": "/etc/hosts",
+      "risk_level": "medium",
+      "desc": "DNS 解析配置",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/crontab",
+      "risk_level": "high",
+      "desc": "系统定时任务",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/cron.d/",
+      "risk_level": "high",
+      "desc": "系统定时任务目录（拆分式 crontab）",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/var/spool/cron/",
+      "risk_level": "high",
+      "desc": "用户级定时任务目录",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/systemd/",
+      "risk_level": "high",
+      "desc": "systemd 服务配置",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/ssh/sshd_config",
+      "risk_level": "high",
+      "desc": "SSH 服务配置",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/pam.d/",
+      "risk_level": "high",
+      "desc": "PAM 可插拔认证模块配置",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/nginx/nginx.conf",
+      "risk_level": "high",
+      "desc": "Nginx 主配置",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/nginx/conf.d/",
+      "risk_level": "high",
+      "desc": "Nginx 子配置目录",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/nginx/sites-enabled/",
+      "risk_level": "high",
+      "desc": "Nginx 启用站点配置目录",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/boot/",
+      "risk_level": "critical",
+      "desc": "启动引导目录",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/proc/sys/",
+      "risk_level": "high",
+      "desc": "内核参数",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/sys/",
+      "risk_level": "high",
+      "desc": "sysfs 内核接口",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/dev/random",
+      "risk_level": "high",
+      "desc": "阻塞式随机数设备（读取耗尽熵池）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
+      "path": "/dev/mem",
+      "risk_level": "critical",
+      "desc": "物理内存访问设备（读写均危险）",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "/dev/kmsg",
+      "risk_level": "high",
+      "desc": "内核消息缓冲区",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": ".bashrc",
+      "risk_level": "high",
+      "desc": "用户 Shell 初始化脚本",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".bash_profile",
+      "risk_level": "high",
+      "desc": "用户 Shell 登录脚本",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".profile",
+      "risk_level": "high",
+      "desc": "用户通用登录脚本",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": "/etc/ssh/ssh_host_rsa_key(?!\\.pub)",
+      "risk_level": "critical",
+      "desc": "SSH 主机 RSA 私钥",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/ssh/ssh_host_ed25519_key(?!\\.pub)",
+      "risk_level": "critical",
+      "desc": "SSH 主机 Ed25519 私钥",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/ssh/ssh_host_ecdsa_key(?!\\.pub)",
+      "risk_level": "critical",
+      "desc": "SSH 主机 ECDSA 私钥",
+      "deny_mode": "deny_both",
+      "scope": "root"
+    },
+    {
+      "path": "credentials.yml",
+      "risk_level": "high",
+      "desc": "凭据配置文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": "credentials.yaml",
+      "risk_level": "high",
+      "desc": "凭据配置文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": "secrets.yml",
+      "risk_level": "high",
+      "desc": "密钥配置文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": "secrets.yaml",
+      "risk_level": "high",
+      "desc": "密钥配置文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": ".env",
+      "risk_level": "high",
+      "desc": "环境变量/凭据配置文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": ".config/agentmoss/config.json",
+      "risk_level": "critical",
+      "desc": "AgentMoss 配置中的 LLM api_key（凭据），读=泄露，写=篡改，均不可",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".config/agentmoss",
+      "risk_level": "high",
+      "desc": "AgentMoss 自身配置目录（runtime 规则/token 用量），agent 可读但不可写（防篡改关闭安全检测）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".agentmoss/brain",
+      "risk_level": "high",
+      "desc": "AgentMoss Brain 数据（rules.json/skill_meta.json 自学习成果），agent 可读自查但不可写（防投毒）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    }
+  ]
+}

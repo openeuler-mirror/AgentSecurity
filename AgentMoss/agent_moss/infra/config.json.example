@@ -1,0 +1,31 @@
+{
+    "llm": {
+        "api_key": "your-api-key-here",
+        "model": "gpt-4o",
+        "temperature": 0.1,
+        "base_url": "https://api.openai.com/v1"
+    },
+    "timeout": {
+        "total_timeout": 90.0,
+        "prompt1_timeout": 40.0,
+        "prompt2_timeout": 20.0,
+        "step_interval": 0.0
+    },
+    "cache": {
+        "enabled": true,
+        "max_size": 1000
+    },
+    "retry": {
+        "max_retries": 2,
+        "retry_interval": 2.0
+    },
+    "security": {
+        "enabled": true,
+        "heuristic_enabled": true,
+        "logic_rules_enabled": true,
+        "llm_analysis_enabled": true,
+        "rules_path": "",
+        "skills_dir": ""
+    },
+    "log_level": "INFO"
+}

@@ -1,0 +1,47 @@
+{
+  "agent_id": "xiaoo",
+  "description": "xiaoO 宿主 agent 专属安全规则。在通用 Linux profile 之上追加 xiaoO 配置/密钥/安全 Skill 目录的写保护，以及 xiaoO 专属绕过词。同步自 audit_agent heuristic_detector.py 行 98-132 + 行 361-367。",
+  "extra_command_patterns": [
+    {
+      "pattern": "xiaoo\\.env|xiaoo\\.toml|llm_secrets\\.json",
+      "risk_level": "high",
+      "risk_type": "config_tampering",
+      "reason": "检测到尝试访问或修改 xiaoO 配置文件"
+    },
+    {
+      "pattern": "/usr/lib/\\.xiaoo/skills/xiaoo-guardian/.*\\b(rm|del|delete|remove|修改|删除|chmod|chown|write|save|保存|modify|更新|覆盖|replace|truncate|追加|append)\\b",
+      "risk_level": "critical",
+      "risk_type": "config_tampering",
+      "reason": "检测到尝试修改或删除 xiaoO 系统级安全防护 Skill 目录"
+    },
+    {
+      "pattern": "\\b(rm|del|delete|remove|修改|删除|chmod|chown|write|save|保存|modify|更新|覆盖|replace|truncate|追加|append)\\b.* /usr/lib/\\.xiaoo/skills/xiaoo-guardian/",
+      "risk_level": "critical",
+      "risk_type": "config_tampering",
+      "reason": "检测到尝试修改或删除 xiaoO 系统级安全防护 Skill 目录"
+    },
+    {
+      "pattern": "\\.xiaoo/skills/xiaoo-guardian/.*\\b(rm|del|delete|remove|修改|删除|chmod|chown|write|save|保存|modify|更新|覆盖|replace|truncate|追加|append)\\b",
+      "risk_level": "critical",
+      "risk_type": "config_tampering",
+      "reason": "检测到尝试修改或删除 xiaoO 用户级安全防护 Skill 目录"
+    },
+    {
+      "pattern": "\\b(rm|del|delete|remove|修改|删除|chmod|chown|write|save|保存|modify|更新|覆盖|replace|truncate|追加|append)\\b.*\\.xiaoo/skills/xiaoo-guardian/",
+      "risk_level": "critical",
+      "risk_type": "config_tampering",
+      "reason": "检测到尝试修改或删除 xiaoO 用户级安全防护 Skill 目录"
+    }
+  ],
+  "extra_injection_keywords": [
+    { "keyword": "bypass audit", "risk_level": "critical", "lang": "en" },
+    { "keyword": "skip security check", "risk_level": "critical", "lang": "en" },
+    { "keyword": "disable guard", "risk_level": "critical", "lang": "en" },
+    { "keyword": "绕过审计", "risk_level": "critical", "lang": "zh" },
+    { "keyword": "禁用安全检查", "risk_level": "critical", "lang": "zh" },
+    { "keyword": "关闭防护", "risk_level": "critical", "lang": "zh" }
+  ],
+  "extra_sensitive_paths": [],
+  "builtin_safe_skills": ["xiaoo-guardian"],
+  "extra_skills": []
+}

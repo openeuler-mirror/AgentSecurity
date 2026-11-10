@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-moss"
+version = "0.15.1"
+description = "Multi-layer security analysis engine for AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "httpx>=0.25",
+    "tomli>=2.0; python_version < '3.11'",
+    "pydantic>=2.0",
+    "tenacity>=8.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+agent-moss = "agent_moss.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["agent_moss*"]

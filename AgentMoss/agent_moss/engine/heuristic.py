@@ -1,0 +1,1163 @@
+"""特征匹配静态检测 — 快速拦截已知危险模式
+
+采用组合式检测器架构，包含三个独立子检测器：
+1. UserRuleMatcher — 用户敏感动作规则匹配（精确 + 通配符）
+2. CommandPatternScanner — 关键命令正则检测（从 OSProfile 获取模式）
+3. InjectionKeywordChecker — Prompt 注入检测（从 OSProfile 获取关键词）
+
+三者由 HeuristicDetector 统一协调，按优先级依次执行，支持短路返回。
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..profiles.base import OSProfile
+    from ..agents.base import AgentExtensions
+
+from .types import HeuristicResult
+
+# _is_write_operation 留在 logic_rules.py 作为单一事实源（read_before_write 也用），
+# 此处复用避免读写判定逻辑漂移。
+from .logic_rules import _is_write_operation, _SensitivePathMatcher, _is_directory_delete_action, _is_archive_read_of_dir, _is_ssh_keygen_generate
+
+# 默认用户规则文件路径
+DEFAULT_RULES_PATH = Path(__file__).parent.parent / "rules" / "user_rules.json"
+
+# ==================== 风险等级优先级映射 ====================
+_RISK_PRIORITY = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def _max_risk(*levels: str) -> str:
+    """返回多个风险等级中最高的那个"""
+    return max(levels, key=lambda l: _RISK_PRIORITY.get(l, 0))
+
+
+def _merge_heuristic_hit(cur: HeuristicResult, new: HeuristicResult) -> HeuristicResult:
+    """合并两次启发式命中,取风险等级更高者（对齐 TS runHeuristicCheck 的 max 合并）。
+
+    detect() 原是"先命中即 return"的早退结构,导致低等级命中（如命令正则 medium）
+    遮蔽高等级子检测器（如通配符+删除 high）→ 双端漂移（TS 取 max 不漏 wildcard,
+    Python 早退漏）。改为扫完全部子检测器后取最高,与 TS 语义一致。
+    """
+    if not cur.hit:
+        return new
+    if not new.hit:
+        return cur
+    if _RISK_PRIORITY.get(new.risk_level, 0) <= _RISK_PRIORITY.get(cur.risk_level, 0):
+        return cur
+    return new
+
+
+# ==================== 从 L2 搬入 L1 的静态子检测器 ====================
+# 以下三个检测器只看 a_next（不看 action_history），按"L1 只看这一步"原则
+# 从 logic_rules.py 搬入。逻辑原样保留，返回类型从 LogicRuleResult 改为
+# HeuristicResult（携带 is_credential / violated_rule），保证三层分析效果一致。
+
+# sensitive_path 排除的非文件工具前缀（避免 memory-searchMemory 等误报）
+_SENSITIVE_EXCLUDED_PREFIXES = ("memory-", "skill-", "skill-manager-", "mailbox-", "app-")
+
+# 搜索/查询类工具前缀：其 action_detail 是「查询数据」（如 query=...），不是指令。
+# 注入关键词检测应只针对指令性文本（用户 prompt / reason / 命令），
+# 否则搜索 "jailbreak"、"bypass" 等资料会被 L1 注入检测误判为注入攻击（prompt injection 误报）。
+# 与 TS 端 ts/src/engine/heuristic.ts 的 SEARCH_ACTION_PREFIXES 保持一致。
+_SEARCH_ACTION_PREFIXES = ("search-", "web-", "browser-", "query-", "websearch", "web_search")
+
+
+def _is_search_action_type(action_type: str) -> bool:
+    """判断是否为搜索/查询类工具（action_detail 是数据载荷，非指令）。"""
+    at = action_type.lower()
+    return any(at.startswith(p) for p in _SEARCH_ACTION_PREFIXES) or at in (
+        "websearch", "web_search", "search", "query"
+    )
+
+
+class SensitivePathChecker:
+    """子检测器：敏感路径访问检测（从 L2 搬入）
+
+    deny_both（凭据）：无论读写都拦截，is_credential=True
+    deny_read：只拦截读取
+    deny_write：只拦截写入/删除
+
+    热生效：runtime_config 启用敏感路径 > profile 默认（复用 L2 getter，
+    不改 runtime_config JSON schema，保持用户已配置的敏感路径热更新生效）。
+    agent_ext.extra_sensitive_paths 追加在后。
+    """
+
+    def __init__(self, profile: "OSProfile", agent_ext: "AgentExtensions | None" = None):
+        self._profile = profile
+        self._agent_ext = agent_ext
+
+    def _get_sensitive_paths(self):
+        """runtime_config 启用敏感路径（热更新） > profile 默认；
+        末尾追加 agent_ext.extra_sensitive_paths（如有）。
+
+        runtime_config 返回 dict 形态；转为 SensitivePath dataclass 以复用循环体。
+        """
+        base_paths: list = self._profile.sensitive_paths
+        try:
+            from ..infra.runtime_config import has_runtime_config, get_enabled_l2_sensitive_paths_or_default, load_runtime_config
+            if has_runtime_config():
+                enabled = get_enabled_l2_sensitive_paths_or_default(load_runtime_config())
+                if enabled:
+                    from ..profiles.base import SensitivePath
+                    # NEW-FP-1: runtime overlay 是用户 stdout 保存的旧数据，.ssh/.aws 目录级
+                    # 条目没有 dir_del_only 标记（dir_del_only 是本次新增语义字段）。若仅按
+                    # runtime 构造，老 runtime 会丢失该语义 → 目录级条目退化回「写/删都拦」，
+                    # mkdir/chmod 初始化被误拦。缺省取 profile 同名条目的 dir_del_only 补齐。
+                    _profile_dir_del: dict[str, bool] = {
+                        getattr(sp, "path", ""): getattr(sp, "dir_del_only", False)
+                        for sp in self._profile.sensitive_paths
+                    }
+                    base_paths = [
+                        SensitivePath(
+                            path=r["path"], risk_level=r["risk_level"], desc=r["desc"],
+                            credential=r.get("credential", False),
+                            read_only=r.get("read_only", False),
+                            deny_mode=r.get("deny_mode", ""),
+                            dir_del_only=r.get("dir_del_only", _profile_dir_del.get(r["path"], False)),
+                        )
+                        for r in enabled
+                    ]
+        except Exception:
+            pass
+
+        # agent 专属敏感路径追加在后（通用规则先匹配命中即短路）
+        if self._agent_ext and self._agent_ext.extra_sensitive_paths:
+            base_paths = base_paths + self._agent_ext.extra_sensitive_paths
+        return base_paths
+
+    def check(self, a_next: dict[str, str]) -> HeuristicResult:
+        action_type = a_next.get("action_type", "").lower()
+        action_detail = a_next.get("action_detail", "").lower()
+
+        # 只对文件/命令类操作执行敏感路径检查，避免 memory-searchMemory 等
+        # 非文件工具的关键词参数触发路径子串匹配误报
+        if any(action_type.startswith(p) for p in _SENSITIVE_EXCLUDED_PREFIXES):
+            return HeuristicResult(hit=False)
+
+        # 检测操作类型：读/写/其他（统一用 _is_write_operation，与 read_before_write 对齐）
+        is_write_op = _is_write_operation(action_type, action_detail, self._profile.write_keywords)
+
+        # ssh-keygen 生成模式豁免：-t <type> 生成新私钥时 -f 是写目标（输出），
+        # 不读取任何已有私钥内容，不应命中 deny_both 的「读私钥」拦截（误报卡死初始化）。
+        is_keygen_generate = _is_ssh_keygen_generate(action_detail)
+
+        # NEW-FP-I: echo/printf 引号内参数是字面量（打印文本），其中的敏感路径
+        # （echo "/etc/passwd"）不应被当真实路径访问。对首词 echo/printf 的段剥掉
+        # 引号内容后再做路径匹配。非 echo/printf 段（cat "/etc/passwd"）不剥，
+        # 引号内真实路径参数仍匹配。引号外的重定向（echo "x" > /etc/passwd）在
+        # 剥离后保留，仍被路径匹配。
+        # NORM-PATH: 再折叠路径混淆段（//、/./），堵 CVE-2023-37274 路径穿越变体。
+        path_scan_text = _normalize_path_segments(_strip_literal_text_segments(action_detail))
+
+        for sp in self._get_sensitive_paths():
+            raw_path = sp.path
+            path = raw_path.lower()
+            # 确定拦截模式：优先 deny_mode，向后兼容 credential / read_only
+            deny_mode = sp.deny_mode
+            if not deny_mode:
+                if sp.credential:
+                    deny_mode = "deny_both"
+                elif sp.read_only:
+                    deny_mode = "deny_read"
+                else:
+                    deny_mode = "deny_write"
+
+            # 检查路径是否在操作中出现
+            # deny_both 路径使用边界匹配，避免非文件名拼接（如 something_credentials_yml）误报
+            if deny_mode == "deny_both":
+                # 以 . 或 / 开头的路径，其首字符不是单词字符，\b 在它前面不构成边界
+                # （空格→/ 之间没有 \b），故用 (?:^|[\s/\\]) 替代前导 \b。
+                # 也兼容引号上下文：open('.env')、cat ".env" 等
+                # 私钥路径（不以 .pub 结尾）加负向先行 (?!\.pub) 排除公钥变体：
+                # .ssh/id_rsa 不应命中 .ssh/id_rsa.pub（公钥本就公开）。
+                # 内联带 (?!...) 块的路径（如 /etc/ssh/ssh_host_rsa_key(?!\.pub)，
+                # 对齐 TS ROOT_SENSITIVE_PATHS）用 _SensitivePathMatcher 复刻 TS
+                # pathMatches 分段逻辑；裸路径（无内联块）仍走原 pub_excl 追加。
+                if "(" in path and "?" in path:
+                    path_match = _SensitivePathMatcher.match(path, path_scan_text)
+                else:
+                    escaped = re.escape(path)
+                    pub_excl = r"(?!\.pub)" if not path.endswith(".pub") else r""
+                    if path.startswith(".") or path.startswith("/"):
+                        path_match = bool(re.search(rf"(?:^|[\s/\\'\"]){escaped}{pub_excl}\b", path_scan_text))
+                    else:
+                        path_match = bool(re.search(rf"\b{escaped}{pub_excl}\b", path_scan_text))
+            else:
+                if getattr(sp, "dir_del_only", False):
+                    # NEW-FP-1 审核：目录级条目（.ssh/.aws）在下面非 deny_both 分支原本用
+                    # 裸子串 path in text——删 ~/.ssh.bak（主目录下独立备份目录，如
+                    # ~/.ssh.bak）会被 ".ssh" 子串误命中。改用「目录边界」匹配：
+                    # 前导 (?:^|[\s/\\'\"]) + 尾随 (?:/|[\s'\"\\]|$)——目录名后只接受
+                    # 路径分隔符或空白/引号/行尾，不接受继续拼字符（.ssh.bak 的 . 不是边界）
+                    # dbak'、~/.ssh_backup、~/.ssh-hist 等拼写变体也放行。
+                    path_match = bool(
+                        re.search(
+                            rf"(?:^|[\s/\\'\"]){re.escape(path)}(?:/|[\s'\"\\]|$)",
+                            path_scan_text,
+                        )
+                    )
+                else:
+                    path_match = path in path_scan_text
+
+            if not path_match and raw_path.startswith("~"):
+                expanded = os.path.expanduser(raw_path)
+                if expanded.lower() in path_scan_text:
+                    path_match = True
+                else:
+                    home_dir = str(Path.home())
+                    if expanded.startswith(home_dir):
+                        rel_path = expanded[len(home_dir):]
+                        if rel_path.lower() in path_scan_text or expanded.lower() in path_scan_text:
+                            path_match = True
+
+            if path_match:
+                # ssh-keygen 生成模式：-f 是写目标（生成新私钥），放行（不读已有私钥）。
+                # 读模式（-y 推导公钥 / -l 指纹 / -p 改密）不受此豁免，仍走 deny_both 拦。
+                if is_keygen_generate:
+                    continue
+                # 凭据文件：无论读写都拦截（读凭据文件同样危险）
+                if deny_mode == "deny_both":
+                    return HeuristicResult(
+                        hit=True,
+                        matched_patterns=[sp.path],
+                        risk_level=sp.risk_level,
+                        reason=f"访问敏感路径: {sp.desc} ({sp.path})",
+                        risk_type="file_access",
+                        is_credential=True,
+                        violated_rule="sensitive_path_access",
+                    )
+                # read_only 路径：只拦截读取操作，写入/删除放行（如 /dev/random：
+                #   读取可耗尽熵池导致 TLS 阻塞（攻击向量），写入是投喂熵（增强安全））
+                if deny_mode == "deny_read":
+                    if is_write_op:
+                        continue  # 允许写入操作（如投喂熵池）
+                    return HeuristicResult(
+                        hit=True,
+                        matched_patterns=[sp.path],
+                        risk_level=sp.risk_level,
+                        reason=f"读取敏感路径: {sp.desc} ({sp.path})",
+                        risk_type="file_access",
+                        violated_rule="sensitive_path_access",
+                    )
+                # dir_del_only 目录级条目（.ssh/.aws）独立于 is_write 判定：
+                # 只拦「删除该目录」或「归档/复制读源整包读取」两种高危语义，
+                # 不拦 mkdir/chmod/echo 等正常初始化/权限收紧（NEW-FP-1），
+                # 也不拦 ls/cat 只读及解压恢复（tar -x、cp 目标位）。
+                if getattr(sp, "dir_del_only", False):
+                    if self._is_delete_action(action_detail, raw_path):
+                        return HeuristicResult(
+                            hit=True,
+                            matched_patterns=[sp.path],
+                            risk_level=sp.risk_level,
+                            reason=f"删除敏感目录: {sp.desc} ({sp.path})",
+                            risk_type="file_access",
+                            violated_rule="sensitive_path_access",
+                        )
+                    if self._is_archive_read(action_detail, raw_path):
+                        return HeuristicResult(
+                            hit=True,
+                            matched_patterns=[sp.path],
+                            risk_level=sp.risk_level,
+                            reason=f"归档/复制读取敏感目录: {sp.desc} ({sp.path})",
+                            risk_type="file_access",
+                            violated_rule="sensitive_path_access",
+                        )
+                    continue  # 其余对目录级的读/写（mkdir/chmod/echo/ls/cat/解压/写目标位）放行
+                # 默认（无特殊标记）：只拦截写入/删除操作，只读访问放行
+                if not is_write_op:
+                    continue  # 允许读取操作
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=[sp.path],
+                    risk_level=sp.risk_level,
+                    reason=f"访问敏感路径: {sp.desc} ({sp.path})",
+                    risk_type="file_access",
+                    violated_rule="sensitive_path_access",
+                )
+
+        return HeuristicResult(hit=False)
+
+    @staticmethod
+    def _is_delete_action(action_detail: str, dir_path: str) -> bool:
+        """判断命令是否含「删除该目录/其下内容」意图（dir_del_only 目录级条目专用）。
+
+        复用 L2 单一事实源（_is_directory_delete_action），避免 L1/L2 双份删除判定漂移
+        导致同一 .ssh 删除命令两端判定不一致。实现见 logic_rules.py。
+        """
+        return _is_directory_delete_action(action_detail, dir_path)
+
+    @staticmethod
+    def _is_archive_read(action_detail: str, dir_path: str) -> bool:
+        """判断命令是否把目录作为归档/复制读源整包读取（dir_del_only 条目专用）。
+
+        复用 L2 单一事实源（_is_archive_read_of_dir），见 logic_rules.py。
+        """
+        return _is_archive_read_of_dir(action_detail, dir_path)
+
+
+class DangerousPatternChecker:
+    """子检测器：危险操作模式检测（从 L2 搬入）
+
+    通配符+删除（排除 /tmp 等临时目录清理）、重定向覆盖 /etc /boot /proc。
+    """
+
+    def check(self, a_next: dict[str, str]) -> HeuristicResult:
+        action_detail = a_next.get("action_detail", "").lower()
+        action_type = a_next.get("action_type", "").lower()
+
+        if action_type in ("file_write", "file_edit"):
+            return HeuristicResult(hit=False)
+
+        # 通配符 + 删除/修改 — 排除 /tmp 等临时目录的清理操作
+        # 用边界正则匹配目录名本身（/tmp 和 /tmp/ 都算），避免 `find /tmp -delete`
+        # 因 "/tmp/" 子串不匹配（/tmp 后是空格）而 is_temp_path=False 误报（Bug6）。
+        # NEW-FP（鸿蒙写周报误报）：先剥离 heredoc 文档字面量内容——文档正文里的
+        # `*`/`?`/`rm`/`删除` 是文本不是真实删除命令，不剥离会误判为批量删除。
+        # NEW-FP-2: 临时目录豁免扩充相对 var/tmp 前缀——rm -rf var/tmp/* 清理本地 venv
+        # 的临时目录（相对路径），旧豁免只认绝对 /tmp 等 4 个，相对 var/tmp/* 漏过 →
+        # 通配符+删除误报。相对 var/tmp（无前导 /）也是标准临时目录名，一并豁免。
+        _scan = _strip_heredoc_content(action_detail)
+        _TEMP_DIRS = ("/tmp", "/var/tmp", "/run", "/dev/shm")
+        # NEW-FP-2 审核：相对 var/tmp（无前导 /）& 深层绝对路径（/opt/app/var/tmp）——
+        # 裸露的 (?:^|[\s/])td(?:[\s/]|$) 会把「以 var/tmp 结尾的深层子路径」误当临时目录
+        # 豁免（rm -rf /opt/app/var/tmp/* 是删业务数据却被放行 = 漏拦）。相对 var/tmp
+        # 只认「命令中独立路径 token 首段为 var/tmp（rm -rf var/tmp/*、cd var/tmp && rm *）」
+        # 的精确形态；深层绝对路径必须是 /var/tmp（tmp 目录在根下才是标准临时位置）。
+        # 相对 token 判定：变量赋值对（VAR=… && rm）、(rm|cd|pushd) 后紧跟的相对首段
+        # 是 var/tmp，或整条命令仅 rm 一个目标 token 恰为 var/tmp（var/tmp/foo）。
+        is_temp_path = any(
+            re.search(rf"(?:^|[\s/]){re.escape(td)}(?:[\s/]|$)", action_detail)
+            for td in _TEMP_DIRS
+        ) or re.search(
+            r"(?:^|[\s;]|&&\s*|\|\|\s*)var/tmp(?:/|[\s;]|$)",
+            action_detail,
+        ) is not None
+
+        # 通配符必须紧邻删除命令（真实命令 token），而非任意位置子串。
+        # 收紧：`*`/`?` 出现在删除命令（rm/del/delete/remove/删除/移除）附近——
+        # 匹配「删除命令 + 通配符路径」组合，如 `rm -rf /tmp/*`、`rm *`、`find . -delete`。
+        # 不再用 action_detail.includes('*') && includes('rm') 的宽泛子串匹配，
+        # 避免文档正文/heredoc/grep 模式里的字面量误报。
+        _wildcard_delete_re = re.compile(
+            r"(?:\brm\b|\b(r?mdir|del|delete|remove|rmdir|unlink)\b|\b删除\b|\b移除\b)[\s\S]{0,40}?[*?]"
+            r"|[*?][\s\S]{0,40}?\b(?:rm|del|delete|remove|rmdir|unlink)\b"
+            r"|rm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+\S*[*?]",
+            re.IGNORECASE,
+        )
+        if not is_temp_path and _wildcard_delete_re.search(_scan):
+            return HeuristicResult(
+                hit=True,
+                matched_patterns=["wildcard+delete"],
+                risk_level="high",
+                reason="检测到通配符结合删除操作，可能造成批量误删",
+                risk_type="script_execution",
+                violated_rule="dangerous_wildcard_operation",
+            )
+
+        # find -exec <写命令> / find | xargs <写命令> — find 在 READ_ONLY_COMMANDS
+        # 导致整段被当只读，-exec 或 | xargs 后的 chmod/cp/mv/rm/sed -i 等写命令漏检
+        # （NEW-FN-C: -exec；NEW-FN-E: | xargs 等价变体未覆盖）。find 遍历出的文件被
+        # 批量执行写操作，静态无法确定具体目标文件，但「find + 写命令」组合本身就是
+        # 批量写意图，此处识别 -exec/-execdir/-ok 后紧跟写命令、或 | xargs 后紧跟写命令
+        # 即拦截。只匹配写命令首词，避免 -exec grep / | xargs ls 等只读误报。
+        # xargs 后的 sed -i 单独匹配（sed -i 是 sed + -i 参数，不是简单首词）。
+        _FIND_WRITE_RE = re.compile(
+            r"\bfind\b.*?(?:"
+            r"(?:^|\s)-exec(?:dir)?\s+(chmod|chown|cp|mv|rm|dd|tee|truncate|mkfs|shred|rmdir|unlink)\b"
+            r"|(?:^|\s)\|\s*xargs\s+(?:sed\s+-[a-zA-Z]*i|chmod|chown|cp|mv|rm|dd|tee|truncate|mkfs|shred|rmdir|unlink)\b"
+            r")",
+            re.IGNORECASE,
+        )
+        m = _FIND_WRITE_RE.search(action_detail)
+        if m:
+            cmd_hit = m.group(1) if m.group(1) else "xargs"
+            return HeuristicResult(
+                hit=True,
+                matched_patterns=[f"find ... {cmd_hit}"],
+                risk_level="high",
+                reason=f"检测到 find 批量执行写操作 ({cmd_hit})，可能批量修改/删除文件",
+                risk_type="script_execution",
+                violated_rule="find_exec_write",
+            )
+
+        # 重定向覆盖关键文件
+        # 重定向覆盖关键系统目录——支持引号包裹路径（echo > '/etc/x' 绕过裸 > /etc/ 正则）
+        override_patterns = [r">\s*['\"]?/etc/", r">\s*['\"]?/boot/", r">\s*['\"]?/proc/"]
+        for pat in override_patterns:
+            if re.search(pat, action_detail):
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=["redirect+critical-dir"],
+                    risk_level="critical",
+                    reason="检测到重定向覆盖写入关键系统目录",
+                    risk_type="file_access",
+                    violated_rule="dangerous_redirect",
+                )
+
+        return HeuristicResult(hit=False)
+
+
+class HomeDeletionChecker:
+    """子检测器：主目录删除检测（NEW-FN: rm -rf ~ / $HOME 漏报）
+
+    危险命令正则以 / 开头匹配，`~` 和 `$HOME` 形态全部绕过（rm -rf ~、rm -rf $HOME、
+    TARGET=$HOME; rm -rf $TARGET 均漏放——文章"Claude 删 700GB 主目录"同款攻击形态）。
+    本检测器按命令段判定：
+      - 段首命令是删除类（rm/unlink/rmdir/删除）且目标指向主目录（`~`、`$HOME`、
+        `~/…`、`$HOME/…`）→ high / home-deletion。
+      - 同段赋值后续删除命令引用主目录变量：`TARGET=$HOME; rm -rf $TARGET` → high。
+    只拦删除（home 目录被删是破坏性最大的）；chmod/dd/写文件的定级交给其它规则
+    （chmod 规则 critical、敏感路径 deny_write 如 .gitconfig medium），避免误报
+     `echo >> ~/.gitconfig`（写 home 下具体文件，非删主目录）被升 high。
+    """
+
+    def __init__(self, profile: "OSProfile"):
+        self._profile = profile
+
+    # 主目录根目标：~ / $HOME / ${HOME}（可带尾斜杠、通配全内容 / 自身点）。
+    # 语义：只拦「删主目录根/全部内容」，不拦「删主目录下具体子路径」——NEW-FP 修复：
+    #   rm -rf ~ / rm -rf ~/ / rm -rf ~/* / rm -rf ~/.* / rm -rf $HOME / rm -rf $HOME/ 拦；
+    #   rm -rf ~/project/build / rm -rf ~/.cache / rm ~/notes.txt（定向清理具体子路径）放行——
+    #   凭据子目录（~/.ssh、~/.aws/credentials、.gnupg）由 SensitivePathChecker 独立兜底，
+    #   不依赖本子检测器（收紧后凭据保护不缺口子）。
+    # ~ 是非词字符，前导 \b 不生效：前界 ^|空白|=|引号|$（命令替换内）。
+    # 后界 行尾|空白|引号|;|}（不接 / 子路径段）；允许 0..1 个 / 后跟 *、.*、.（通配全内容/自身）。
+    # NEW-FN-1: `..` 穿越段（~/..、~/../..、$HOME/..、~/a/.. 等）由 _walk_depth 深度解析
+    # 单独判定（本正则不含 ..，避免 `~/a` 因后接段而误匹配）。rm -rf ~/.. 等于删 /home、
+    # rm -rf /home/user/.. 同理，是删主目录根的放大形态，须拦截（详见 ① 分支）。
+    _HOME_TARGET_RE = re.compile(
+        r"(?:^|[\s=\"'($])(?:~|(?:\$home|\$\{home\}))(?:/(?:\.\*|\*|\.)?)?(?=[\s\"';}|&|\)]|$)",
+        re.IGNORECASE,
+    )
+    # 同段赋值：VAR=(~ | ~/ | $HOME | $HOME/ | /home/xxx | 命令替换 $() 含根 ~/$HOME)。
+    # 捕获整个赋值值（到下一个 shell 分隔符），由 _is_home_value 判定是否主目录根。
+    _ASSIGN_RE = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r"(~[A-Za-z0-9_./-]*|\$HOME[A-Za-z0-9_./-]*|\$\{HOME\}[A-Za-z0-9_./-]*|/home/[^\s;|&]+"
+        r"|\$\((?:[^()]|\([^()]*\))*\))(?=\s|;|$|\||&)",
+        re.IGNORECASE,
+    )
+    # 删除类命令（主目录删除专指删除：rm/unlink/rmdir；chmod/dd/echo-写 交给其它规则定级）
+    _DELETE_CMDS_RE = re.compile(r"\b(?:rm|unlink|rmdir)\b|删除|移除", re.IGNORECASE)
+
+    @staticmethod
+    def _is_home_value(path: str) -> bool:
+        """赋值源是否为主目录根：~ | ~/ | $HOME | $HOME/ | /home/xxx（根本身）| 命令替换含根。
+
+        NEW-FP 修复：只认「用户主目录根」，不认后代路径——T=/home/myuser/backup 是定向
+        清理（放行），T=/home/myuser 或 T=~/ 才是删主目录根（拦）。
+        命令替换形态：VAR=$(echo $HOME)、VAR=$(echo ~)——剥离 $() 内层，复用根目标判定。
+        /home/xxx 分支仅认「用户目录根」本身（允许尾斜杠），后代路径不算。
+        """
+        p = path.strip().lower()
+        # 命令替换：$(echo ~) / $(echo $HOME) / $(echo ~/x) —— 内层按根目标判定（不含子路径段）。
+        if p.startswith("$(") and p.endswith(")"):
+            inner = p[2:-1].strip()
+            return HomeDeletionChecker._HOME_TARGET_RE.search(" " + inner) is not None
+        # 绝对路径根：仅 /home/<user> 或 /home/<user>/（后代路径不算）
+        if re.match(r"^/home/[^/\s]+/?$", p):
+            return True
+        return HomeDeletionChecker._HOME_TARGET_RE.search(" " + p) is not None
+
+    @staticmethod
+    def _home_escape_target(seg: str) -> bool:
+        """NEW-FN-1: `..` 穿越段是否解析到「主目录根或以上」（删主目录根的放大形态）。
+
+        rm -rf ~/.. == rm -rf /home/<user>/.. == 删 /home（同时删掉本机所有主目录！）；
+        rm -rf $HOME/../.. == 删 /。这些用 .. 逃逸主目录删更上一级的形态，主目录根正则
+        不含 .. 全部漏放。深度行走（token 化 + .. 弹栈）判定：
+          - 记录行走过程中的**最低深度**（min_depth）：任何一步弹到 < 0（逃出主目录根、
+            进入 /home/.. 以上，即 /home/b/c、/ 等）→ 整个目标已不在主目录内 → 拦；
+          - 起点为主目录根（~/、$HOME/、/home/<user>/），最终深度 < 主目录根深度 → 拦；
+          - 深度 == 主目录根深度且至少弹过一次 .. → 拦（~/.ssh/.. 弹回主目录根）；
+          - 深度 > 主目录根深度且从未逃出（最低深度 ≥ 0，如 ~/a/../b）→ 定向清理，放行。
+        修复（NEW-FN 审核）：`~/a/../../b/c` 深度行走 1→0→-1→0→1，中途逃出主目录根
+        （到 /home 层）后又回升 —— 旧判定只看最终深度(>0) 全放，实际目标是 /home/b/c
+        （删主目录外的根级内容）。记录 min_depth < 0 一并拦截；`~/a/../b`（1→0→1，未出界）
+        不受影响仍放行。
+
+        只解析主目录前缀后的首个路径 token（rm 的目标参数之一），不误伤同段其它路径。
+        """
+        low = seg.lower()
+        # 找所有 ~ / $HOME / ${HOME} / /home/<user> 起始的主目录前缀
+        for m in re.finditer(r"(?:~|(?:\$home|\$\{home\})|/home/[a-z0-9_.-]+)", low):
+            prefix = m.group(0)
+            end_idx = m.end()
+            # 取主目录前缀后的首个 whitespace-界 token（./../etc 到下一个空白/分隔符）
+            tail = low[end_idx:]
+            if not tail:
+                continue
+            # 目标 token：主目录后紧跟的第一段路径（到空白/;|& 等分隔符）
+            token = re.split(r"\s+", tail)[0].rstrip("/")
+            token = token.split("&&")[0].split("||")[0].split(";")[0]
+            # 清洗：剥引号、纯路径段（去空/.）；保留 ..（弹栈）
+            token = token.strip("'\"")
+            segments = [s for s in token.split("/") if s and s != "."]
+            # 只处理含 .. 的目标（无 .. 由 _HOME_TARGET_RE 根正则覆盖那个目标）
+            if not any(s == ".." for s in segments):
+                continue
+            depth = 0  # 主目录根 = 深度 0
+            min_depth = 0  # 行走过程中的最低深度（记录中途逃逸）
+            for s in segments:
+                depth += -1 if s == ".." else 1
+                min_depth = min(min_depth, depth)
+            # 新增（NEW-FN-1 审核）：行走途中曾弹到根深度以下（逃出主目录，如 ~/a/../..）
+            # → 目标已指向主目录外（/home/.. 甚至 / 级），无论最终是否回升都必须拦；
+            # ~/a/../b（1→0→1，min_depth=0 未逃出）不受影响仍放行。
+            if min_depth < 0:
+                return True
+            # 弹过栈（有 ..）且最终深度 <= 根深度 → 删主目录根或以上
+            if depth <= 0:
+                return True
+        return False
+
+    @staticmethod
+    def _is_delete_command(seg: str) -> bool:
+        """判断命令段是否为删除类命令段（段首词 rm/rmdir/unlink 或含 删除/移除）。"""
+        seg = seg.lstrip()
+        m = re.match(r"^(?:rm|rmdir|unlink)\b", seg, re.IGNORECASE)
+        if m:
+            return True
+        return bool(re.search(r"删除|移除", seg))
+
+    def check(self, a_next: dict[str, str]) -> HeuristicResult:
+        action_type = a_next.get("action_type", "").lower()
+        action_detail = a_next.get("action_detail", "").lower()
+
+        # 只对 bash 类命令判定（非 shell 工具名/参数不追）
+        if action_type not in ("bash", "executebash", "terminal-executebash"):
+            return HeuristicResult(hit=False)
+
+        # ① 删除类命令段 + 主目录根目标：rm -rf ~ / rm -rf $HOME / rm -rf ~/ 等（不拦 ~/子路径）。
+        # NEW-FN-1: 段内主目录根目标 + `..` 穿越解析——rm -rf ~/..（删 /home）、
+        # rm -rf $HOME/../..（删 /）等用 .. 逃逸主目录删更上一级的形态，主目录根正则不含
+        # .. 全部漏放。深度行走：~/a/.. 解析回 ~ 根（拦）、~/a/../b 落具体子路径（放行）。
+        for seg in re.split(r"&&|\|\||;|\n", action_detail):
+            seg = seg.strip()
+            if not seg or not self._is_delete_command(seg):
+                continue
+            if self._HOME_TARGET_RE.search(seg) or self._home_escape_target(seg):
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=["home-literal-delete"],
+                    risk_level="high",
+                    reason="检测到删除主目录 (~/$HOME) 操作",
+                    risk_type="script_execution",
+                    violated_rule="home_directory_delete",
+                )
+
+        # ② 同段赋值后删除命令引用：TARGET=$HOME; rm -rf $TARGET（文章同款变量间接形态）
+        assigned: dict[str, str] = {}
+        for m in self._ASSIGN_RE.finditer(action_detail):
+            assigned[m.group(1)] = m.group(2)
+        if assigned:
+            for var, path in assigned.items():
+                if not self._is_home_value(path):
+                    continue
+                var_ref_re = re.compile(rf"(?:{re.escape(var)}|\${{{re.escape(var)}}})")
+                for seg in re.split(r"&&|\|\||;|\n", action_detail):
+                    seg = seg.strip()
+                    if not seg or not self._is_delete_command(seg):
+                        continue
+                    if var_ref_re.search(seg):
+                        return HeuristicResult(
+                            hit=True,
+                            matched_patterns=["home-assigned-var-delete"],
+                            risk_level="high",
+                            reason=f"检测到通过变量 {var}（={path}，主目录）执行删除",
+                            risk_type="script_execution",
+                            violated_rule="home_directory_delete",
+                        )
+        return HeuristicResult(hit=False)
+
+
+class LateralMovementChecker:
+    """子检测器：横向移动检测（从 L2 搬入，原为死代码，启用后归 L1）
+
+    ssh/scp/rsync 到非本机主机即拦截。
+
+    复用 L2 `LogicRulesChecker._check_lateral_movement`：内联脚本（python -c 等）
+    里的 ssh/scp/rsync 是字面量非真调用、echo/printf 首词段是字面量，都跳过
+    （NEW-FP-D），用 token 化三策略提取主机（NEW-FN-G/F/E）。避免 L1/L2 双份
+    横向移动逻辑漂移导致判定不一致（曾因 L1 缺内联脚本跳过而误报 python -c 测试）。
+    """
+
+    def __init__(self, profile: "OSProfile | None" = None):
+        self._profile = profile
+
+    def check(self, a_next: dict[str, str]) -> HeuristicResult:
+        # 懒加载复用 L2 检测逻辑（需 OSProfile 构造 LogicRulesChecker）
+        if self._profile is None:
+            from ..profiles.linux import LinuxProfile
+            self._profile = LinuxProfile()
+        from .logic_rules import LogicRulesChecker
+        lr = LogicRulesChecker(self._profile)._check_lateral_movement(a_next)
+        if not lr.hit:
+            return HeuristicResult(hit=False)
+        return HeuristicResult(
+            hit=True,
+            matched_patterns=[lr.reason],
+            risk_level="medium",
+            reason=lr.reason,
+            risk_type="lateral_movement",
+            violated_rule="lateral_movement",
+        )
+
+
+class UserRuleMatcher:
+    """子检测器：用户自定义敏感动作/工具规则匹配"""
+
+    def __init__(self, rules_path: str | Path | None = None):
+        self._rules = self._load(rules_path)
+
+    @staticmethod
+    def _load(rules_path: str | Path | None) -> dict:
+        path = Path(rules_path) if rules_path else DEFAULT_RULES_PATH
+        if not path.exists():
+            return {"sensitive_actions": [], "sensitive_tools": []}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def check(self, action_type: str, action_detail: str) -> HeuristicResult:
+        # 通配符匹配敏感动作
+        for rule in self._rules.get("sensitive_actions", []):
+            pattern = rule.get("pattern", "").lower()
+            description = rule.get("description", "")
+            if not pattern:
+                continue
+            regex = re.escape(pattern).replace(r"\*", ".*")
+            if re.search(regex, action_detail) or re.search(regex, action_type):
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=[pattern],
+                    risk_level="high",
+                    reason=f"命中用户敏感动作规则: {description or pattern}",
+                    risk_type="sensitive_action",
+                )
+
+        # 精确匹配敏感工具名
+        for tool_name in self._rules.get("sensitive_tools", []):
+            if tool_name.lower() == action_type:
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=[tool_name],
+                    risk_level="high",
+                    reason=f"命中敏感工具规则: {tool_name}",
+                    risk_type="sensitive_tool",
+                )
+
+        return HeuristicResult(hit=False)
+
+
+def _strip_heredoc_content(action_detail: str) -> str:
+    """剥离 heredoc 文档字面量内容（<<EOF ... EOF）。
+
+    heredoc 是传递给命令的文档正文，不是命令本身。其中的 `*`/`?`/`rm`/`删除` 等
+    字样是文档内容而非真实删除操作——若不加剥离，写含 markdown 加粗（\\*\\*）、
+    三元表达式（? :）、或描述性文字（含 rm）的文档时，会被 DangerousPatternChecker
+    的「通配符+删除」误判为批量删除（NEW-FP：写周报文件即触发）。
+
+    支持 <<EOF / <<-EOF / <<'EOF' / <<"EOF" 四种引号形态，匹配到行首的结束标记
+    为止，替换为占位符 <<heredoc>>。
+    """
+    return re.sub(
+        r"<<-?\s*(?:['\"]?)([A-Za-z_][A-Za-z0-9_]*)(?:['\"]?)[^\n]*\n.*?\n\s*\1\s*(?:\n|$)",
+        "<<heredoc>>\n",
+        action_detail,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+
+
+def _strip_literal_text_segments(action_detail: str) -> str:
+    """NEW-FP-I: 对首词 echo/printf 的命令段剥掉引号内容（字面量参数）。
+
+    echo/printf 是文本输出命令，其引号内参数是被打印的字面量而非真实命令——
+    `echo "rm -rf /tmp"` 是打印这串文本不是执行删除。但 CommandPatternScanner
+    旧实现对整个 action_detail 做正则搜索，引号内的 rm/chmod/mkfs 等危险命令
+    模式被误当真实命令匹配 → 误报（NEW-FP-I）。
+
+    修复：按 &&/||/;/换行 分段，首词是 echo/printf 的段，剥掉引号内容（字面量），
+    保留引号外的重定向 `>`/`>>` 和管道 `|` 后的真实操作。这样：
+    - `echo "rm -rf /tmp"` → `echo `（rm 模式不匹配，误报消除）
+    - `echo "x" > /etc/passwd` → `echo  > /etc/passwd`（重定向 >/etc/ 仍匹配，真实写不漏报）
+    - `rm -rf /tmp; echo done` → rm 段不剥，echo 段剥，rm 仍匹配（真实危险不漏报）
+    - `echo pass | passwd` → passwd 无引号在管道后，剥后仍保留（管道注入不漏报）
+
+    注意：重定向目标的引号路径（`echo 'x' > '~/.bashrc'` 的 `'~/.bashrc'`）
+    是真实写目标不是字面量。先摘 `> 'path'` / `> "path"` 为裸路径 `> path`，
+    再剥剩余引号内容，避免重定向目标被当字面量剥掉导致漏报（与 read_before_write
+    的 _REDIRECT_TARGET_RE 一致）。
+
+    旁路（NEW-FN-H 待修）：若整条命令含"写入脚本文件后执行"或"管道喂给解释器执行"
+    的绕过链，不剥离 echo/printf 段——该场景真实威胁是绕过链而非字面量，保留引号
+    内路径让 L1 凭据检测兜底，避免剥离后绕过链在 L1/L2 漏检（inline-09/10 依赖）。
+    - inline-09: echo "cat /etc/shadow" > /tmp/x.sh && bash /tmp/x.sh（写脚本+执行）
+    - inline-10: printf 'cat /etc/shadow' | bash（管道喂给解释器）
+    """
+    # 旁路：含"写脚本 + 后续执行"或"管道喂解释器"绕过链时整条不剥离
+    _exec_after = r"&&|\|\||;|\n|\|"
+    if (re.search(r">\s*[/~]\S*\.(sh|py|pl|rb)\b", action_detail) and
+        re.search(rf"(?:{_exec_after})\s*(?:bash|sh|zsh|dash|python|perl|ruby|node)", action_detail)) or \
+       re.search(r"\|\s*(?:bash|sh|zsh|dash|python|perl|ruby|node)\b", action_detail):
+        return action_detail
+    # 按命令分隔符分段，但跳过引号内的分隔符（echo "a; b" 的 ; 在引号内不分段）
+    result_parts: list[str] = []
+    for seg in _split_command_segments(action_detail):
+        fw = seg.strip().split()[0].lower() if seg.strip().split() else ""
+        if fw in ("echo", "printf"):
+            # 先摘重定向目标的引号路径为裸路径（保留真实写目标），再剥剩余引号内容
+            seg_unquoted_redirect = re.sub(
+                r">{1,2}\s*(['\"])([~./][^'\"]+)\1",
+                lambda m: ">" + m.group(2),
+                seg,
+            )
+            result_parts.append(re.sub(r"'[^']*'|\"[^\"]*\"", "", seg_unquoted_redirect))
+        else:
+            result_parts.append(seg)
+    return "".join(result_parts)
+
+
+def _normalize_path_segments(text: str) -> str:
+    """NORM-PATH: 折叠路径混淆段，堵路径穿越变体（对齐 CVE-2023-37274 攻击面）。
+
+    敏感路径/危险命令匹配前，把「路径混淆」归一回真实路径，避免子串/正则漏检：
+    - 连续斜杠 `//` → `/`（`cat /etc//shadow` 与 `cat /etc/shadow` 等价，应同判）
+    - 单点段 `/./` → `/`（`cat /etc/./shadow` 同理）
+
+    不做 `..` 解析（`cat ../../etc/shadow` 的 `..` 可能改变路径语义，且现有
+    dangerous pattern / read_before_write 已对 `..` 穿越有兜底），只折叠无歧义的
+    `//` 与 `/./`，避免过度归一化误伤。
+
+    约束（must not break）：
+    1. 跳过协议 URL 的 `//`（`curl http://x` 的 `http://` 是协议分隔，折叠成
+       `http:/x` 会破坏 curl 下载/管道检测）。
+    2. 跳过引号内字面量（`grep "a//b"` 引号内是搜索模式非路径；echo/printf 字面量
+       已由 _strip_literal_text_segments 先剥掉，此处兜底非 echo 段的引号）。
+    """
+    # 1. 保护协议 URL 的 //（用不含 / 的令牌占位，避免被 /{2,} 折叠）
+    prot_tokens: list[str] = []
+    def _stash_prot(m: re.Match[str]) -> str:
+        prot_tokens.append("://")
+        return f"{m.group(1)}__PROT{len(prot_tokens) - 1}__"
+    text = re.sub(r"\b(https?|ftp|file)://", _stash_prot, text, flags=re.IGNORECASE)
+    # 2. 保护引号内内容（非路径字面量不折叠）
+    quote_tokens: list[str] = []
+    def _stash_quote(m: re.Match[str]) -> str:
+        quote_tokens.append(m.group(0))
+        return f"__Q{len(quote_tokens) - 1}__"
+    text = re.sub(r"'[^']*'|\"[^\"]*\"", _stash_quote, text)
+    # 3. 折叠引号外 + 非 URL 的连续斜杠与单点段
+    text = re.sub(r"/{2,}", "/", text)
+    text = re.sub(r"/\./", "/", text)
+    # 4. 还原引号与协议
+    for i, q in enumerate(quote_tokens):
+        text = text.replace(f"__Q{i}__", q)
+    for i, p in enumerate(prot_tokens):
+        text = text.replace(f"__PROT{i}__", p)
+    return text
+
+
+def _split_command_segments(action_detail: str) -> list[str]:
+    """按 &&/||/;/换行 分段，跳过引号内的分隔符。
+
+    echo "a; b && c" 的引号内分隔符是字面量非命令分隔，不能分段——否则
+    引号内 chmod/mkfs 等词会脱离 echo 段被当独立命令首词误匹配（NEW-FP-I）。
+    """
+    segments: list[str] = []
+    cur = []
+    i = 0
+    quote: str | None = None
+    while i < len(action_detail):
+        ch = action_detail[i]
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        # 检查分隔符 &&/||/;/换行（引号外）
+        if ch == ';' or ch == '\n':
+            segments.append("".join(cur))
+            segments.append(ch)
+            cur = []
+            i += 1
+            continue
+        if ch == '&' and i + 1 < len(action_detail) and action_detail[i + 1] == '&':
+            segments.append("".join(cur))
+            segments.append("&&")
+            cur = []
+            i += 2
+            continue
+        if ch == '|' and i + 1 < len(action_detail) and action_detail[i + 1] == '|':
+            segments.append("".join(cur))
+            segments.append("||")
+            cur = []
+            i += 2
+            continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        segments.append("".join(cur))
+    return segments
+
+
+class CommandPatternScanner:
+    """子检测器：关键命令正则扫描（从 OSProfile 获取模式）
+
+    热生效：scan 时若存在 runtime_config，按其 enabled 规则集覆盖编译列表，
+    使用户在 console 关闭某条 L1 命令规则后立即生效（下次调用即不再触发）。
+    runtime_config 缺失时回退到 profile 默认（__init__ 编译的 _compiled）。
+
+    agent_ext：三方 agent 定制化规则（agent_moss.agents.AgentExtensions）。
+    在通用规则（runtime_config 或 profile 默认）之后追加该 agent 的
+    extra_command_patterns；通用规则先匹配命中即短路，避免重复检测。
+    """
+
+    def __init__(
+        self,
+        profile: "OSProfile",
+        agent_ext: "AgentExtensions | None" = None,
+    ):
+        self._profile = profile
+        self._compiled = self._compile_from_rules(profile.dangerous_commands)
+        self._agent_ext = agent_ext
+        # 预编译 agent_ext 的 extra_command_patterns（一次性，避免 scan 时重复编译）
+        self._agent_extra_compiled: list[dict] = []
+        if agent_ext and agent_ext.extra_command_patterns:
+            self._agent_extra_compiled = self._compile_from_rules(
+                agent_ext.extra_command_patterns
+            )
+
+    @staticmethod
+    def _compile_from_rules(rules) -> list[dict]:
+        """将规则列表（CommandPattern 或 runtime dict）编译为正则条目"""
+        compiled = []
+        for p in rules:
+            pattern = p.get("pattern") if isinstance(p, dict) else p.pattern
+            compiled.append({
+                "pattern": pattern,
+                "risk_level": p.get("risk_level") if isinstance(p, dict) else p.risk_level,
+                "risk_type": p.get("risk_type") if isinstance(p, dict) else p.risk_type,
+                "reason": p.get("reason") if isinstance(p, dict) else p.reason,
+                "regex": re.compile(pattern, re.IGNORECASE),
+            })
+        return compiled
+
+    def _get_active_rules(self) -> list[dict]:
+        """获取当前生效的规则集：
+        runtime_config 启用规则（热更新） > profile 默认；
+        末尾追加 agent_ext.extra_command_patterns（如有）。
+        """
+        try:
+            from ..infra.runtime_config import has_runtime_config, get_enabled_l1_command_patterns_or_default, load_runtime_config
+            if has_runtime_config():
+                runtime = load_runtime_config()
+                enabled = get_enabled_l1_command_patterns_or_default(runtime)
+                if enabled:
+                    return self._compile_from_rules(enabled) + self._agent_extra_compiled
+        except Exception:
+            pass
+        return self._compiled + self._agent_extra_compiled
+
+    def scan(self, action_detail: str) -> HeuristicResult:
+        active = self._get_active_rules()
+        # NEW-FP-I: echo/printf 是文本输出命令，其引号内参数是字面量非真实命令。
+        # 旧实现对整个 action_detail 做正则搜索，echo "rm -rf /tmp" 的输出文本里
+        # rm -rf 被当真实命令匹配 → 误报。修复：对首词 echo/printf 的命令段剥掉
+        # 引号内容（字面量），保留引号外的重定向 > 和管道 | 后的真实操作（echo "x" > /etc/passwd
+        # 的重定向仍被检测，echo pass | passwd 的管道后 passwd 仍被匹配）。非 echo/printf
+        # 段（rm -rf /tmp; echo done 的 rm 段）不剥，真实危险命令不漏报。
+        # NORM-PATH: 再折叠路径混淆段（//、/./），堵路径穿越变体（cat /etc//shadow 漏检）。
+        scan_text = _normalize_path_segments(_strip_literal_text_segments(action_detail))
+        # ssh-keygen 生成模式豁免：生成新私钥时 -f 后的私钥路径是写目标，不应命中
+        # 「访问私钥」命令正则（如 .ssh/id_rsa）。读模式（-y/-l/-p）不受豁免。
+        exempt_keygen = _is_ssh_keygen_generate(action_detail)
+        hits = [
+            p for p in active
+            if p["regex"].search(scan_text)
+            and not (exempt_keygen and p["risk_type"] == "file_access")
+        ]
+        if not hits:
+            return HeuristicResult(hit=False)
+
+        top = max(hits, key=lambda p: _RISK_PRIORITY.get(p["risk_level"], 0))
+        return HeuristicResult(
+            hit=True,
+            matched_patterns=[p["pattern"] for p in hits],
+            risk_level=top["risk_level"],
+            reason="; ".join(p["reason"] for p in hits),
+            risk_type=top["risk_type"],
+        )
+
+
+class InjectionKeywordChecker:
+    """子检测器：Prompt 注入关键词检测（从 OSProfile 获取关键词）
+
+    热生效：check 时若存在 runtime_config，按其 enabled 关键词集覆盖，
+    使用户在 console 关闭某条注入关键词后立即生效。
+
+    agent_ext：三方 agent 定制化关键词（agent_moss.agents.AgentExtensions）。
+    在通用关键词（runtime_config 或 profile 默认）之后追加该 agent 的
+    extra_injection_keywords；通用关键词先匹配命中即短路。
+    """
+
+    def __init__(
+        self,
+        profile: "OSProfile",
+        agent_ext: "AgentExtensions | None" = None,
+    ):
+        self._profile = profile
+        self._keywords = profile.injection_keywords
+        self._agent_extra_keywords: list[dict] = []
+        if agent_ext and agent_ext.extra_injection_keywords:
+            self._agent_extra_keywords = [
+                {
+                    "keyword": k.keyword,
+                    "risk_level": k.risk_level,
+                    "lang": k.lang,
+                }
+                for k in agent_ext.extra_injection_keywords
+            ]
+
+    def _get_active_keywords(self) -> list[dict]:
+        """runtime_config 启用关键词（热更新） > profile 默认；
+        末尾追加 agent_ext.extra_injection_keywords（如有）。
+        """
+        try:
+            from ..infra.runtime_config import has_runtime_config, get_enabled_l1_injection_keywords_or_default, load_runtime_config
+            if has_runtime_config():
+                runtime = load_runtime_config()
+                enabled = get_enabled_l1_injection_keywords_or_default(runtime)
+                if enabled:
+                    return enabled + self._agent_extra_keywords
+        except Exception:
+            pass
+        return self._keywords + self._agent_extra_keywords
+
+    def check(self, text: str) -> HeuristicResult:
+        keywords = self._get_active_keywords()
+        hits = [p for p in keywords if p["keyword"].lower() in text]
+        if not hits:
+            return HeuristicResult(hit=False)
+
+        top = max(hits, key=lambda p: _RISK_PRIORITY.get(p["risk_level"], 0))
+        return HeuristicResult(
+            hit=True,
+            matched_patterns=[p["keyword"] for p in hits],
+            risk_level=top["risk_level"],
+            reason="; ".join(
+                f"检测到注入关键词 [{p.get('lang', 'unknown')}]: {p['keyword']}"
+                for p in hits
+            ),
+            risk_type="prompt_injection",
+        )
+
+
+class CustomEnvRuleChecker:
+    """子检测器：AGENT_MOSS_CUSTOM_RULES 环境变量自定义规则（与 TS 版一致）"""
+
+    def __init__(self):
+        from ..infra.config import load_custom_rules
+        self._rules = load_custom_rules()
+
+    def check(self, action_type: str, action_detail: str) -> HeuristicResult:
+        if not self._rules:
+            return HeuristicResult(hit=False)
+
+        command = f"{action_type}: {action_detail}"
+        matched = []
+        highest_severity = "low"
+        _rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+        for rule in self._rules:
+            try:
+                if re.search(rule["pattern"], command):
+                    if rule["action"] == "Deny":
+                        matched.append(f"自定义规则: {rule['pattern']}")
+                        sev = rule.get("severity", "high")
+                        if _rank.get(sev, 0) > _rank.get(highest_severity, 0):
+                            highest_severity = sev
+            except re.error:
+                continue
+
+        if matched:
+            return HeuristicResult(
+                hit=True,
+                matched_patterns=matched,
+                risk_level=highest_severity,
+                reason=f"命中自定义规则: {', '.join(matched)}",
+                risk_type="custom_rule",
+            )
+        return HeuristicResult(hit=False)
+
+
+def _extract_first_command(command: str) -> str:
+    """提取管道和链式命令的第一段"""
+    main_cmd = command.split("|")[0].strip()
+    for sep in ["&&", "||"]:
+        if sep in main_cmd:
+            main_cmd = main_cmd.split(sep)[0].strip()
+            break
+    return main_cmd
+
+
+def is_fully_safe_bash_command(command: str, profile: "OSProfile") -> bool:
+    """检查是否为完全安全的 bash 命令（跳过 L2 + L3）
+
+    含真实重定向写（echo x > file / printf >> file）的不算 fully_safe——
+    _extract_first_command 只取首命令名（echo），会忽略 >/>> 重定向，导致
+    `echo x > /tmp/existing.txt` 覆写已存在文件被白名单放行跳过 L2（Bug3）。
+    复用 _is_write_operation 的重定向判定（已剥 devnull + 比较运算符 + 只读首词保护）。
+    注意：heredoc/内联脚本内容中的 > 字符不应触发重定向写检测（待优化）。
+    """
+    main_cmd = _extract_first_command(command)
+    compiled = [re.compile(p, re.IGNORECASE) for p in profile.fully_safe_commands]
+    if not any(p.match(main_cmd) for p in compiled):
+        return False
+    # 命中 fully_safe 首命令后，再查完整命令是否含真实重定向写
+    if _is_write_operation(main_cmd, command, profile.write_keywords):
+        return False
+    return True
+
+
+def is_readonly_sensitive_bash_command(command: str, profile: "OSProfile") -> bool:
+    """检查是否为安全但可能访问敏感路径的 bash 命令（跳过 L3，保留 L2）"""
+    main_cmd = _extract_first_command(command)
+    compiled = [re.compile(p, re.IGNORECASE) for p in profile.readonly_sensitive_commands]
+    return any(p.match(main_cmd) for p in compiled)
+
+
+def is_safe_bash_command(command: str, profile: "OSProfile") -> bool:
+    """检查 bash 命令是否是安全的只读操作（向后兼容）"""
+    return is_fully_safe_bash_command(command, profile) or is_readonly_sensitive_bash_command(command, profile)
+
+
+# 内联脚本命令检测 — 供 coordinator 判断是否需要跳过 Layer 1/2 立即拦截
+_INLINE_SCRIPT_RE = re.compile(
+    r"(?:^|\s)(?:python|python3|python3\.\d+|perl|perl5|ruby|jruby|mruby|node|php|lua)\s+"
+    r"(?:-[a-zA-Z]*[cer][a-zA-Z]*\s+)",
+    re.IGNORECASE,
+)
+
+
+def is_inline_script_command(action_detail: str) -> bool:
+    """判断命令是否为内联脚本解释器命令（python -c, perl -e 等）"""
+    return bool(_INLINE_SCRIPT_RE.search(action_detail))
+
+
+class HeuristicDetector:
+    """特征匹配静态检测器 — 组合式协调器
+
+    按优先级依次调用子检测器，支持短路返回：
+    1. CustomEnvRuleChecker — AGENT_MOSS_CUSTOM_RULES 环境变量规则
+    2. UserRuleMatcher — 用户敏感规则
+    3. CommandPatternScanner — 关键命令正则（OS Profile 驱动）
+    4. InjectionKeywordChecker — Prompt 注入关键词（OS Profile 驱动）
+    5. SensitivePathChecker — 敏感路径访问检测（从 L2 搬入，含凭据边界匹配）
+    6. DangerousPatternChecker — 危险操作模式检测（从 L2 搬入）
+    7. LateralMovementChecker — 横向移动检测（从 L2 搬入，原死代码启用）
+    """
+
+    def __init__(
+        self,
+        profile: "OSProfile",
+        rules_path: str | Path | None = None,
+        agent_ext: "AgentExtensions | None" = None,
+    ):
+        self._profile = profile
+        self._agent_ext = agent_ext
+        self._custom_env_checker = CustomEnvRuleChecker()
+        self._rule_matcher = UserRuleMatcher(rules_path)
+        self._command_scanner = CommandPatternScanner(profile, agent_ext=agent_ext)
+        self._injection_checker = InjectionKeywordChecker(profile, agent_ext=agent_ext)
+        # 从 L2 搬入的三个静态子检测器（只看 a_next）
+        self._sensitive_path_checker = SensitivePathChecker(profile, agent_ext=agent_ext)
+        self._dangerous_pattern_checker = DangerousPatternChecker()
+        self._home_deletion_checker = HomeDeletionChecker(profile)
+        self._lateral_movement_checker = LateralMovementChecker(profile)
+
+    def detect(
+        self,
+        a_next: dict[str, str],
+        reason: str,
+        prompt_session: str = "",
+    ) -> HeuristicResult:
+        """
+        执行特征匹配检测。
+
+        Args:
+            a_next: 下一步动作，含 action_type 和 action_detail
+            reason: 执行该动作的理由
+            prompt_session: 用户原始 prompt（用于注入关键词检测）
+
+        Returns:
+            HeuristicResult: 检测结果
+        """
+        action_type = a_next.get("action_type", "").lower()
+        action_detail = a_next.get("action_detail", "").lower()
+        combined_text = f"{action_type} {action_detail} {reason} {prompt_session}".lower()
+
+        # 安全工具白名单跳过：仅按 action_type 精确匹配（safe_action_types 是
+        # 工具类型名如 ls/glob/list_dir，不应在 action_detail 里做子串匹配——
+        # 否则 "ls" 子串会命中 "credentials.yml" 等，导致读凭据文件被白名单短路放行）。
+        if action_type in self._profile.safe_action_types:
+            return HeuristicResult(hit=False)
+
+        # 0. 环境变量自定义规则（AGENT_MOSS_CUSTOM_RULES）
+        result = self._custom_env_checker.check(action_type, action_detail)
+        if result.hit:
+            return result
+
+        # 1. 用户敏感规则
+        result = self._rule_matcher.check(action_type, action_detail)
+        if result.hit:
+            return result
+
+        # 2. 关键命令正则
+        best: HeuristicResult = self._command_scanner.scan(action_detail)
+
+        # 3. Prompt 注入
+        # 搜索/查询类工具（search-WebSearch 等）的 action_detail 是查询参数（数据载荷），
+        # 不是指令。注入检测只针对指令性文本（用户 prompt / reason / 命令），
+        # 排除搜索工具的 action_detail，避免 "搜索 jailbreak" 等被误判为注入攻击。
+        injection_text = combined_text
+        if _is_search_action_type(action_type):
+            injection_text = f"{action_type} {reason} {prompt_session}".lower()
+        result = self._injection_checker.check(injection_text)
+        if result.hit:
+            best = _merge_heuristic_hit(best, result)
+
+        # 4. 敏感路径访问检测（从 L2 搬入）
+        # 排在 safe_action_types 短路之后：glob/list_dir/ask_user_question 等纯元数据
+        # 工具已在前放行；read/grep 不在 safe_action_types 中，会进此检查，
+        # 凭据文件（deny_both）无论读写都拦截——与原 L2 行为一致。
+        result = self._sensitive_path_checker.check(a_next)
+        if result.hit:
+            best = _merge_heuristic_hit(best, result)
+
+        # 5. 危险操作模式检测（从 L2 搬入）：通配符+删除、重定向覆盖关键目录
+        result = self._dangerous_pattern_checker.check(a_next)
+        if result.hit:
+            best = _merge_heuristic_hit(best, result)
+
+        # 5b. 主目录删除/写改检测（NEW-FN）：rm -rf ~ / $HOME / 变量间接删主目录
+        result = self._home_deletion_checker.check(a_next)
+        if result.hit:
+            best = _merge_heuristic_hit(best, result)
+
+        # 6. 横向移动检测（从 L2 搬入，原死代码启用）：ssh/scp/rsync 到非本机
+        result = self._lateral_movement_checker.check(a_next)
+        if result.hit:
+            best = _merge_heuristic_hit(best, result)
+
+        return best

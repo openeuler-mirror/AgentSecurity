@@ -1,0 +1,9 @@
+[
+  {
+    "id": "plugin_agent_moss_tool_input",
+    "hook_point": "*.Tool.*.pre",
+    "command": "/home/hkl/gitcode/AgentMoss/hooks/xiaoO/bridge.py",
+    "raw_command": "python3 bridge.py",
+    "_comment": "替代 audit_agent。bridge.py 读 stdin JSON → POST AgentMoss /api/v1/analyze → 输出 {result:allow|deny, reason}。需先启动 AgentMoss（agent_moss.server.app，默认 127.0.0.1:9090）。command 用绝对路径 python3 解释器需按部署环境调整（RPM 安装后改 dnf 提供的 python3）。"
+  }
+]

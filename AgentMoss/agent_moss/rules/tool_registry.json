@@ -1,0 +1,25 @@
+{
+  "_comment": "Tool Registry — 工具名/命令 → 数据流属性（单一事实源，双端共用）。对齐站点 registry.ts：actionClass（read/write/compute/network_egress/message_egress/unknown）+ requireHighIntegrity（该工具是否要求高完整性输入）。驱动 Rule 5/9/10/11 的按动作类分流 block/observe 与低完整性判定。",
+  "tools": {
+    "bash": { "actionClass": "compute", "requireHighIntegrity": true },
+    "shell": { "actionClass": "compute", "requireHighIntegrity": true },
+    "terminal": { "actionClass": "compute", "requireHighIntegrity": true },
+    "cmd": { "actionClass": "compute", "requireHighIntegrity": true },
+    "python": { "actionClass": "compute", "requireHighIntegrity": true },
+    "node": { "actionClass": "compute", "requireHighIntegrity": true },
+    "exec": { "actionClass": "compute", "requireHighIntegrity": true },
+    "curl": { "actionClass": "network_egress", "requireHighIntegrity": false },
+    "wget": { "actionClass": "network_egress", "requireHighIntegrity": false },
+    "scp": { "actionClass": "network_egress", "requireHighIntegrity": false },
+    "rsync": { "actionClass": "network_egress", "requireHighIntegrity": false },
+    "nc": { "actionClass": "network_egress", "requireHighIntegrity": false },
+    "file.read": { "actionClass": "read", "requireHighIntegrity": false },
+    "file_read": { "actionClass": "read", "requireHighIntegrity": false },
+    "read_file": { "actionClass": "read", "requireHighIntegrity": false },
+    "cat": { "actionClass": "read", "requireHighIntegrity": false },
+    "file.write": { "actionClass": "write", "requireHighIntegrity": false },
+    "file_write": { "actionClass": "write", "requireHighIntegrity": false },
+    "write_file": { "actionClass": "write", "requireHighIntegrity": false },
+    "echo": { "actionClass": "write", "requireHighIntegrity": false }
+  }
+}

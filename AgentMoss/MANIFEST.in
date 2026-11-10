@@ -1,0 +1,6 @@
+recursive-include agent_moss/templates *
+recursive-include agent_moss/skills *.md
+recursive-include agent_moss/rules *.json
+recursive-include agent_moss/agents *
+recursive-include agent_moss/data *
+recursive-include agent_moss/console/static *

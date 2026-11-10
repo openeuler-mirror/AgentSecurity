@@ -1,0 +1,369 @@
+{
+  "_comment": "L2.2 模型检测规则单一事实源（Python + TS 共用）。原子命题正则 + LTL 公式（前缀 AST）。公式在事件迹位置 0 处评估：LTL 公式满足 = 攻击存在。对应站点 detection-l2-2.html 的 10 条 LTL + 5 条 CTL 规则（CTL 活性降级为 G(!φ) 安全不变量，见 docs/DETECTION_METHODS.md 5.4）。",
+  "ap_patterns": {
+    "reads_credential": [
+      "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*[~]?/\\.ssh(?:/[\\w.-]+)?\\b",
+      "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*(?:id_rsa|id_dsa|id_ecdsa|\\.aws/credentials|credentials\\.json|\\.netrc)",
+      "(?:cat|head|tail|less|more|sed|awk|strings|base64)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd)",
+      "(?:cat|head|tail|less|more|grep)\\s+[^;&|\\n]*known_hosts",
+      "(?:grep|find)\\s+[^;&|\\n]*\\b(?:password|secret|passwd|credential|api[_-]?key)\\b[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|~?/\\.aws/credentials)",
+      "\\bcurl\\b[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
+      "\\bpython3?\\s+-c\\s+['\\\"][\\s\\S]{0,200}?(?:base64\\.b64encode|open\\s*\\(|Path\\(|io\\.open\\s*\\(|read_text\\s*\\(|read\\s*\\()[\\s\\S]{0,200}?(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)"
+    ],
+    "network_egress": [
+      "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary|-T\\s+)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
+      "\\b(?:curl|wget|ftp)\\b[^;&|\\n]*\\s(?:-T|--upload-file|--post-file|--post-data|put)\\b[^;&|\\n]*https?://(?!localhost|127\\.0\\.0\\.1)",
+      "[^;&|\\n]*\\|\\s*(?:nc|netcat)\\s+\\S+\\s+\\d{1,5}\\b",
+      "(?:requests|urllib(?:\\.request)?|aiohttp|httpx)\\.(?:post|put|request|send)\\s*\\(",
+      "\\b(?:scp|sftp|rsync)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|id_dsa|credentials|\\S*secret\\S*|\\.ssh/)[^;&|\\n]*\\S+@\\S+:",
+      "\\b(?:smtplib|ftplib|paramiko)\\s*\\."
+    ],
+    "execute_file": [
+      "\\bpython3?\\s+-c\\s+['\\\"](?![^'\\\"]*\\b(?:print|pprint|echo)\\s*\\()",
+      "\\b(?:bash|sh)\\s+-[ce]\\b",
+      "\\bos\\.system\\s*\\(",
+      "\\bsubprocess\\.(?:run|call|Popen|check_output|check_call)\\s*\\(",
+      "\\bshell\\s*=\\s*True\\b",
+      "\\beval\\s*[\\(\\s]|\\bexec\\s*\\(|\\bexecve\\b",
+      "\\bperl\\s+-e\\b|\\bnode\\s+-e\\b|\\bphp\\s+-r\\b",
+      "\\./[\\w.-]+\\.(?:sh|py|pl)\\b"
+    ],
+    "write_file": [
+      "(?:>|>>|tee\\s+)\\s*(?:/etc/passwd|/etc/shadow|/etc/crontab|/var/spool/cron/|~?/\\.ssh/(?:authorized_keys|config))",
+      "(?:cp|mv)\\s+[^;&|\\n]*\\s(?:/etc/passwd|/etc/shadow|/etc/crontab)"
+    ],
+    "delete_file": [
+      "\\brm\\s+-[rf]+\\s+/|\\brm\\s+-[rf]+\\s+[^;&|\\n]*(?:/etc|/var|/opt|/home)",
+      "\\bshred\\b|\\bwipe\\b"
+    ],
+    "disable_security": [
+      "iptables\\s+-F|setenforce\\s+0|systemctl\\s+stop\\s+(?:firewalld|apparmor|fail2ban)|ufw\\s+disable",
+      "\\b(?:killing|disable)\\s+(?:selinux|firewall|av)"
+    ],
+    "install_persistence": [
+      "(?:echo|printf|cat)\\b[^;&|\\n]*\\|\\s*(?:crontab|at\\b)\\s*-",
+      "\\bsystemctl\\s+enable\\s+",
+      "(?:echo|printf)\\b[^;&|\\n]*[^;&|\\n]*(?:/dev/tcp/|nc\\s+-l|ncat|reverse|backdoor|bash\\s+-i)[^;&|\\n]*(?:>>|>)\\s*(?:~?/\\.bashrc|~?/\\.profile)",
+      "\\bat\\s+now\\b|\\bchkconfig\\s+\\S+\\s+on\\b",
+      "\\bcrontab\\s+-e\\b"
+    ],
+    "privilege_escalation": [
+      "\\bsudo\\s+-u\\s+root\\b",
+      "\\bsudo\\b[^;&|\\n]*(?:/bin/sh|/bin/bash|\\bchmod\\b|\\bsetcap\\b|\\bvisudo\\b|\\bpasswd\\s+root|\\buseradd\\b)",
+      "\\bchmod\\s+u\\+s\\b|setcap\\b|pkexec\\b|doas\\b|setuid\\b",
+      "\\bsu\\s+-\\s*$|\\bsu\\s+root\\b|\\bsu\\s+-l\\s+root\\b"
+    ],
+    "download_file": [
+      "\\b(?:curl|wget)\\b[^;&|\\n]*(?:-o|--output|--location|-O)\\s+(?:(?:/tmp|/var/tmp|/dev/shm|~/)[\\w./-]*\\.(?:sh|py|pl|elf|bin|out)\\b|\\S+\\.(?:sh|py|pl|elf)\\b)",
+      "\\b(?:git\\s+clone|svn\\s+checkout)\\s+\\S+"
+    ],
+    "archive_data": [
+      "\\b(?:tar|zip|7za?|rar)\\s+[^;&|\\n]*(?:-c|-a)\\s+[^;&|\\n]*(?:(?:/etc|/var|/home|/root)|shadow|passwd|\\.ssh|secret)",
+      "\\bbase64\\b[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|secret)"
+    ],
+    "prompt_injection": [
+      "ignore\\s+(?:previous|prior|all)\\s+(?:instructions?|commands?)",
+      "<INFORMATION>|TODO:\\s*(?:send|email|transfer|delete|forward|reserve)"
+    ],
+    "sensitive_data": [
+      "(?:api[_-]?token|access[_-]?token|bearer\\s+[a-z0-9._-]+|sk-[a-z0-9_-]{10,})",
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?:^|[\\s\\W]|/)(?:\\.env|\\.env\\.local)\\b"
+    ],
+    "lateral_movement": [
+      "\\bssh\\s+[^;&|\\n]*\\S+@\\S+[\\s;&|]+(?:exec|cat|curl|wget|nc|scp|ssh|sudo|chmod|base64)",
+      "\\bssh\\s+-i\\s+\\S+\\s+\\S+@",
+      "(?:psexec|wmiexec|smbexec|sshpass)"
+    ],
+    "clear_logs": [
+      "history\\s+-c\\b",
+      "(?:>|>>)\\s*/var/log/|journalctl\\s+.*--vacuum",
+      "\\b(?:truncate|shred)\\s+[\\w/]*(?:log|journal)",
+      "\\brm\\s+-[rf]+\\s+/var/log/"
+    ]
+  },
+  "rules": [
+    {
+      "id": "mc-ltl-001",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "reads_credential"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "network_egress"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "凭证读取后网络外传（mc-ltl-001）"
+    },
+    {
+      "id": "mc-ltl-002",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "download_file"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "execute_file"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "下载后执行（mc-ltl-002）"
+    },
+    {
+      "id": "mc-ltl-003",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "disable_security"
+          ],
+          [
+            "F",
+            [
+              "|",
+              [
+                "ap",
+                "execute_file"
+              ],
+              [
+                "|",
+                [
+                  "ap",
+                  "delete_file"
+                ],
+                [
+                  "ap",
+                  "privilege_escalation"
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "禁用安全后破坏性操作（mc-ltl-003）"
+    },
+    {
+      "id": "mc-ltl-004",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "prompt_injection"
+          ],
+          [
+            "F",
+            [
+              "|",
+              [
+                "ap",
+                "network_egress"
+              ],
+              [
+                "|",
+                [
+                  "ap",
+                  "write_file"
+                ],
+                [
+                  "ap",
+                  "execute_file"
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "注入后敏感操作（mc-ltl-004）"
+    },
+    {
+      "id": "mc-ltl-005",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "reads_credential"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "lateral_movement"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "凭证读取后横向移动（mc-ltl-005）"
+    },
+    {
+      "id": "mc-ltl-006",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "sensitive_data"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "clear_logs"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "敏感数据访问后清除日志（mc-ltl-006）"
+    },
+    {
+      "id": "mc-ltl-007",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "privilege_escalation"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "install_persistence"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "提权后安装持久化（mc-ltl-007）"
+    },
+    {
+      "id": "mc-ltl-008",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "download_file"
+          ],
+          [
+            "F",
+            [
+              "ap",
+              "install_persistence"
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "下载后安装持久化（mc-ltl-008）"
+    },
+    {
+      "id": "mc-ltl-009",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "&",
+          [
+            "ap",
+            "sensitive_data"
+          ],
+          [
+            "F",
+            [
+              "&",
+              [
+                "ap",
+                "archive_data"
+              ],
+              [
+                "F",
+                [
+                  "ap",
+                  "network_egress"
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "敏感数据→归档→外传（mc-ltl-009）"
+    },
+    {
+      "id": "mc-ltl-010",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "ap",
+          "install_persistence"
+        ]
+      ],
+      "risk_level": "medium",
+      "action": "approval",
+      "reason": "持久化机制安装，需审批（mc-ltl-010）"
+    },
+    {
+      "id": "mc-ctl-001",
+      "type": "ltl",
+      "formula": [
+        "F",
+        [
+          "ap",
+          "clear_logs"
+        ]
+      ],
+      "risk_level": "critical",
+      "action": "block",
+      "reason": "安全不变量：任何情况不得清除日志（mc-ctl-001，AG(!clear_logs) 线性迹降级：违反 ⟺ 出现 clear_logs ⟺ F(clear_logs) 成立）"
+    }
+  ]
+}
