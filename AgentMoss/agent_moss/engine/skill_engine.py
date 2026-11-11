@@ -10,13 +10,29 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..infra.paths import asset_dir
+from ..infra.rules_mode import is_builtin_only, is_hot_reload_enabled, is_runtime_config_disabled
+
 if TYPE_CHECKING:
     from ..agents.base import AgentExtensions
 
 from .types import SkillMatch
 
-# Skills 目录路径
-DEFAULT_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+# Skills 目录：默认包内 `agent_moss/skills/`；设了 AGENT_MOSS_RULES_ROOT →
+# `<root>/skills/`（规则仓剥离后的落点）。用函数不用常量 —— 测试会 monkeypatch 环境变量。
+def default_skills_dir() -> Path:
+    return asset_dir("skills")
+
+
+#: 兼容旧引用名（模块导入时求值一次）。**新代码请用 default_skills_dir()** ——
+#: 它会跟随 AGENT_MOSS_RULES_ROOT 的当前值，而这个常量只在导入那一刻取。
+DEFAULT_SKILLS_DIR = default_skills_dir()
+
+
+#: cold / builtin 模式下的进程级 skill 冻结副本（按 skills_dir 区分）。
+#: 为什么需要：SkillEngine 是每次 analyze 新建的，若每次都重新 glob/read 包内 .md，
+#: 同用户改 venv 里的 skill 文件仍会热生效；冻结后本次运行只认首次读到的内容。
+_FROZEN_SKILLS_CACHE: dict[str, dict[str, str]] = {}
 
 # ==================== Skill 分类映射 ====================
 # action_type / action_detail 中的关键词 → 匹配的 skill 文件名
@@ -39,6 +55,35 @@ def _load_l3_skills() -> dict[str, list[str]]:
 SKILL_KEYWORD_MAP: dict[str, list[str]] = _load_l3_skills()
 
 
+def runtime_custom_skill_keywords() -> dict[str, list[str]]:
+    """runtime 里**用户新增**的 L3 skill（builtin=False 且启用）→ ``{skill_id: keywords}``。
+
+    为什么需要：Console「新增 Skill」把 .md 写到 ``<data_root>/agent_moss_skills/``、
+    关键词记进 runtime 的 ``L3_skills.<分类>.skills``，但 ``SKILL_KEYWORD_MAP`` 是
+    **模块级常量**（只读包内 l3_rules.json）——于是自定义 skill 既进不了关键词表、
+    .md 也不在加载目录，**写完永远不参与判定且无任何提示**（2026-09 招行客户
+    "当前的规则我没办法追加"的另一半）。此处按调用实时合并，控制台新增即生效。
+    """
+    try:
+        from ..infra.runtime_config import has_runtime_config, load_runtime_config
+        if not has_runtime_config():
+            return {}
+        rt = load_runtime_config() or {}
+    except Exception:
+        return {}
+    out: dict[str, list[str]] = {}
+    for _cat, cat in (rt.get("L3_skills") or {}).items():
+        if not isinstance(cat, dict) or not cat.get("category_enabled", True):
+            continue
+        for sk in cat.get("skills", []) or []:
+            if sk.get("builtin", True) or not sk.get("enabled", True):
+                continue
+            sid = sk.get("id")
+            if sid:
+                out[sid] = list(sk.get("keywords") or [])
+    return out
+
+
 class SkillEngine:
     """Skill 引擎 — 加载、匹配和注入安全检测 Skill"""
 
@@ -47,7 +92,11 @@ class SkillEngine:
         skills_dir: str | Path | None = None,
         agent_ext: "AgentExtensions | None" = None,
     ):
-        self._skills_dir = Path(skills_dir) if skills_dir else DEFAULT_SKILLS_DIR
+        # 仅内置规则模式：忽略配置里的自定义 skills_dir，只用包内 skills/。
+        if is_builtin_only():
+            self._skills_dir = default_skills_dir()
+        else:
+            self._skills_dir = Path(skills_dir) if skills_dir else default_skills_dir()
         self._skills_cache: dict[str, str] = {}
         # agent 专属 builtin safe skills 白名单（追加到通用 TRUSTED_SKILLS）
         self._agent_builtin_safe_skills: set[str] = set()
@@ -56,7 +105,22 @@ class SkillEngine:
         self._load_all_skills()
 
     def _load_all_skills(self) -> None:
-        """加载所有 Skill 文件到缓存"""
+        """加载所有 Skill 文件到缓存。
+
+        cold / builtin 模式：skill 目录只读一次并进程级冻结（不随文件变化热加载）。
+        cold 允许配置里的自定义 skills_dir（作为启动时输入）；builtin 强制包内目录。
+        """
+        if not is_hot_reload_enabled():
+            key = str(self._skills_dir)
+            cache = _FROZEN_SKILLS_CACHE.get(key)
+            if cache is None:
+                cache = {}
+                if self._skills_dir.exists():
+                    for md_file in sorted(self._skills_dir.glob("*.md")):
+                        cache[md_file.stem] = md_file.read_text(encoding="utf-8")
+                _FROZEN_SKILLS_CACHE[key] = cache
+            self._skills_cache = dict(cache)
+            return
         if not self._skills_dir.exists():
             return
         for md_file in sorted(self._skills_dir.glob("*.md")):
@@ -93,9 +157,11 @@ class SkillEngine:
         except Exception:
             pass
 
-        # 计算每个 skill 的相关度
+        # 计算每个 skill 的相关度（内置关键词表 + 用户自定义 skill，后者实时合并）
+        skill_map = dict(SKILL_KEYWORD_MAP)
+        skill_map.update(runtime_custom_skill_keywords())
         scores: dict[str, float] = {}
-        for skill_name, keywords in SKILL_KEYWORD_MAP.items():
+        for skill_name, keywords in skill_map.items():
             if skill_name in disabled_skill_ids:
                 continue
             score = 0.0
@@ -122,7 +188,7 @@ class SkillEngine:
 
         results = []
         for skill_name, score in top_skills:
-            content = self._skills_cache.get(skill_name, "")
+            content = self._skills_cache.get(skill_name) or self._load_user_skill(skill_name)
             if content:
                 results.append(
                     SkillMatch(
@@ -145,6 +211,28 @@ class SkillEngine:
                 )
 
         return results
+
+    def _load_user_skill(self, name: str) -> str:
+        """惰性读用户自定义 skill：``<data_root>/agent_moss_skills/<id>.md``。
+
+        刻意**不**放进启动时的 ``_load_all_skills`` 扫描：控制台新增 skill 是运行中
+        发生的事，只在启动扫一次会导致"刚加的 skill 要重启才生效"，与 console 其余
+        开关的"改完立刻生效"语义不一致。
+
+        cold / builtin 模式：用户自定义 skill 属于运行期用户数据，直接返回空（不读盘）。
+        """
+        if is_runtime_config_disabled():
+            return ""
+        try:
+            from ..infra.paths import get_data_root
+            p = get_data_root() / "agent_moss_skills" / f"{name}.md"
+            if p.is_file():
+                content = p.read_text(encoding="utf-8")
+                self._skills_cache[name] = content   # 缓存，避免每次判定都读盘
+                return content
+        except Exception:
+            pass
+        return ""
 
     def format_skills_for_prompt(self, skills: list[SkillMatch]) -> str:
         """
@@ -179,6 +267,9 @@ class SkillEngine:
         return self._agent_builtin_safe_skills
 
     def reload_skills(self) -> None:
-        """重新加载所有 Skill 文件"""
+        """重新加载所有 Skill 文件。
+
+        cold / builtin 模式下不热加载：保留进程级冻结副本（清空实例缓存后从冻结副本恢复）。
+        """
         self._skills_cache.clear()
         self._load_all_skills()

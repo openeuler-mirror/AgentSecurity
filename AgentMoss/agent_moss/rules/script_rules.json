@@ -1,0 +1,311 @@
+{
+  "_comment": "脚本内容分析的高风险词表（Python script_content_analyzer/script_analyzer ↔ TS script-content-analyzer/script-analyzer 单一事实源）。suspicious_patterns 与 script_exec_patterns 的 flags 是语义标志（i/s/m）；keyword_combination_risks 的 group1/group2 里以 $ 开头的字符串是对 keyword_sets 的引用。script_exec_patterns 分两份是**历史原因**：chain 供递归追踪（识别解释器 + 任意后缀），legacy 只认 .sh（供 L3 提示词用），两者不可互相替换。",
+  "keyword_sets": {
+    "network_post": [
+      "curl POST",
+      "curl --data",
+      "curl -d",
+      "wget --post-data",
+      "wget --post-file"
+    ]
+  },
+  "suspicious_patterns": [
+    {
+      "name": "curl POST",
+      "pattern": "curl\\s+(.*\\s)?-X\\s+POST",
+      "flags": "i"
+    },
+    {
+      "name": "curl --data",
+      "pattern": "curl\\s+(.*\\s)?--data",
+      "flags": "i"
+    },
+    {
+      "name": "curl -d",
+      "pattern": "curl\\s+(.*\\s)?-d\\s",
+      "flags": "i"
+    },
+    {
+      "name": "wget --post-data",
+      "pattern": "wget\\s+(.*\\s)?--post-data",
+      "flags": "i"
+    },
+    {
+      "name": "wget --post-file",
+      "pattern": "wget\\s+(.*\\s)?--post-file",
+      "flags": "i"
+    },
+    {
+      "name": "nc -e",
+      "pattern": "\\bnc\\s+.*-e\\b",
+      "flags": ""
+    },
+    {
+      "name": "ncat -e",
+      "pattern": "\\bncat\\s+.*-e\\b",
+      "flags": ""
+    },
+    {
+      "name": "/dev/tcp",
+      "pattern": "/dev/tcp/",
+      "flags": ""
+    },
+    {
+      "name": "/dev/udp",
+      "pattern": "/dev/udp/",
+      "flags": ""
+    },
+    {
+      "name": "$(base64",
+      "pattern": "\\$\\(\\s*base64",
+      "flags": ""
+    },
+    {
+      "name": "`base64",
+      "pattern": "`\\s*base64",
+      "flags": ""
+    },
+    {
+      "name": "base64 decode pipe",
+      "pattern": "base64\\s+(-d|--decode)\\s*\\|",
+      "flags": ""
+    },
+    {
+      "name": "/etc/shadow",
+      "pattern": "/etc/shadow",
+      "flags": ""
+    },
+    {
+      "name": "id_rsa",
+      "pattern": "\\bid_rsa\\b",
+      "flags": ""
+    },
+    {
+      "name": "id_ed25519",
+      "pattern": "\\bid_ed25519\\b",
+      "flags": ""
+    },
+    {
+      "name": "crontab install",
+      "pattern": "crontab\\s+-",
+      "flags": ""
+    },
+    {
+      "name": "authorized_keys",
+      "pattern": "authorized_keys",
+      "flags": ""
+    },
+    {
+      "name": "ssh no host key check",
+      "pattern": "ssh\\s+.*StrictHostKeyChecking\\s*=\\s*no",
+      "flags": ""
+    }
+  ],
+  "keyword_combination_risks": [
+    {
+      "group1": "$network_post",
+      "group2": [
+        "$(base64",
+        "`base64",
+        "base64 decode pipe"
+      ],
+      "level": "critical",
+      "reason": "检测到网络数据发送 + Base64编码组合，构成 Critical 级别数据外传风险。攻击者可能将敏感数据编码后外传。"
+    },
+    {
+      "group1": "$network_post",
+      "group2": [
+        "/etc/shadow",
+        "id_ed25519",
+        "id_rsa"
+      ],
+      "level": "critical",
+      "reason": "检测到网络数据发送 + 敏感文件访问组合，构成 Critical 级别凭证外传风险。"
+    },
+    {
+      "group1": [
+        "/dev/tcp",
+        "/dev/udp",
+        "nc -e",
+        "ncat -e"
+      ],
+      "group2": [],
+      "level": "high",
+      "reason": "检测到反弹 Shell 特征，攻击者可能建立远程控制通道。"
+    },
+    {
+      "group1": [
+        "authorized_keys",
+        "crontab install",
+        "ssh no host key check"
+      ],
+      "group2": [],
+      "level": "high",
+      "reason": "检测到持久化后门特征，攻击者可能在系统中植入后门。"
+    }
+  ],
+  "single_keyword_risks": {
+    "curl POST": {
+      "level": "high",
+      "reason": "检测到 curl POST 请求，可能向外部服务器发送数据。"
+    },
+    "curl --data": {
+      "level": "high",
+      "reason": "检测到 curl --data 参数，可能向外部服务器发送数据。"
+    },
+    "curl -d": {
+      "level": "high",
+      "reason": "检测到 curl -d 参数，可能向外部服务器发送数据。"
+    },
+    "wget --post-data": {
+      "level": "high",
+      "reason": "检测到 wget POST 请求，可能向外部服务器发送数据。"
+    },
+    "wget --post-file": {
+      "level": "high",
+      "reason": "检测到 wget 文件上传，可能向外部服务器发送文件。"
+    },
+    "nc -e": {
+      "level": "critical",
+      "reason": "检测到 nc -e 反弹 Shell 特征。"
+    },
+    "ncat -e": {
+      "level": "critical",
+      "reason": "检测到 ncat -e 反弹 Shell 特征。"
+    },
+    "/dev/tcp": {
+      "level": "critical",
+      "reason": "检测到 /dev/tcp 反弹 Shell 特征。"
+    },
+    "/dev/udp": {
+      "level": "critical",
+      "reason": "检测到 /dev/udp 反弹 Shell 特征。"
+    },
+    "$(base64": {
+      "level": "high",
+      "reason": "检测到 Base64 编码执行，可能是混淆逃逸。"
+    },
+    "`base64": {
+      "level": "high",
+      "reason": "检测到 Base64 编码执行，可能是混淆逃逸。"
+    },
+    "base64 decode pipe": {
+      "level": "high",
+      "reason": "检测到 Base64 解码后管道执行，可能是混淆逃逸。"
+    },
+    "/etc/shadow": {
+      "level": "critical",
+      "reason": "检测到访问系统密码文件。"
+    },
+    "id_rsa": {
+      "level": "critical",
+      "reason": "检测到访问 SSH 私钥。"
+    },
+    "id_ed25519": {
+      "level": "critical",
+      "reason": "检测到访问 SSH 私钥。"
+    },
+    "crontab install": {
+      "level": "high",
+      "reason": "检测到修改定时任务，可能是持久化后门。"
+    },
+    "authorized_keys": {
+      "level": "high",
+      "reason": "检测到修改 SSH 授权密钥，可能是持久化后门。"
+    },
+    "ssh no host key check": {
+      "level": "high",
+      "reason": "检测到 SSH 跳过主机密钥验证，可能是横向移动。"
+    }
+  },
+  "env_exfil_patterns": [
+    "$env",
+    "$(env)",
+    "$USER",
+    "$(hostname)",
+    "$(pwd)",
+    "$HOME"
+  ],
+  "script_exec_patterns": {
+    "chain": [
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*bash\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*/bin/bash\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*sh\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*zsh\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "\\./(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*source\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*\\.\\s+(\\S+)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*python3?\\s+(\\S+\\.py)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*node\\s+(\\S+\\.js)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*ruby\\s+(\\S+\\.rb)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*perl\\s+(\\S+\\.pl)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*php\\s+(\\S+\\.php)",
+        "flags": "i"
+      },
+      {
+        "pattern": "(?:^|\\s|&&|\\|\\|)\\s*lua\\s+(\\S+\\.lua)",
+        "flags": "i"
+      }
+    ],
+    "legacy": [
+      {
+        "pattern": "bash\\s+(\\S+\\.sh)",
+        "flags": ""
+      },
+      {
+        "pattern": "sh\\s+(\\S+\\.sh)",
+        "flags": ""
+      },
+      {
+        "pattern": "\\./(\\S+\\.sh)",
+        "flags": ""
+      },
+      {
+        "pattern": "source\\s+(\\S+\\.sh)",
+        "flags": ""
+      },
+      {
+        "pattern": "\\.\\s+(\\S+\\.sh)",
+        "flags": ""
+      },
+      {
+        "pattern": "zsh\\s+(\\S+\\.sh)",
+        "flags": ""
+      }
+    ]
+  }
+}

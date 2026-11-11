@@ -37,6 +37,16 @@ class ActionNode:
     resources: set = field(default_factory=set)  # 涉及资源（文件路径/网络目标/工具名）
     integrity: str = "medium"       # 完整性标签（high/medium/low，低处流原则沿 data 边取 min）
     is_low_source: bool = False     # 低完整性源（外取/下载/注入内容）→ 其资源被后续动作继承 low
+    #: 动作真实发生时间（调用方上报的 called_at，ISO 或 "YYYY-MM-DD HH:MM:SS"）。
+    #: 可空 —— 旧调用方 / 旧数据没有这个字段时，依赖时间的性质（P4 提权窗口）
+    #: 退回"不设窗口"的旧行为，不改变判定。
+    timestamp: str | None = None
+    #: 动作来源（哪个 agent 上报的）。**仅用于取证与告警展示，不参与链匹配** ——
+    #: 组合攻击针对的是这台服务器，跨 agent 分步实施同样成立（见 AGENT_MOSS_CHAIN_SCOPE）。
+    agent_id: str = ""
+    #: 来源实例（哪个 agent 安装/实例上报的）。**仅用于展示层脱敏**：
+    #: 同实例的历史节点不隐藏命令原文，跨实例才隐藏。不参与链匹配。
+    instance_id: str = ""
 
 
 @dataclass
@@ -108,6 +118,10 @@ class PropertyViolation:
     reason: str
     risk_level: str = "high"
     path: list = field(default_factory=list)  # [(session_id, seq, action_detail)] 反例路径
+    # 结构化攻击链图（前端可视化用）：
+    # {"nodes": [{session_id, seq, stage, action_detail, resources}],
+    #  "edges": [{from, to, type: "next"|"data", label?}]}
+    graph: dict | None = None
 
 
 @dataclass

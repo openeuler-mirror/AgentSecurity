@@ -18,14 +18,30 @@ if TYPE_CHECKING:
     from ..profiles.base import OSProfile
     from ..agents.base import AgentExtensions
 
+from ..infra.rules_mode import is_builtin_only, is_hot_reload_enabled
+from ..infra.paths import asset_dir
+from ..rules_loader import load_heuristic_rules
 from .types import HeuristicResult
 
 # _is_write_operation 留在 logic_rules.py 作为单一事实源（read_before_write 也用），
 # 此处复用避免读写判定逻辑漂移。
 from .logic_rules import _is_write_operation, _SensitivePathMatcher, _is_directory_delete_action, _is_archive_read_of_dir, _is_ssh_keygen_generate
+from .logic_rules import has_exec_bypass_chain, ALL_QUOTES_RE
+# 引号感知命令段切分同样下沉 logic_rules（NEW-FN-M 起含单管道切分），单一事实源：
+from .logic_rules import _SEPARATOR_SEGMENTS, _split_shell_segments
 
-# 默认用户规则文件路径
-DEFAULT_RULES_PATH = Path(__file__).parent.parent / "rules" / "user_rules.json"
+# 默认用户规则文件路径（随包内置；builtin 模式下唯一允许读取的 user_rules.json）
+# 用户自定义规则文件（随规则目录走）。函数而非常量：AGENT_MOSS_RULES_ROOT 改了立即生效。
+def default_rules_path() -> Path:
+    return asset_dir("rules") / "user_rules.json"
+
+
+#: 兼容旧引用名（模块导入时求值；内部调用请用 default_rules_path()）
+DEFAULT_RULES_PATH = default_rules_path()
+
+#: cold / builtin 模式下的进程级 user_rules.json 冻结副本（按路径区分）。
+#: UserRuleMatcher 每次 analyze 新建，若每次重读文件，同用户改包内文件仍会热生效。
+_FROZEN_USER_RULES_CACHE: dict[str, dict] = {}
 
 # ==================== 风险等级优先级映射 ====================
 _RISK_PRIORITY = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -57,22 +73,29 @@ def _merge_heuristic_hit(cur: HeuristicResult, new: HeuristicResult) -> Heuristi
 # 从 logic_rules.py 搬入。逻辑原样保留，返回类型从 LogicRuleResult 改为
 # HeuristicResult（携带 is_credential / violated_rule），保证三层分析效果一致。
 
+# 小型名单：单一事实源 rules/heuristic_rules.json（与 TS heuristic.ts 共用）。
+_HEURISTIC_RULES = load_heuristic_rules()
+
 # sensitive_path 排除的非文件工具前缀（避免 memory-searchMemory 等误报）
-_SENSITIVE_EXCLUDED_PREFIXES = ("memory-", "skill-", "skill-manager-", "mailbox-", "app-")
+_SENSITIVE_EXCLUDED_PREFIXES: tuple[str, ...] = tuple(
+    _HEURISTIC_RULES.get("sensitive_excluded_prefixes") or ()
+)
 
 # 搜索/查询类工具前缀：其 action_detail 是「查询数据」（如 query=...），不是指令。
 # 注入关键词检测应只针对指令性文本（用户 prompt / reason / 命令），
 # 否则搜索 "jailbreak"、"bypass" 等资料会被 L1 注入检测误判为注入攻击（prompt injection 误报）。
-# 与 TS 端 ts/src/engine/heuristic.ts 的 SEARCH_ACTION_PREFIXES 保持一致。
-_SEARCH_ACTION_PREFIXES = ("search-", "web-", "browser-", "query-", "websearch", "web_search")
+_SEARCH_ACTION_PREFIXES: tuple[str, ...] = tuple(
+    _HEURISTIC_RULES.get("search_action_prefixes") or ()
+)
+_SEARCH_ACTION_EXACT: tuple[str, ...] = tuple(
+    _HEURISTIC_RULES.get("search_action_exact") or ()
+)
 
 
 def _is_search_action_type(action_type: str) -> bool:
     """判断是否为搜索/查询类工具（action_detail 是数据载荷，非指令）。"""
     at = action_type.lower()
-    return any(at.startswith(p) for p in _SEARCH_ACTION_PREFIXES) or at in (
-        "websearch", "web_search", "search", "query"
-    )
+    return any(at.startswith(p) for p in _SEARCH_ACTION_PREFIXES) or at in _SEARCH_ACTION_EXACT
 
 
 class SensitivePathChecker:
@@ -99,10 +122,14 @@ class SensitivePathChecker:
         """
         base_paths: list = self._profile.sensitive_paths
         try:
-            from ..infra.runtime_config import has_runtime_config, get_enabled_l2_sensitive_paths_or_default, load_runtime_config
-            if has_runtime_config():
-                enabled = get_enabled_l2_sensitive_paths_or_default(load_runtime_config())
-                if enabled:
+            from ..infra.runtime_config import get_enabled_l2_sensitive_paths_or_default, load_runtime_config
+            # 传入当前 profile 的 os_type：runtime config 覆盖按平台隔离，
+            # 该平台无条目时回退到该平台 profile 默认（Windows 部署的关键路径）。
+            enabled = get_enabled_l2_sensitive_paths_or_default(
+                load_runtime_config(),
+                getattr(self._profile, "os_type", ""),
+            )
+            if enabled:
                     from ..profiles.base import SensitivePath
                     # NEW-FP-1: runtime overlay 是用户 stdout 保存的旧数据，.ssh/.aws 目录级
                     # 条目没有 dir_del_only 标记（dir_del_only 是本次新增语义字段）。若仅按
@@ -140,7 +167,7 @@ class SensitivePathChecker:
             return HeuristicResult(hit=False)
 
         # 检测操作类型：读/写/其他（统一用 _is_write_operation，与 read_before_write 对齐）
-        is_write_op = _is_write_operation(action_type, action_detail, self._profile.write_keywords)
+        is_write_op = _is_write_operation(action_type, action_detail, self._profile.write_keywords, self._profile)
 
         # ssh-keygen 生成模式豁免：-t <type> 生成新私钥时 -f 是写目标（输出），
         # 不读取任何已有私钥内容，不应命中 deny_both 的「读私钥」拦截（误报卡死初始化）。
@@ -152,7 +179,22 @@ class SensitivePathChecker:
         # 引号内真实路径参数仍匹配。引号外的重定向（echo "x" > /etc/passwd）在
         # 剥离后保留，仍被路径匹配。
         # NORM-PATH: 再折叠路径混淆段（//、/./），堵 CVE-2023-37274 路径穿越变体。
-        path_scan_text = _normalize_path_segments(_strip_literal_text_segments(action_detail))
+        # 变体清单见 _path_scan_variants（含「连引号一起折叠」那份，堵
+        # `cat "/etc//shadow"` 这类加个引号就绕过的形态）。
+        path_scan_texts = _path_scan_variants(action_detail)
+
+        # WIN-SEP: Windows 下追加「分隔符归一化」变体（/ → \）。
+        # Windows 的敏感路径规则按反斜杠书写（.aws\credentials、C:\Windows\...），
+        # 而 agent 常写正斜杠（cat ~/.aws/credentials、type C:/Windows/...）——
+        # 只匹配原文会整条漏掉。**不能直接替换原文**：Win 命令行标志（net user /add、
+        # bitsadmin /transfer）与 URL（https://）里的 / 是有语义的，替换会破坏命令规则。
+        # 故保留原文、追加变体，任一命中即算命中。
+        if getattr(self._profile, "os_type", "") == "windows":
+            path_scan_texts += [t.replace("/", "\\") for t in path_scan_texts]
+
+        def _path_search(pattern: str) -> bool:
+            """任一扫描变体命中即算命中。"""
+            return any(re.search(pattern, t) for t in path_scan_texts)
 
         for sp in self._get_sensitive_paths():
             raw_path = sp.path
@@ -179,14 +221,16 @@ class SensitivePathChecker:
                 # 对齐 TS ROOT_SENSITIVE_PATHS）用 _SensitivePathMatcher 复刻 TS
                 # pathMatches 分段逻辑；裸路径（无内联块）仍走原 pub_excl 追加。
                 if "(" in path and "?" in path:
-                    path_match = _SensitivePathMatcher.match(path, path_scan_text)
+                    path_match = any(
+                        _SensitivePathMatcher.match(path, t) for t in path_scan_texts
+                    )
                 else:
                     escaped = re.escape(path)
                     pub_excl = r"(?!\.pub)" if not path.endswith(".pub") else r""
                     if path.startswith(".") or path.startswith("/"):
-                        path_match = bool(re.search(rf"(?:^|[\s/\\'\"]){escaped}{pub_excl}\b", path_scan_text))
+                        path_match = _path_search(rf"(?:^|[\s/\\'\"]){escaped}{pub_excl}\b")
                     else:
-                        path_match = bool(re.search(rf"\b{escaped}{pub_excl}\b", path_scan_text))
+                        path_match = _path_search(rf"\b{escaped}{pub_excl}\b")
             else:
                 if getattr(sp, "dir_del_only", False):
                     # NEW-FP-1 审核：目录级条目（.ssh/.aws）在下面非 deny_both 分支原本用
@@ -195,24 +239,24 @@ class SensitivePathChecker:
                     # 前导 (?:^|[\s/\\'\"]) + 尾随 (?:/|[\s'\"\\]|$)——目录名后只接受
                     # 路径分隔符或空白/引号/行尾，不接受继续拼字符（.ssh.bak 的 . 不是边界）
                     # dbak'、~/.ssh_backup、~/.ssh-hist 等拼写变体也放行。
-                    path_match = bool(
-                        re.search(
-                            rf"(?:^|[\s/\\'\"]){re.escape(path)}(?:/|[\s'\"\\]|$)",
-                            path_scan_text,
-                        )
+                    path_match = _path_search(
+                        rf"(?:^|[\s/\\'\"]){re.escape(path)}(?:/|[\s'\"\\]|$)"
                     )
                 else:
-                    path_match = path in path_scan_text
+                    path_match = any(path in t for t in path_scan_texts)
 
             if not path_match and raw_path.startswith("~"):
                 expanded = os.path.expanduser(raw_path)
-                if expanded.lower() in path_scan_text:
+                if any(expanded.lower() in t for t in path_scan_texts):
                     path_match = True
                 else:
                     home_dir = str(Path.home())
                     if expanded.startswith(home_dir):
                         rel_path = expanded[len(home_dir):]
-                        if rel_path.lower() in path_scan_text or expanded.lower() in path_scan_text:
+                        if any(
+                            rel_path.lower() in t or expanded.lower() in t
+                            for t in path_scan_texts
+                        ):
                             path_match = True
 
             if path_match:
@@ -222,6 +266,14 @@ class SensitivePathChecker:
                     continue
                 # 凭据文件：无论读写都拦截（读凭据文件同样危险）
                 if deny_mode == "deny_both":
+                    # chmod 收权豁免（NEW-FP 2026-09）：chmod 600/700/644 等是对敏感文件的
+                    # 权限加固（收权），不是读写内容，不应命中 deny_both 的「访问私钥」。
+                    # 判据 = other 位无写权限（bit 2 未置位）→ 收权/加固；
+                    # other 位有写权限（777/666/707/1777）→ 权限敞开，仍拦截。
+                    # 注意：仅对 deny_both（凭据文件）生效，不适用于 deny_write（系统文件）
+                    # 的 chmod 改权限——后者仍按原有 deny_write 逻辑拦截。
+                    if _is_chmod_tightening(action_detail):
+                        continue
                     return HeuristicResult(
                         hit=True,
                         matched_patterns=[sp.path],
@@ -322,7 +374,7 @@ class DangerousPatternChecker:
         # 的临时目录（相对路径），旧豁免只认绝对 /tmp 等 4 个，相对 var/tmp/* 漏过 →
         # 通配符+删除误报。相对 var/tmp（无前导 /）也是标准临时目录名，一并豁免。
         _scan = _strip_heredoc_content(action_detail)
-        _TEMP_DIRS = ("/tmp", "/var/tmp", "/run", "/dev/shm")
+        _TEMP_DIRS = _HEURISTIC_TEMP_DIRS
         # NEW-FP-2 审核：相对 var/tmp（无前导 /）& 深层绝对路径（/opt/app/var/tmp）——
         # 裸露的 (?:^|[\s/])td(?:[\s/]|$) 会把「以 var/tmp 结尾的深层子路径」误当临时目录
         # 豁免（rm -rf /opt/app/var/tmp/* 是删业务数据却被放行 = 漏拦）。相对 var/tmp
@@ -609,14 +661,103 @@ class LateralMovementChecker:
         )
 
 
+#: 回环 URL host 提取（M20）：http(s):// 后到首个分隔符
+_LOOPBACK_URL_RE = re.compile(r"https?://([^/\s;'\"|&)]+)", re.IGNORECASE)
+_LOOPBACK_HOSTS: tuple[str, ...] = tuple(_HEURISTIC_RULES.get("loopback_hosts") or ())
+_HEURISTIC_TEMP_DIRS: tuple[str, ...] = tuple(_HEURISTIC_RULES.get("temp_dirs") or ())
+
+
+def _all_urls_loopback(action_detail: str) -> bool:
+    """命令中的所有 http(s) URL 是否均为回环地址（M20，对齐 A17 内置规则的豁免口径）。
+
+    A17（curl -X POST 到外部地址）早已豁免 127.*/localhost/[::1]，但用户敏感动作
+    规则层未同步——agent 与本机服务（审计 API/本地 LLM/本地 DB）的合法回环通信
+    被用户规则误拦（M20：curl -X POST http://127.0.0.1:9090/... 命中 curl * -d *）。
+    含非回环 URL 或无 URL → False（不豁免）。
+    """
+    hosts = _LOOPBACK_URL_RE.findall(action_detail)
+    if not hosts:
+        return False
+    for h in hosts:
+        host = h.rsplit("@", 1)[-1].split(":", 1)[0].strip("[]").lower()
+        if host in _LOOPBACK_HOSTS or host.startswith("127."):
+            continue
+        return False
+    return True
+
+
+def _strip_echo_params_for_user_rules(action_detail: str) -> str:
+    """M19：echo/printf 段的参数（含无引号的叙述文本）是输出文本非命令。
+
+    `echo下面用curl localhost POST 提交数据` 是一句描述性中文——curl 在 echo 的
+    参数位置（字面量），用户规则 `curl * POST *` 全文搜索把它当真命令命中 → 误拦。
+    只供用户规则匹配使用（L1 危险命令扫描的 echo 剥离走 _strip_literal_text_segments，
+    两层口径独立——此处剥参数本体，保留首词与重定向/管道结构）。
+    """
+    out = []
+    for seg in _split_shell_segments(action_detail):
+        # \b 词边界识别 echo/printf 首词——`echo下面用curl...`（中文无空格粘连）
+        # 的首词 token 是整串粘连文本，split()[0] 识别不了，必须用 \b
+        # 不用 \b：Unicode 模式下中文算 \w，「echo下面」的 o|下 之间不是边界。
+        # (?![a-zA-Z0-9_]) 只排除 ASCII 词字符——echox 不剥、echo下面 剥。
+        m = re.match(r"^(echo|printf)(?![a-zA-Z0-9_])\s*", seg, re.IGNORECASE)
+        if m:
+            head = m.group(1).lower()
+            rest = seg[m.end():]
+            # 分离重定向/管道：参数区 = 到第一个 > 或 | 之前（重定向目标保留）
+            cut = re.search(r">+|\|", rest)
+            out.append(f"{head} " + (rest[cut.start():] if cut else ""))
+        else:
+            out.append(seg)
+    return " ".join(out)
+
+
+def _user_rule_regex_variants(pattern: str) -> list[str]:
+    """M05：`curl * -d *` 生成参数前置变体 `curl -d *`。
+
+    通配规则按 re.escape 语义是**顺序敏感**的——`curl * -d *` 要求 curl 与 -d
+    之间有内容，`curl -d 'x=1' http://...`（-d 在首位）失配 → 用户规则被参数
+    顺序绕过（M05）。变体生成：首 token + `*` + 字面 token（curl * -d ...）
+    → 把字面 token 提前、`*` 挪到尾部。只做一阶交换，控制误报面。
+    """
+    tokens = pattern.split()
+    if len(tokens) >= 3 and tokens[1] == "*" and tokens[2] != "*":
+        lead = tokens[0]
+        rest = tokens[2:]
+        variant = " ".join([lead] + rest)
+        if not variant.endswith("*"):
+            variant += " *"
+        escaped = re.escape(variant).replace(r"\*", ".*")
+        return [escaped]
+    return []
+
+
 class UserRuleMatcher:
     """子检测器：用户自定义敏感动作/工具规则匹配"""
 
     def __init__(self, rules_path: str | Path | None = None):
+        # builtin：忽略配置里的自定义 rules_path，只用包内 user_rules.json；
+        # cold：允许 rules_path 作为启动时输入，首次加载后冻结。
+        if is_builtin_only():
+            rules_path = None
         self._rules = self._load(rules_path)
 
     @staticmethod
     def _load(rules_path: str | Path | None) -> dict:
+        if not is_hot_reload_enabled():
+            # cold / builtin：只读一次并进程级冻结（不随文件 mtime 热加载）。
+            path = Path(rules_path) if rules_path else default_rules_path()
+            key = str(path)
+            cached = _FROZEN_USER_RULES_CACHE.get(key)
+            if cached is not None:
+                return cached
+            if not path.exists():
+                data: dict = {"sensitive_actions": [], "sensitive_tools": []}
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            _FROZEN_USER_RULES_CACHE[key] = data
+            return data
         path = Path(rules_path) if rules_path else DEFAULT_RULES_PATH
         if not path.exists():
             return {"sensitive_actions": [], "sensitive_tools": []}
@@ -624,6 +765,12 @@ class UserRuleMatcher:
             return json.load(f)
 
     def check(self, action_type: str, action_detail: str) -> HeuristicResult:
+        # M19/M20 前置：bash 类命令剥 echo/printf 参数（叙述文本非命令）。
+        # 注入词检测用原文（载荷语义），此处只服务用户敏感动作规则的命令位锚定。
+        is_bash_like = action_type.lower() in ("bash", "executebash", "terminal-executebash")
+        # M20：所有 URL 均为回环 → 跳过敏感动作规则（对齐 A17 的回环豁免口径）
+        urls_all_loopback = _all_urls_loopback(action_detail)
+        scan_detail = _strip_echo_params_for_user_rules(action_detail) if is_bash_like else action_detail
         # 通配符匹配敏感动作
         for rule in self._rules.get("sensitive_actions", []):
             pattern = rule.get("pattern", "").lower()
@@ -631,7 +778,16 @@ class UserRuleMatcher:
             if not pattern:
                 continue
             regex = re.escape(pattern).replace(r"\*", ".*")
-            if re.search(regex, action_detail) or re.search(regex, action_type):
+            hit = re.search(regex, scan_detail) or re.search(regex, action_type)
+            # M05：参数前置变体（curl -d 首位形态）
+            if not hit:
+                for vr in _user_rule_regex_variants(pattern):
+                    if re.search(vr, scan_detail) or re.search(vr, action_type):
+                        hit = True
+                        break
+            if hit:
+                if urls_all_loopback:
+                    continue  # M20：回环通信豁免（对齐 A17）
                 return HeuristicResult(
                     hit=True,
                     matched_patterns=[pattern],
@@ -654,6 +810,28 @@ class UserRuleMatcher:
         return HeuristicResult(hit=False)
 
 
+def _is_chmod_tightening(action_detail: str) -> bool:
+    """判断 chmod 命令是否是「权限加固」（收权）而非「权限敞开」。
+
+    判据：chmod 的数字权限串（3-4 位八进制），other 位（末位）**无写权限**
+    （bit 2 未置位，即末位为 0/1/4/5）→ 收权/加固，安全；
+    other 位**有写权限**（末位为 2/3/6/7，如 777/666/707/1777）→ 权限敞开，危险。
+
+    setuid/setgid/sticky 组合位（chmod u+s、chmod 4755 等）不在此豁免——
+    它们由 chmod 危险权限规则单独管理（收权 vs 提权是两回事）。
+    非 chmod 命令、或非数字权限形态（chmod +x 等）→ 返回 False（不豁免）。
+
+    动机（NEW-FP 2026-09）：chmod 600 ~/.ssh/id_rsa 是对私钥的权限加固，
+    此前被敏感路径表 deny_both 误当「访问私钥」拦截，卡死正常安全配置。
+    """
+    m = re.search(r"\bchmod\s+(?:-\S+\s+)*([0-7]{3,4})\b", action_detail, re.IGNORECASE)
+    if not m:
+        return False
+    val = int(m.group(1)[-1])
+    # other 位无写权限（bit 2 未置位）→ 收权
+    return (val & 2) == 0
+
+
 def _strip_heredoc_content(action_detail: str) -> str:
     """剥离 heredoc 文档字面量内容（<<EOF ... EOF）。
 
@@ -671,6 +849,94 @@ def _strip_heredoc_content(action_detail: str) -> str:
         action_detail,
         flags=re.DOTALL | re.MULTILINE,
     )
+
+
+#: python 内联代码中的执行/IO/列举/敏感调用 —— 出现任意一个即认定 -c 代码不是纯输出，
+#: 保留原文（真实威胁不漏，M07a 特征依赖此项不剥离）
+_PY_EXEC_IO_RE = re.compile(
+    r"os\.system|os\.popen|subprocess|eval\s*\(|exec\s*\(|__import__|open\s*\(|"
+    r"socket|urllib|requests\.|shutil|os\.(?:remove|unlink|rename|makedirs?|listdir|"
+    r"scandir|walk|chmod|chown|kill|environ)|iterdir|glob\s*\(|path\(",
+    re.IGNORECASE,
+)
+#: 纯输出调用（print / stdout.write）
+_PY_PRINT_RE = re.compile(r"\b(?:print|sys\.stdout\.write)\s*\(")
+#: 大数字字面量（资源消耗形态，M07b 特征面 —— 含大数字的代码一律不剥）
+_PY_BIGNUM_RE = re.compile(r"\d{6,}")
+#: 内联解释器 -c 参数（含外层引号，非贪婪取到同引号；含转义引号/反斜杠的复杂代码不剥）
+# 外层引号分支：双引号内可含单引号（print('x')），单引号内可含双引号
+_PY_INLINE_C_RE = re.compile(
+    r"(python(?:3(?:\.\d+)?)?|perl5?|ruby|node|php|lua)\s+(?:-[a-zA-Z]+\s+)*-c\s+(?:\"([^\"]*)\"|'([^']*)')",
+    re.IGNORECASE,
+)
+#: 命令替换包裹的 python -c（$(python3 -c '...')）——M21：纯输出时整个 $() 降级为
+#: $(<<pylit>>)，否则 A51 命令替换执行器列表（含 python3）恒命中良性 print 形态
+_PY_CMD_SUBST_C_RE = re.compile(
+    r"\$\(\s*(python(?:3(?:\.\d+)?)?|perl5?|ruby|node|php|lua)\s+(?:-[a-zA-Z]+\s+)*-c\s+(?:\"([^\"]*)\"|'([^']*)')\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_print_code(code: str) -> bool:
+    """-c 代码是否为「纯输出」：只做 print/stdout.write 输出与字面量/算术运算。
+
+    含执行/IO/列举调用（os.system/open/socket/iterdir/...）→ False（真实威胁，
+    保留拦截面）；含大数字字面量 → False（资源消耗形态，M07b）；含反斜杠
+    （引号嵌套复杂形态）→ False（保守不剥，宁误报不漏报）。
+    """
+    if "\\" in code:
+        return False
+    if _PY_EXEC_IO_RE.search(code) or _PY_BIGNUM_RE.search(code):
+        return False
+    # print/stdout.write 输出 → 纯；完全无调用的赋值/算术（x=1+2）→ 也是纯字面量
+    return bool(_PY_PRINT_RE.search(code)) or not re.search(r"\w+\s*\(", code)
+
+
+def _strip_inline_python_literals(text: str) -> str:
+    """NEW-FP-Q（M18/M21）：python -c 纯输出代码的字面量剥离。
+
+    `python3 -c "print('chmod 777 /tmp/x')"` 的 'chmod 777 ...' 是 print 的
+    字符串参数 = 被打印的字面量，不是真实命令；危险命令扫描对 -c 代码全文
+    re.search 把它当真 → critical 短路误拦安全测试/示例代码类任务（M18）。
+    `echo $(python3 -c 'print(1)')` 同理被 A51 命令替换执行器列表命中（M21）。
+
+    处理（只对纯输出代码）：
+    - 命令替换内（$(python3 -c '...')）→ 整个 $() 替换为 $(<<pylit>>)
+      ——否则 A51 的 $( 后跟 python3 仍命中；
+    - 裸 python -c '...' → -c 参数替换为 '<<pylit>>'（保留骨架）。
+    非「纯输出」代码（os.system/open/iterdir/大数字等）原样保留。
+    """
+    def _code_of(m):
+        return m.group(2) if m.group(2) is not None else m.group(3)
+
+    def _subst_repl(m):
+        if not _is_pure_print_code(_code_of(m)):
+            return m.group(0)
+        return "$(<<pylit>>)"
+
+    def _c_repl(m):
+        if not _is_pure_print_code(_code_of(m)):
+            return m.group(0)
+        q = '"' if m.group(0).rstrip().endswith('"') else "'"
+        return f"{m.group(1)} -c {q}<<pylit>>{q}"
+
+    out = _PY_CMD_SUBST_C_RE.sub(_subst_repl, text)
+    out = _PY_INLINE_C_RE.sub(_c_repl, out)
+    return out
+
+
+#: NEW-FP-R（2026-11，xiaoO 实测误报）：非交互式密码修改家族的真实语义要求
+#: 「管道/命令词出现在引号外」——`grep -E "password|passwd|secret" f` 的模式串
+#: 里 `|passwd` 是正则或关系，却被 `\\|\\s*passwd\\b` 误当"管道喂密码给 passwd"。
+#: 守卫：原始命中后，若剥离全部引号内容就不再命中 → 丢弃该模式命中。
+#: 绕过链（has_exec_bypass_chain）不适用此守卫（引号内载荷会被执行）。
+QUOTED_SAFE_PASSWORD_PATTERNS = frozenset(
+    {
+        r"\|\s*passwd\b",
+        r"\bpasswd\s+--stdin\b",
+        r"\bchpasswd\b",
+    }
+)
 
 
 def _strip_literal_text_segments(action_detail: str) -> str:
@@ -699,17 +965,22 @@ def _strip_literal_text_segments(action_detail: str) -> str:
     - inline-09: echo "cat /etc/shadow" > /tmp/x.sh && bash /tmp/x.sh（写脚本+执行）
     - inline-10: printf 'cat /etc/shadow' | bash（管道喂给解释器）
     """
-    # 旁路：含"写脚本 + 后续执行"或"管道喂解释器"绕过链时整条不剥离
-    _exec_after = r"&&|\|\||;|\n|\|"
-    if (re.search(r">\s*[/~]\S*\.(sh|py|pl|rb)\b", action_detail) and
-        re.search(rf"(?:{_exec_after})\s*(?:bash|sh|zsh|dash|python|perl|ruby|node)", action_detail)) or \
-       re.search(r"\|\s*(?:bash|sh|zsh|dash|python|perl|ruby|node)\b", action_detail):
+    # 旁路：含"写脚本 + 后续执行"或"管道喂解释器/持久化消费者"绕过链时整条不剥离。
+    # crontab/at 是"持久化消费者"：`echo '<schedule> <命令>' | crontab -` 里的内容会被
+    # 写入定时任务**稍后执行**，等价于喂给解释器——剥离会把载荷当文本丢弃，导致
+    # `@reboot /tmp/x.sh`、`wget ... && bash ...` 这类 cron 后门整体漏拦（2026-09 修复）。
+    if has_exec_bypass_chain(action_detail):
         return action_detail
     # 按命令分隔符分段，但跳过引号内的分隔符（echo "a; b" 的 ; 在引号内不分段）
     result_parts: list[str] = []
     for seg in _split_command_segments(action_detail):
-        fw = seg.strip().split()[0].lower() if seg.strip().split() else ""
+        words = seg.strip().split()
+        fw = words[0].lower() if words else ""
         if fw in ("echo", "printf"):
+            # NEW-FP-Q（M21）：先剥 $() 内 python -c 纯输出（echo $(python3 -c 'print(1)')），
+            # 否则下面的引号剥离只剥掉代码引号、$(python3 -c ) 骨架残留仍被 A51 命中；
+            # 非纯输出（os.system 等）原样保留，A51 照常拦真威胁。
+            seg = _strip_inline_python_literals(seg)
             # 先摘重定向目标的引号路径为裸路径（保留真实写目标），再剥剩余引号内容
             seg_unquoted_redirect = re.sub(
                 r">{1,2}\s*(['\"])([~./][^'\"]+)\1",
@@ -718,11 +989,86 @@ def _strip_literal_text_segments(action_detail: str) -> str:
             )
             result_parts.append(re.sub(r"'[^']*'|\"[^\"]*\"", "", seg_unquoted_redirect))
         else:
-            result_parts.append(seg)
+            # NEW-FP-Q（M18/M21）：python -c 纯输出代码的字面量剥离（print 参数
+            # 不是真实命令；$(python3 -c 'print(1)') 不算命令替换执行）。
+            result_parts.append(_strip_inline_python_literals(seg))
     return "".join(result_parts)
 
 
-def _normalize_path_segments(text: str) -> str:
+def _normalize_shell_obfuscation(text: str) -> str:
+    """折叠**语义确定**的 shell 混淆形态（对齐 TS 同名实现）。
+
+    只做"读命令的人一定能算出结果"的等价变换，**不做需要执行才能确定的求值**：
+
+    - **空引号拼接** `r""m -rf /` / `r''m -rf /` → `rm -rf /`
+      bash 把空引号当不存在，等价。只折叠**夹在词字符之间**的空引号
+      （`(?<=\\w)(?:''|"") (?=\\w)` 形态），避免动到 `a="" b` 这类赋值语句，
+      把误报面压到最小。
+    - **$IFS 展开** `rm$IFS-rf$IFS/` → `rm -rf /`
+      默认 IFS 就是空白（空格/制表/换行），是最常见的混淆写法。
+
+    ⚠️ 不处理 `$(echo rm)` / 反引号 / base64 —— 那些需要**执行**才能知道结果，
+    静态无法确定，强行猜会带来误报。`_normalize_path_segments` 负责路径混淆
+    （`//`、`/./`），两者互补。
+    """
+    t = re.sub(r"(?<=\w)(?:''|\"\")(?=\w)", "", text)
+    # ⚠️ 大小写不敏感：analyze() 会把命令小写化，$IFS 到这时已经是 $ifs。
+    t = re.sub(r"\$\{IFS\}|\$IFS", " ", t, flags=re.IGNORECASE)
+    return t
+
+def _path_scan_variants(action_detail_lower: str) -> list[str]:
+    """敏感路径检查用的扫描文本变体（原文 + 深度归一化）。
+
+    为什么需要一个**额外**变体，而不是直接改归一化本身：默认归一化刻意跳过引号内
+    内容（`grep "a//b"` 的引号内是搜索模式，不是路径），这个取舍对危险命令扫描是
+    对的，但对敏感路径检查会开一个口子 —— 引号内恰恰是真实路径参数：
+
+        cat  /etc//shadow   → Deny
+        cat "/etc//shadow"  → Allow   ← 只因为加了引号
+        cat "~/.ssh//id_rsa" → Allow  ← 私钥
+
+    所以敏感路径额外扫一份 `fold_quotes=True` 的变体（原文照扫，命中即命中），
+    纯增量、不改动其它规则看到的文本。
+
+    `echo "/etc//shadow"` 这类字面量不受影响：L1 会先用
+    `_strip_literal_text_segments` 把 echo/printf 段的引号内容整段剥掉，
+    剥完连路径都不剩，再加变体也匹配不到。
+    """
+    base = _strip_literal_text_segments(action_detail_lower)
+    deep = _normalize_path_segments(base, fold_quotes=True)
+    variants = [base]
+    if deep != base:
+        variants.append(deep)
+    return variants
+
+
+_PATH_QUOTE_TOKEN_RE = re.compile(r"__Q([0-9]+)__")
+_PATH_PROTOCOL_TOKEN_RE = re.compile(r"__PROT([0-9]+)__")
+
+#: 占位令牌批量还原阈值：少于该值逐个 str.replace 更快（C 实现，无正则引擎
+#: 与回调开销），达到该值一次 re.sub 更快（避免每个编号都重新扫描全文）。
+#: 实测交叉点约 8 个令牌（随文本长度浮动，取偏保守值）。
+_PATH_RESTORE_BATCH_MIN_TOKENS = 8
+
+
+def _restore_path_tokens(
+    text: str, tokens: list[str], prefix: str, token_re: re.Pattern[str]
+) -> str:
+    """还原路径归一化占位令牌，按令牌数选择更快的还原策略。
+
+    少量令牌时批量正则反而比逐个 replace 慢（少量令牌 + 含 `//` 的输入
+    实测回退 1.4~1.75 倍），因此只在令牌较多时走批量正则。
+    """
+    if not tokens:
+        return text
+    if len(tokens) < _PATH_RESTORE_BATCH_MIN_TOKENS:
+        for i, token in enumerate(tokens):
+            text = text.replace(f"__{prefix}{i}__", token)
+        return text
+    return token_re.sub(lambda m: tokens[int(m.group(1))], text)
+
+
+def _normalize_path_segments(text: str, fold_quotes: bool = False) -> str:
     """NORM-PATH: 折叠路径混淆段，堵路径穿越变体（对齐 CVE-2023-37274 攻击面）。
 
     敏感路径/危险命令匹配前，把「路径混淆」归一回真实路径，避免子串/正则漏检：
@@ -736,30 +1082,50 @@ def _normalize_path_segments(text: str) -> str:
     约束（must not break）：
     1. 跳过协议 URL 的 `//`（`curl http://x` 的 `http://` 是协议分隔，折叠成
        `http:/x` 会破坏 curl 下载/管道检测）。
-    2. 跳过引号内字面量（`grep "a//b"` 引号内是搜索模式非路径；echo/printf 字面量
-       已由 _strip_literal_text_segments 先剥掉，此处兜底非 echo 段的引号）。
+    2. 默认跳过引号内内容（`grep "a//b"` 引号内是搜索模式非路径）。
+
+    Args:
+        fold_quotes: 连引号内内容一起折叠。敏感路径检查用（引号内是真实路径参数，
+            `cat "/etc//shadow"` 应同判 Deny），见 `_path_scan_variants`。
     """
+    # 原文中的 Q/PROT 可能与生成标记的边界拼出额外标记（如 'a' 'b'Q0'c'）。
+    # 保守地保留旧还原顺序；仅检查完整的 __Q/__PROT 前缀并不足够。
+    needs_legacy_restore = "Q" in text or "PROT" in text
+    if not needs_legacy_restore and "//" not in text and "/./" not in text:
+        return text
+
     # 1. 保护协议 URL 的 //（用不含 / 的令牌占位，避免被 /{2,} 折叠）
     prot_tokens: list[str] = []
     def _stash_prot(m: re.Match[str]) -> str:
         prot_tokens.append("://")
         return f"{m.group(1)}__PROT{len(prot_tokens) - 1}__"
     text = re.sub(r"\b(https?|ftp|file)://", _stash_prot, text, flags=re.IGNORECASE)
-    # 2. 保护引号内内容（非路径字面量不折叠）
+    # 2. 保护引号内内容（非路径字面量不折叠）—— fold_quotes 时跳过本步
     quote_tokens: list[str] = []
-    def _stash_quote(m: re.Match[str]) -> str:
-        quote_tokens.append(m.group(0))
-        return f"__Q{len(quote_tokens) - 1}__"
-    text = re.sub(r"'[^']*'|\"[^\"]*\"", _stash_quote, text)
-    # 3. 折叠引号外 + 非 URL 的连续斜杠与单点段
+    if not fold_quotes:
+        def _stash_quote(m: re.Match[str]) -> str:
+            quote_tokens.append(m.group(0))
+            return f"__Q{len(quote_tokens) - 1}__"
+        text = re.sub(r"'[^']*'|\"[^\"]*\"", _stash_quote, text)
+    # 3. 折叠非 URL 的连续斜杠与单点段
     text = re.sub(r"/{2,}", "/", text)
     text = re.sub(r"/\./", "/", text)
-    # 4. 还原引号与协议
-    for i, q in enumerate(quote_tokens):
-        text = text.replace(f"__Q{i}__", q)
-    for i, p in enumerate(prot_tokens):
-        text = text.replace(f"__PROT{i}__", p)
+    # 4. 原文存在编号冲突时，保留逐次替换的兼容行为。
+    if needs_legacy_restore:
+        for i, quote in enumerate(quote_tokens):
+            text = text.replace(f"__Q{i}__", quote)
+        for i, protocol in enumerate(prot_tokens):
+            text = text.replace(f"__PROT{i}__", protocol)
+        return text
+
+    # 普通输入按令牌数择优还原：少量逐个 replace、大量批量正则（避免每个编号
+    # 都重新搜索全文）。引号内容可能含协议编号，因此必须先还原引号，再还原协议。
+    text = _restore_path_tokens(text, quote_tokens, "Q", _PATH_QUOTE_TOKEN_RE)
+    text = _restore_path_tokens(text, prot_tokens, "PROT", _PATH_PROTOCOL_TOKEN_RE)
     return text
+
+
+_COMMAND_SEGMENT_TOKEN_RE = re.compile(r"['\";\n]|&&|\|\|")
 
 
 def _split_command_segments(action_detail: str) -> list[str]:
@@ -769,45 +1135,21 @@ def _split_command_segments(action_detail: str) -> list[str]:
     引号内 chmod/mkfs 等词会脱离 echo 段被当独立命令首词误匹配（NEW-FP-I）。
     """
     segments: list[str] = []
-    cur = []
-    i = 0
-    quote: str | None = None
-    while i < len(action_detail):
-        ch = action_detail[i]
-        if quote:
-            cur.append(ch)
-            if ch == quote:
-                quote = None
-            i += 1
+    start = cursor = 0
+    while match := _COMMAND_SEGMENT_TOKEN_RE.search(action_detail, cursor):
+        token = match.group()
+        if token in ("'", '"'):
+            # 保持旧状态机语义：同种引号关闭，不额外解释反斜杠转义。
+            end = action_detail.find(token, match.end())
+            if end < 0:
+                break
+            cursor = end + 1
             continue
-        if ch in ("'", '"'):
-            quote = ch
-            cur.append(ch)
-            i += 1
-            continue
-        # 检查分隔符 &&/||/;/换行（引号外）
-        if ch == ';' or ch == '\n':
-            segments.append("".join(cur))
-            segments.append(ch)
-            cur = []
-            i += 1
-            continue
-        if ch == '&' and i + 1 < len(action_detail) and action_detail[i + 1] == '&':
-            segments.append("".join(cur))
-            segments.append("&&")
-            cur = []
-            i += 2
-            continue
-        if ch == '|' and i + 1 < len(action_detail) and action_detail[i + 1] == '|':
-            segments.append("".join(cur))
-            segments.append("||")
-            cur = []
-            i += 2
-            continue
-        cur.append(ch)
-        i += 1
-    if cur:
-        segments.append("".join(cur))
+        segments.append(action_detail[start:match.start()])
+        segments.append(token)
+        start = cursor = match.end()
+    if start < len(action_detail):
+        segments.append(action_detail[start:])
     return segments
 
 
@@ -859,12 +1201,15 @@ class CommandPatternScanner:
         末尾追加 agent_ext.extra_command_patterns（如有）。
         """
         try:
-            from ..infra.runtime_config import has_runtime_config, get_enabled_l1_command_patterns_or_default, load_runtime_config
-            if has_runtime_config():
-                runtime = load_runtime_config()
-                enabled = get_enabled_l1_command_patterns_or_default(runtime)
-                if enabled:
-                    return self._compile_from_rules(enabled) + self._agent_extra_compiled
+            from ..infra.runtime_config import get_enabled_l1_command_patterns_or_default, load_runtime_config
+            # 传入当前 profile 的 os_type：runtime 覆盖按平台隔离（Windows 无
+            # 条目时回退 WindowsProfile，不再沿用 Linux 危险命令规则）。
+            enabled = get_enabled_l1_command_patterns_or_default(
+                load_runtime_config(),
+                getattr(self._profile, "os_type", ""),
+            )
+            if enabled:
+                return self._compile_from_rules(enabled) + self._agent_extra_compiled
         except Exception:
             pass
         return self._compiled + self._agent_extra_compiled
@@ -879,13 +1224,34 @@ class CommandPatternScanner:
         # 段（rm -rf /tmp; echo done 的 rm 段）不剥，真实危险命令不漏报。
         # NORM-PATH: 再折叠路径混淆段（//、/./），堵路径穿越变体（cat /etc//shadow 漏检）。
         scan_text = _normalize_path_segments(_strip_literal_text_segments(action_detail))
+        # WIN-SEP: 同 SensitivePathChecker —— Windows 下追加分隔符归一化变体，
+        # 让 `type C:/Windows/.../SAM` 这类正斜杠写法也能命中按反斜杠书写的规则。
+        # 原文保留，故 `net user /add`、`https://` 等含 / 的命令模式不受影响。
+        scan_texts = [scan_text]
+        # SHELL-OBF：追加「确定性 shell 混淆已折叠」的变体（原文照扫，纯增量）。
+        # 折叠 r""m -rf / （空引号拼接）与 rm$IFS-rf$IFS/ （$IFS 展开为空白）。
+        # 不做 $(echo rm) / base64 这类需要**执行**才能确定的形态 —— 猜会带来误报。
+        _deob = _normalize_shell_obfuscation(scan_text)
+        if _deob != scan_text:
+            scan_texts.append(_deob)
+        if getattr(self._profile, "os_type", "") == "windows":
+            scan_texts.append(scan_text.replace("/", "\\"))
         # ssh-keygen 生成模式豁免：生成新私钥时 -f 后的私钥路径是写目标，不应命中
         # 「访问私钥」命令正则（如 .ssh/id_rsa）。读模式（-y/-l/-p）不受豁免。
         exempt_keygen = _is_ssh_keygen_generate(action_detail)
+        # NEW-FP-R：密码修改家族的命中必须经得起全量剥引号——真实语义的管道/命令词
+        # 都在引号外；只在引号内出现（grep 搜索模式串）是字面量误报。绕过链例外。
+        _pw_guard_off = has_exec_bypass_chain(action_detail)
+        _no_quotes = None if _pw_guard_off else ALL_QUOTES_RE.sub(" ", action_detail)
         hits = [
             p for p in active
-            if p["regex"].search(scan_text)
+            if any(p["regex"].search(t) for t in scan_texts)
             and not (exempt_keygen and p["risk_type"] == "file_access")
+            and (
+                p["pattern"] not in QUOTED_SAFE_PASSWORD_PATTERNS
+                or _no_quotes is None
+                or p["regex"].search(_no_quotes) is not None
+            )
         ]
         if not hits:
             return HeuristicResult(hit=False)
@@ -934,12 +1300,14 @@ class InjectionKeywordChecker:
         末尾追加 agent_ext.extra_injection_keywords（如有）。
         """
         try:
-            from ..infra.runtime_config import has_runtime_config, get_enabled_l1_injection_keywords_or_default, load_runtime_config
-            if has_runtime_config():
-                runtime = load_runtime_config()
-                enabled = get_enabled_l1_injection_keywords_or_default(runtime)
-                if enabled:
-                    return enabled + self._agent_extra_keywords
+            from ..infra.runtime_config import get_enabled_l1_injection_keywords_or_default, load_runtime_config
+            # 同 _get_active_rules：runtime 覆盖按平台隔离
+            enabled = get_enabled_l1_injection_keywords_or_default(
+                load_runtime_config(),
+                getattr(self._profile, "os_type", ""),
+            )
+            if enabled:
+                return enabled + self._agent_extra_keywords
         except Exception:
             pass
         return self._keywords + self._agent_extra_keywords
@@ -1001,40 +1369,89 @@ class CustomEnvRuleChecker:
         return HeuristicResult(hit=False)
 
 
+#: 命令替换/进程替换：能让"看起来只读"的命令执行任意东西
+#: （`ls $(shutdown -h now)`、`` ls `kill -9 1` ``）。出现即不白名单。
+_CMD_SUBSTITUTION = re.compile(r"\$\(|`|<\(")
+
+
+def _split_shell_commands(command: str) -> list[str]:
+    """把命令切成「命令段」列表（不含分隔符），供白名单逐段判定。
+
+    NEW-FN-M 起委托 `logic_rules._split_shell_segments`（引号感知 + &&/||/;/换行/
+    单 `|` / 单 `&` 全切 + 滤分隔符段），保持单一事实源 —— 此前的两步实现
+    （先 `_split_command_segments` 引号感知切 && || ; \\n，再对每段无引号感知地
+    `re.split(r"[|&]")` 补切）对引号内的 `|`/`&` 会误切（`echo "a|b"` 被拆成两段）。
+    委托后引号内的 `|`/`&` 是字面量不切，行为更正确。
+
+    ⚠️ 不要再写一个叫 `_split_command_segments` 的函数：与已有同名函数冲突时
+    Python 以**后定义者**为准，会静默改掉剥离函数的分段行为 —— 曾因此把
+    `df -h && rm -rf /` 拼成 `df -hrm -rf /`，危险模式 `\\brm\\s+-...` 匹配不上，
+    任意复合命令里的危险命令全部漏检。命名冲突已有「剥离函数保持结构」用例守住。
+    """
+    return _split_shell_segments(command)
+
+
 def _extract_first_command(command: str) -> str:
-    """提取管道和链式命令的第一段"""
-    main_cmd = command.split("|")[0].strip()
-    for sep in ["&&", "||"]:
-        if sep in main_cmd:
-            main_cmd = main_cmd.split(sep)[0].strip()
-            break
-    return main_cmd
+    """提取第一段命令（供重定向写判定等使用）"""
+    segments = _split_shell_commands(command)
+    return segments[0] if segments else ""
+
+
+def _whitelist_tier(command: str, profile: "OSProfile") -> str:
+    """判定命令能走哪一档白名单，返回 ``"full"`` / ``"readonly"`` / ``""``（不可放行）。
+
+    **要求每一段都命中白名单**，而不是只看第一段。白名单判定作用于整条命令：
+    只看首段的话，`df -h ; shutdown -h now` 会因为首段是 df 而整条放行 —— 危险
+    命令特征又兜不住 shutdown/kill/sc stop 这类，等于开了个口子。同理 `|` 管道
+    也要逐段看：`ps aux | xargs kill -9` 的尾段不是白名单命令，整条就不放行；
+    而 `ps aux | grep nginx` 两段都是只读，照常放行。
+
+    出现命令替换（``$(`` / 反引号 / ``<(``）一律不放行。
+    """
+    segments = _split_shell_commands(command)
+    if not segments:
+        return ""
+    if any(_CMD_SUBSTITUTION.search(seg) for seg in segments):
+        return ""
+
+    full = [re.compile(p, re.IGNORECASE) for p in profile.fully_safe_commands]
+    readonly = [re.compile(p, re.IGNORECASE) for p in profile.readonly_sensitive_commands]
+
+    def hits(seg: str, patterns: list) -> bool:
+        return any(p.match(seg) for p in patterns)
+
+    if all(hits(seg, full) for seg in segments):
+        return "full"
+    if all(hits(seg, full) or hits(seg, readonly) for seg in segments):
+        return "readonly"
+    return ""
 
 
 def is_fully_safe_bash_command(command: str, profile: "OSProfile") -> bool:
     """检查是否为完全安全的 bash 命令（跳过 L2 + L3）
 
     含真实重定向写（echo x > file / printf >> file）的不算 fully_safe——
-    _extract_first_command 只取首命令名（echo），会忽略 >/>> 重定向，导致
+    白名单只看首段命令（echo），会忽略 >/>> 重定向，导致
     `echo x > /tmp/existing.txt` 覆写已存在文件被白名单放行跳过 L2（Bug3）。
     复用 _is_write_operation 的重定向判定（已剥 devnull + 比较运算符 + 只读首词保护）。
     注意：heredoc/内联脚本内容中的 > 字符不应触发重定向写检测（待优化）。
     """
-    main_cmd = _extract_first_command(command)
-    compiled = [re.compile(p, re.IGNORECASE) for p in profile.fully_safe_commands]
-    if not any(p.match(main_cmd) for p in compiled):
+    if _whitelist_tier(command, profile) != "full":
         return False
     # 命中 fully_safe 首命令后，再查完整命令是否含真实重定向写
-    if _is_write_operation(main_cmd, command, profile.write_keywords):
+    main_cmd = _extract_first_command(command)
+    if _is_write_operation(main_cmd, command, profile.write_keywords, profile):
         return False
     return True
 
 
 def is_readonly_sensitive_bash_command(command: str, profile: "OSProfile") -> bool:
-    """检查是否为安全但可能访问敏感路径的 bash 命令（跳过 L3，保留 L2）"""
-    main_cmd = _extract_first_command(command)
-    compiled = [re.compile(p, re.IGNORECASE) for p in profile.readonly_sensitive_commands]
-    return any(p.match(main_cmd) for p in compiled)
+    """检查是否为安全但可能访问敏感路径的 bash 命令（跳过 L3，保留 L2）
+
+    比 is_fully_safe_bash_command 宽一档：每一段命中完全安全**或**只读敏感即可
+    （于是 `ls | grep x` 这种"完全安全 + 只读敏感"的管道仍能跳 L3）。
+    """
+    return _whitelist_tier(command, profile) in ("full", "readonly")
 
 
 def is_safe_bash_command(command: str, profile: "OSProfile") -> bool:
@@ -1053,6 +1470,106 @@ _INLINE_SCRIPT_RE = re.compile(
 def is_inline_script_command(action_detail: str) -> bool:
     """判断命令是否为内联脚本解释器命令（python -c, perl -e 等）"""
     return bool(_INLINE_SCRIPT_RE.search(action_detail))
+
+
+# ==================== 路径事实上下文（供 L3 注入）====================
+# 动机（2026-09）：allow-116（rm -rf ~/a/../b）在 L3 被以错误理由判 Deny——
+# LLM 猜测「解析依赖 ~/a 是否存在」，实际词法解析是确定的（~/a/../b ≡ ~/b）。
+# L3 缺少的是「词法解析结果」这一事实 + 「运行时符号链接未验证」这一不确定性标注。
+# 本函数只做纯词法解析（不读文件系统、无 TOCTOU），产出结构化事实文本注入 L3 prompt。
+
+# 触发词法解析的操作动词（删除/软链/移动/权限/覆盖——目标路径语义敏感的写类操作）
+_PATH_CONTEXT_TRIGGER_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:rm|rmdir|unlink|ln|mv|cp|dd|truncate|shred|chmod|chown)\b",
+    re.IGNORECASE,
+)
+
+# 主目录前缀（~、$HOME、${HOME}、/home/<user>）
+_HOME_PREFIX_RE = re.compile(
+    r"(?:~|~(?=/)|\$HOME\b|\$\{HOME\}|/home/[a-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+
+
+def _resolve_path_tokens(segment: str) -> list[tuple[str, str]]:
+    """解析单个命令段中的主目录相关路径 token，返回 [(原文, 词法解析结果)]。
+
+    词法解析规则（纯文本，不读文件系统）：
+    - ~/a/../b → ~/b（.. 弹栈，. 折叠）
+    - ~ 弹栈到主目录根以下 → 标注「逃出主目录」
+    - 其余 token 原样返回（无 .. 不需要解析）
+    """
+    out: list[tuple[str, str]] = []
+    low = segment.lower()
+    for m in _HOME_PREFIX_RE.finditer(low):
+        end_idx = m.end()
+        tail = low[end_idx:]
+        if not tail or not tail[0] in ("/", " "):
+            # ~ 后无 /：裸主目录，无路径段要解析
+            out.append((m.group(0), m.group(0)))
+            continue
+        token = re.split(r"\s+", tail.strip())[0] if tail.strip() else ""
+        if not token.startswith("/"):
+            continue
+        token = token.rstrip("/").strip("'\"")
+        segments = [s for s in token.split("/") if s and s != "."]
+        if not any(s == ".." for s in segments):
+            continue  # 无 .. 不需要解析
+        depth = 0
+        kept: list[str] = []
+        escaped = False
+        for s in segments:
+            if s == "..":
+                depth -= 1
+                if kept:
+                    kept.pop()
+                if depth < 0:
+                    escaped = True
+                    depth = 0  # 继续统计但标注逃逸
+            else:
+                depth += 1
+                kept.append(s)
+        resolved = "~/" + "/".join(kept) if kept else "~"
+        if escaped:
+            resolved += "（⚠️ .. 弹栈超出主目录根，实际目标在主目录之外）"
+        out.append((m.group(0) + token, resolved))
+    return out
+
+
+def build_path_context(action_detail: str) -> str:
+    """为含路径敏感操作的命令构建「路径事实上下文」文本（纯词法，不读文件系统）。
+
+    产出格式（无主目录相关路径时返回空串，不注入）：
+        路径解析事实（词法分析，确定）：
+          - 命令段 `rm -rf ~/a/../b`：~/a/../b 词法解析为 ~/b（目标在主目录内）
+        运行时未验证（供参考，不是事实）：
+          - 符号链接：分析器不读文件系统，无法确认路径中的中间目录是否为符号链接；
+            若中间段在执行时被替换为指向主目录外的软链，实际删除目标可能随之改变。
+
+    设计约束：
+    - 只对「写类敏感操作」触发（rm/ln/mv/cp/dd/chmod...），只读命令不注入（省 token）
+    - 只解析主目录相关 token（其余路径无 ~/ 语义歧义，L1 已有 NORM-PATH 兜底）
+    - 词法结论表述为「事实」，符号链接风险表述为「未验证」——不替 L3 下结论
+    """
+    if not _PATH_CONTEXT_TRIGGER_RE.search(action_detail):
+        return ""
+    # 剥字面量（echo/printf 的文本参数不是真实路径）
+    stripped = _strip_literal_text_segments(action_detail)
+    lines: list[str] = []
+    for seg in _split_command_segments(stripped):
+        resolved = _resolve_path_tokens(seg)
+        for raw, lex in resolved:
+            lines.append(f"- 命令段 `{seg.strip()[:60]}`：`{raw}` 词法解析为 `{lex}`")
+    if not lines:
+        return ""
+    return (
+        "## 路径解析事实（词法分析，确定性结论）\n"
+        + "\n".join(lines)
+        + "\n\n## 运行时未验证（供参考，非事实）\n"
+        "- 分析器不读文件系统：无法确认路径中的中间目录是否为符号链接；"
+        "若中间段在执行时是（或被替换为）指向主目录外的软链，实际操作目标可能随之改变。"
+        "词法解析结果基于标准路径语义，不应因猜测「解析依赖某段是否存在」而否定它。"
+    )
 
 
 class HeuristicDetector:
@@ -1105,13 +1622,27 @@ class HeuristicDetector:
         """
         action_type = a_next.get("action_type", "").lower()
         action_detail = a_next.get("action_detail", "").lower()
+        # 注入关键词检测**用原文 action_detail**（不过字面量剥离）：echo 引号内的
+        # "ignore previous instructions" 是**载荷本体**——echo 输出会进入下游 LLM
+        # 上下文，构成间接 prompt injection 通道（deny-08/177/232、agent-xiaoo-03
+        # 的既有防线）。与危险命令词的「词面巧合」本质不同，不做字面量豁免
+        # （2026-10 M22 复评结论：保留拦截，测试反馈的「误拦良性讨论」需产品再确认）。
         combined_text = f"{action_type} {action_detail} {reason} {prompt_session}".lower()
 
-        # 安全工具白名单跳过：仅按 action_type 精确匹配（safe_action_types 是
-        # 工具类型名如 ls/glob/list_dir，不应在 action_detail 里做子串匹配——
-        # 否则 "ls" 子串会命中 "credentials.yml" 等，导致读凭据文件被白名单短路放行）。
-        if action_type in self._profile.safe_action_types:
-            return HeuristicResult(hit=False)
+        # ⚠️ 这里**不再**按 action_type 整层免检。
+        #
+        # 旧实现在 `action_type in profile.safe_action_types`（ls/glob/list_dir/
+        # count_text_length…）时直接 return 未命中，于是 L1 整层被跳过 →
+        # no_high_risk=True → 工具名白名单放行：
+        #     {"action_type": "glob", "action_detail": "rm -rf /"}  → Allow
+        # **action_type 是调用方声明的，不能当免检依据。** 而且这套"按工具名免检"
+        # 只有 Python 有，本身就是一处实现分叉（穷举语料一照就现形）。
+        #
+        # 去掉后不影响正当用法：`glob "*.txt"`、`list_dir /var/log`、
+        # `ask_user_question "要重启吗？"` 的 detail 不含危险模式，照样 Allow；
+        # 只有 detail 里真塞了危险命令才会命中。
+        # 注：agent 专属白名单（rules.json builtin_safe_action_types，如
+        # OpenDesk 的 memory-*）走 coordinator 且受 no_high_risk 门控，不受影响。
 
         # 0. 环境变量自定义规则（AGENT_MOSS_CUSTOM_RULES）
         result = self._custom_env_checker.check(action_type, action_detail)

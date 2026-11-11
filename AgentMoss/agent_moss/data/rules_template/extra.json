@@ -1,0 +1,14 @@
+{
+  "_说明": [
+    "追加规则：内置规则全部保留，你写在这里的规则加在内置之后一起判定。",
+    "只跑 L1 的部署只需要前三个类别（后三个属于 L2，写了也不生效）。",
+    "怎么填、可直接照抄的样例：见同目录 README.md。",
+    "改完自查：agent-moss rules status"
+  ],
+  "dangerous_commands": [],
+  "injection_detection": [],
+  "sensitive_path_access": [],
+  "intent_consistency": [],
+  "password_modify_consent": [],
+  "user_deletion_consent": []
+}

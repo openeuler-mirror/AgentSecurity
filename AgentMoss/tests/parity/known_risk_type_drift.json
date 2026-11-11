@@ -1,0 +1,344 @@
+{
+  "_comment": [
+    "用例声明了 expected_risk_type，但至少一端实际判定与声明不符的**已知**偏差。",
+    "tests/test_case_metadata.py 比对 python 字段。",
+    "偏差集合必须与清单**完全一致** —— 多一个（新漂移）或少一个（清单过期）都会失败。",
+    "python != typescript 的条目 = **双端 risk_type 分叉**：decision 与 risk_level 一致（拦截行为相同），",
+    "只是「命中哪条规则的分类标签」不同 —— 多规则同时命中时的优先级差异（典型：TS 先命中敏感路径 → file_access）。",
+    "这是独立于 consent 修复的历史债，修它要重排规则优先级，需单独排期。",
+    "清理历史债时从本清单删除对应条目即可。",
+    "范围：l1/l2/agent（确定性判定）；l3 依赖 LLM，不在此列。"
+  ],
+  "drift": [
+    {
+      "case": "l1/allow-127-curl-upload-localhost.json",
+      "expected": "data_exfiltration",
+      "python": "",
+      "typescript": ""
+    },
+    {
+      "case": "l1/allow-128-wget-postdata-localhost.json",
+      "expected": "data_exfiltration",
+      "python": "",
+      "typescript": ""
+    },
+    {
+      "case": "l1/allow-80-agentmoss-runtime-read.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": ""
+    },
+    {
+      "case": "l1/deny-02-rmrf.json",
+      "expected": "script_execution",
+      "python": "script_execution",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-05-curl-exfil.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-06-sudo.json",
+      "expected": "privilege_escalation",
+      "python": "script_execution",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-111-nc-e-bash.json",
+      "expected": "script_execution",
+      "python": "lateral_movement",
+      "typescript": "lateral_movement"
+    },
+    {
+      "case": "l1/deny-112-nc-listen.json",
+      "expected": "script_execution",
+      "python": "lateral_movement",
+      "typescript": "lateral_movement"
+    },
+    {
+      "case": "l1/deny-113-pip-install-pipe-bash.json",
+      "expected": "supply_chain",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-114-npm-install-g-pipe-bash.json",
+      "expected": "supply_chain",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-115-git-clone-pipe-bash.json",
+      "expected": "supply_chain",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-130-gitconfig-pager-revshell.json",
+      "expected": "persistence",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-131-gitconfig-printf-write.json",
+      "expected": "config_tampering",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-15-iptables.json",
+      "expected": "sensitive_action",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-178-chmod-setuid-symbolic.json",
+      "expected": "script_execution",
+      "python": "privilege_escalation",
+      "typescript": "privilege_escalation"
+    },
+    {
+      "case": "l1/deny-18-ssh-key-exfil.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-19-md-injection-exfil.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-20-env-exfil.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-21-iptables-flush.json",
+      "expected": "sensitive_action",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-23-local-post.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-257-py-enum-sensitive-dir.json",
+      "expected": "",
+      "python": "sensitive_action",
+      "typescript": "sensitive_action"
+    },
+    {
+      "case": "l1/deny-258-py-mem-bomb.json",
+      "expected": "",
+      "python": "resource_exhaustion",
+      "typescript": "resource_exhaustion"
+    },
+    {
+      "case": "l1/deny-259-py-print-injection-blocked.json",
+      "expected": "",
+      "python": "prompt_injection",
+      "typescript": "prompt_injection"
+    },
+    {
+      "case": "l1/deny-37-rsync-bashrc.json",
+      "expected": "file_access",
+      "python": "persistence",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-63-ssh-no-strict.json",
+      "expected": "sensitive_action",
+      "python": "lateral_movement",
+      "typescript": "lateral_movement"
+    },
+    {
+      "case": "l1/deny-64-wget-post.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-67-dev-random-read.json",
+      "expected": "",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-68-wget-script.json",
+      "expected": "",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l1/deny-708-danger-108.json",
+      "expected": "data_exfiltration",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-72-curl-post-env.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-84-spool-cron-write.json",
+      "expected": "file_access",
+      "python": "sensitive_action",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-88-bash-profile-write.json",
+      "expected": "file_access",
+      "python": "persistence",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-89-profile-write.json",
+      "expected": "file_access",
+      "python": "persistence",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-95-write-system-file.json",
+      "expected": "sensitive_action",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/deny-96-send-external-email.json",
+      "expected": "sensitive_action",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l1/deny-98-modify-global-config.json",
+      "expected": "sensitive_action",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-branch-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-branch-py-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-branch-shift-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-build-large-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-build-large-deny-full-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "privilege_escalation"
+    },
+    {
+      "case": "l1/script-deploy-large-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "privilege_escalation"
+    },
+    {
+      "case": "l1/script-deploy-large-deny-full-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "privilege_escalation"
+    },
+    {
+      "case": "l1/script-xlarge-py-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l1/script-xlarge-sh-deny-clean.json",
+      "expected": "file_access",
+      "python": "",
+      "typescript": "privilege_escalation"
+    },
+    {
+      "case": "l2/combo-exec-persist-exfil-deny.json",
+      "expected": "combo_chain",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l2/combo-listener-exec-exfil-deny.json",
+      "expected": "combo_chain",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l2/combo-persist-exfil-deny.json",
+      "expected": "combo_chain",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l2/combo-privesc-cred-exfil-deny.json",
+      "expected": "combo_chain",
+      "python": "data_exfiltration",
+      "typescript": "data_exfiltration"
+    },
+    {
+      "case": "l2/inline-09-write-exec-chain.json",
+      "expected": "script_execution",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l2/inline-10-printf-pipe-bash.json",
+      "expected": "script_execution",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l2/logic-01-read-before-write.json",
+      "expected": "read_before_write",
+      "python": "file_access",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l2/logic-10-indirect-access.json",
+      "expected": "indirect_file_access",
+      "python": "",
+      "typescript": "file_access"
+    },
+    {
+      "case": "l2/logic-11-wildcard-delete.json",
+      "expected": "dangerous_wildcard_operation",
+      "python": "script_execution",
+      "typescript": "script_execution"
+    },
+    {
+      "case": "l2/logic-13-redirect-critical.json",
+      "expected": "dangerous_redirect",
+      "python": "file_access",
+      "typescript": "file_access"
+    }
+  ]
+}

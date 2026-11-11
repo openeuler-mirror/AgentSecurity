@@ -1,0 +1,21 @@
+{
+  "id": "agentmoss-gate",
+  "name": "AgentMoss Security Gate",
+  "version": "0.1.0",
+  "description": "Reports every tool call (with turn prompt and full session history) to AgentMoss/AgentGate for security analysis, and enforces the verdict before the tool executes.",
+  "description_i18n": {
+    "zh-CN": "将每次工具调用（连同本轮提示词与完整会话历史）上报 AgentMoss/AgentGate 做安全分析，并在工具真正执行前执行判定结果。",
+    "en-US": "Reports every tool call (with turn prompt and full session history) to AgentMoss/AgentGate for security analysis, and enforces the verdict before the tool executes."
+  },
+  "author": "AgentMoss Team",
+  "type": "general",
+  "entry": {
+    "backend": "agentmoss_gate.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "1.1.6",
+    "max": "2.9.0"
+  },
+  "meta": {}
+}

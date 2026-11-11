@@ -7,7 +7,7 @@
       "reason": "检测到递归强制删除根目录 (rm -rf /)"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\s+/(etc|var(?!/tmp)|home|usr|boot|root|opt|srv|sys|proc)\\b",
+      "pattern": "\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\s+/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到删除关键系统目录"
@@ -25,6 +25,12 @@
       "reason": "检测到强制删除文件 (rm -f /...)"
     },
     {
+      "pattern": "\\bln\\s+(-[a-zA-Z]+\\s+)*(?:--\\s+)?-s[a-zA-Z]*\\s+(?:--\\s+)?(/(?![a-zA-Z0-9._~])|~/\\.\\.(?:\\s|$|\\\"|'|;|&|\\)|\\]|/)|~/(?![.a-zA-Z0-9_~-])|~/$|~(?:\\s|$|\\\"|'|;|&|\\)|\\])|\\$HOME/\\.\\.(?:\\s|$|\\\"|'|;|&|\\)|\\]|/)|\\$HOME/(?![.a-zA-Z0-9_~-])|\\$HOME/$|\\$HOME(?:\\s|$|\\\"|'|;|&|\\)|\\]))",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到创建指向根目录/主目录本身的符号链接（symlink 逃逸原语：链接点进入后 ../ 可穿越到根/主目录层级，配合删除/写入实现越权）"
+    },
+    {
       "pattern": "chmod\\s+(?:(?:-[a-zA-Z]*|--)\\s+)*[0-7]{0,3}7\\b",
       "risk_level": "critical",
       "risk_type": "privilege_escalation",
@@ -37,7 +43,7 @@
       "reason": "检测到 setuid/setgid 位设置 (chmod 4xxx/2xxx/6xxx 及 3/5/7xxx 组合位, 提权; 含 -R 递归与 -- 分隔符形态)"
     },
     {
-      "pattern": "chmod\\s+[ugoa]\\+s\\b",
+      "pattern": "chmod\\s+(?:(?:-[a-zA-Z]*|--)\\s+)*[ugoa]*\\+s\\b",
       "risk_level": "critical",
       "risk_type": "privilege_escalation",
       "reason": "检测到符号 setuid/setgid 设置 (chmod u+s/g+s/a+s, 提权)"
@@ -67,16 +73,16 @@
       "reason": "检测到访问系统组密码文件 (/etc/gshadow)"
     },
     {
+      "pattern": "dd\\s+if=/dev/zero.*\\bof\\s*=\\s*/(?:etc|var|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到磁盘清零写入关键系统目录 (dd if=/dev/zero of=/系统目录)"
+    },
+    {
       "pattern": "\\.ssh/id_rsa(?!\\.pub)",
       "risk_level": "critical",
       "risk_type": "file_access",
       "reason": "检测到访问 SSH 私钥文件 (.ssh/id_rsa)"
-    },
-    {
-      "pattern": "dd\\s+if=/dev/zero.*\\bof\\s*=\\s*/(etc|var|home|usr|boot|root|opt|srv|sys|proc)\\b",
-      "risk_level": "critical",
-      "risk_type": "script_execution",
-      "reason": "检测到磁盘清零写入关键系统目录 (dd if=/dev/zero of=/系统目录)"
     },
     {
       "pattern": "mkfs\\.\\w+\\s+/dev/(sd|hd|nvme|vd|loop|mapper|md|dm)\\S+",
@@ -133,6 +139,36 @@
       "reason": "检测到网络端口扫描工具，可能用于横向移动侦察"
     },
     {
+      "pattern": "\\b(?:curl|wget)\\s+(?:-\\S+\\s+)*https?://(?:10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)(?:/(?:\\s|$)|\\s|$)",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到对内网地址的存活/服务探测（私网裸 IP 根路径 GET，LM-H1 内网测绘；带具体 API 路径或端口的正常调用不受影响）"
+    },
+    {
+      "pattern": "\\bnc(?:at)?\\s+(?:-\\S+\\s+)*-z\\S*\\s+[^;&|\\n]*(?:10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到对内网主机的端口连通性扫描（nc -z 私网目标，LM-H2；本机 localhost/127.0.0.1 检查不受影响）"
+    },
+    {
+      "pattern": "\\barping\\s+[^;&|\\n]*(?:10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+)",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到 ARP 存活探测（arping 内网目标，LM-H3 内网测绘）"
+    },
+    {
+      "pattern": "\\bdig\\s+[^;&|\\n]*\\baxfr\\b",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到 DNS 区域传送枚举（dig axfr，LM-H4 域枚举攻击；正常域名解析不受影响）"
+    },
+    {
+      "pattern": "\\bsmbclient\\s+(?:-\\S+\\s+)*-L\\b",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到 SMB 服务枚举（smbclient -L 共享列表探测，LM-H4 服务枚举）"
+    },
+    {
       "pattern": ">>\\s*(~|/home/[^/]+)/(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)",
       "risk_level": "high",
       "risk_type": "persistence",
@@ -149,6 +185,42 @@
       "risk_level": "high",
       "risk_type": "script_execution",
       "reason": "检测到远程下载脚本到本地 (curl -o script.sh)，存在后续执行风险"
+    },
+    {
+      "pattern": "base64\\s+(?:-[a-zA-Z]*d[a-zA-Z]*|--decode)\\s*[^;&|\\n]*\\|\\s*(?:bash|sh|zsh|dash|ksh|ash)\\b",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "base64 解码执行（编码绕过，下载或读取内容后解码执行；含 -d/--decode 紧贴管道与 sh/zsh/dash 执行器形态）"
+    },
+    {
+      "pattern": "xxd\\s+[^;&|\\n]*-r\\b[^;&|\\n]*\\|\\s*(?:bash|sh|zsh|dash|ksh|ash)\\b",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "xxd 反向解码执行（hex 载荷经 xxd -r 还原后直接喂解释器，编码混淆族）"
+    },
+    {
+      "pattern": "printf\\s+['\\\"][^'\\\"]*(?:\\\\x[0-9a-fA-F]{2}){2,}[^'\\\"]*['\\\"]\\s*[^;&|\\n]*\\|\\s*(?:bash|sh|zsh|dash|ksh|ash)\\b",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "printf \\x 十六进制载荷构造执行（编码混淆族）"
+    },
+    {
+      "pattern": "\\bpython[0-9.]*\\s+(?:-[a-zA-Z]+\\s+)*-c\\s+['\\\"][^'\\\"]*\\b(?:os\\.listdir|os\\.scandir|os\\.walk)\\s*\\(\\s*['\\\"](?:/root\\b|/etc\\b)",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到 python 内联枚举敏感目录（os.listdir/scandir/walk 对 /root、/etc，IA-H3 信息收集；列举项目目录等正常开发不受影响）"
+    },
+    {
+      "pattern": "\\bpython[0-9.]*\\s+(?:-[a-zA-Z]+\\s+)*-c\\s+['\\\"][^'\\\"]*\\bPath\\s*\\(\\s*['\\\"](?:/root\\b|/etc\\b)[^'\\\"]*['\\\"]\\s*\\)\\s*\\.\\s*(?:iterdir|glob|rglob|walk)\\s*\\(",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到 python 内联枚举敏感目录（Path('/root').iterdir() 链式形态，IA-H3）"
+    },
+    {
+      "pattern": "\\bpython[0-9.]*\\s+(?:-[a-zA-Z]+\\s+)*-c\\s+['\\\"].*?['\\\"]\\s*\\*\\s*\\d{7,}",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到 python 内联大字符串分配（≥百万级 'x'*N 乘法，RE-C3 资源消耗；e2e 实测可瞬间吃掉数百 MB 内存）"
     },
     {
       "pattern": "(?:curl|wget)\\s+\\S+.*\\b(?:chmod|chown)\\s+\\+x\\b",
@@ -247,16 +319,16 @@
       "reason": "检测到通过 -p 参数设置或修改密码 (useradd/usermod/groupmod)"
     },
     {
-      "pattern": ":\\(\\)\\s*\\{.*:\\|:&.*\\};:",
+      "pattern": ":\\(\\)\\s*\\{.*:\\|:\\s*&.*\\};:",
       "risk_level": "critical",
       "risk_type": "resource_exhaustion",
-      "reason": "Fork Bomb"
+      "reason": "检测到 Fork Bomb（拒绝服务攻击：函数自复制耗尽系统进程表）"
     },
     {
       "pattern": "curl\\s+.*\\|\\s*bash",
       "risk_level": "high",
       "risk_type": "sensitive_action",
-      "reason": "curl pipe bash 执行 (user_rules)"
+      "reason": "curl pipe bash 执行（下载远程脚本直接执行）"
     },
     {
       "pattern": "curl\\s+.*\\|\\s*(sh|zsh|dash)",
@@ -271,16 +343,10 @@
       "reason": "wget pipe shell 执行"
     },
     {
-      "pattern": "eval\\s+\\$\\(curl|eval\\s+\\$\\(wget",
+      "pattern": "\\beval\\b[^;&|\\n]{0,8}(?:\\$\\(|`)\\s*(?:curl|wget)\\b",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "eval 远程代码执行"
-    },
-    {
-      "pattern": "base64\\s+-d\\s+.*\\|\\s*bash",
-      "risk_level": "high",
-      "risk_type": "sensitive_action",
-      "reason": "base64 解码执行 (user_rules)"
     },
     {
       "pattern": "/dev/tcp/|bash\\s+-i\\s+>&",
@@ -335,238 +401,1324 @@
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到命令替换隐藏执行（$(...)/反引号载荷含写/执行命令），可能产生文件系统副作用"
+    },
+    {
+      "pattern": "\\biptables\\s+-(?:[A-Za-z]*[FPIX][A-Za-z]*|[A-Za-z]*[FPIX]\\b)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到修改防火墙规则（iptables -F/-P/-I/-X），可能关闭安全防护或建立隧道（ATT&CK T1562.004）"
+    },
+    {
+      "pattern": "\\b(?:ssh|scp)\\b[^;\\n]{0,200}?StrictHostKeyChecking\\s*=\\s*(?:no|accept-new)",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到 SSH/SCP 跳过主机密钥验证（-o StrictHostKeyChecking=no），允许中间人攻击，可能用于横向移动"
+    },
+    {
+      "pattern": "\\bwget\\s+(?:-\\S+\\s+)*--post-(?:data|file)\\s*=\\s*(?:\\$\\([^)]+\\)|[^ ]+|\\\"[^\\\"]+\\\"|'[^']+')\\s+(?!https?://(?:127\\.|localhost))https?://[a-zA-Z0-9.-]+",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 wget --post-data/--post-file 向外部地址发送数据（可能为数据外传，回环地址除外）"
+    },
+    {
+      "pattern": "\\bcurl\\b(?:[^;\\n]|&(?![&\\s]))*-X\\s+POST\\b[^;\\n]*https?://(?!(?:127\\.|localhost|\\[::1\\]))[a-zA-Z0-9.-]+",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 curl -X POST 到外部地址（可能为数据外传，回环地址除外）"
+    },
+    {
+      "pattern": "\\bcurl\\b[^;&\\n]*-F\\s+\\S+[^;&\\n]*https?://(?!(?:127\\.|localhost|\\[::1\\]))[a-zA-Z0-9.-]+",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 curl -F 表单上传到外部地址（可能为数据外传，回环地址除外）"
+    },
+    {
+      "pattern": "(?:@reboot|(?:[\\d*,\\-/]+\\s+){4}[\\d*,\\-/]+)\\s+(?:/tmp|/var/tmp|/dev/shm|/run/shm)/\\S+",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到定时任务执行世界可写目录（/tmp、/var/tmp、/dev/shm）下的脚本（cron 持久化后门：任何用户可替换该脚本，重启/定时以任务属主身份执行）"
+    },
+    {
+      "pattern": "\\b(?:while\\s+(?:true\\b|1\\b|:(?=\\s|;|$|\\)))|until\\s+false\\b|for\\s*\\(\\s*\\(?\\s*(?:;|;;)\\s*\\)?\\s*)",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到无限循环（while true / while 1 / while : / until false / for(;;)），可能用于拒绝服务攻击或资源滥用"
+    },
+    {
+      "pattern": "\\byes\\s*(?:>\\s*/dev/null\\s*&|>/dev/null\\s*&\\s*$)",
+      "risk_level": "medium",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到 yes 命令输出刷屏（可能用于资源滥用/拒绝服务）"
+    },
+    {
+      "pattern": "\\bdd\\s+if=/dev/zero\\b.*\\bof\\s*=\\s*/tmp/\\S+\\s+bs\\s*=\\s*\\d+M\\s+count\\s*=\\s*\\d{3,}",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到 dd if=/dev/zero 写入 /tmp 大量数据（可能用于磁盘填充/拒绝服务）"
+    },
+    {
+      "pattern": "\\baws\\s+s3\\s+rb\\s+\\S+.*(?:--force|\\b)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 AWS S3 桶删除 (aws s3 rb)，可能删除云端生产数据"
+    },
+    {
+      "pattern": "\\b(?:gsutil\\s+rm|gcloud\\s+storage\\s+rm)\\s+-[a-zA-Z]*r",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 GCS/云存储递归删除"
+    },
+    {
+      "pattern": "\\bkubectl\\s+delete\\s+(?:deployment|namespace|ns|pod|svc|service|statefulset|daemonset|configmap|secret|pv|pvc)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 kubectl 删除 K8s 资源"
+    },
+    {
+      "pattern": "\\baz\\s+storage\\s+container\\s+delete\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 Azure 存储容器删除"
+    },
+    {
+      "pattern": "\\baws\\s+ec2\\s+terminate-instances\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 AWS EC2 实例终止"
+    },
+    {
+      "pattern": "\\baws\\s+ec2\\s+delete-security-group\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 AWS 安全组删除"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bDROP\\s+(?:DATABASE|SCHEMA|TABLE|USER|ROLE|VIEW|INDEX)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到数据库 DROP 操作（不可逆删除）"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bTRUNCATE\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到数据库 TRUNCATE 操作（清空表数据）"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bDELETE\\s+FROM\\b(?![^(]*(?:WHERE|LIMIT)\\b)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到无条件数据库 DELETE 全表删除（无 WHERE 限定）"
+    },
+    {
+      "pattern": "\\bredis-cli\\s+.*\\bFLUSHALL\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 Redis 清空全部数据 (FLUSHALL)"
+    },
+    {
+      "pattern": "\\bmongo(db)?\\s+.*\\bdb\\.dropDatabase\\(\\)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 MongoDB 删除数据库"
+    },
+    {
+      "pattern": "\\bnc\\s+-[a-zA-Z]*[el][a-zA-Z]*\\s+.*-e\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 nc 反向 shell"
+    },
+    {
+      "pattern": "\\bsocat\\s+exec:.*tcp:",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 socat 反向 shell"
+    },
+    {
+      "pattern": "\\bpty\\.spawn\\(\\[\\\"/bin/(?:sh|bash)\\\"\\]\\)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PTY 伪终端反向 shell"
+    },
+    {
+      "pattern": "\\bbash\\s+-i\\s+.*\\d+\\.\\d+\\.\\d+\\.\\d+",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到交互式 bash 连接到远程地址（反向 shell）"
+    },
+    {
+      "pattern": "\\bat\\s+(?:now|[\\d:]+\\s+[\\d/]+|[\\d/]+\\s+[\\d:]+).*-f\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 at 定时任务执行文件（持久化后门）"
+    },
+    {
+      "pattern": "\\bsystemctl\\s+(?:link|enable)\\s+[^ ]*(?:evil|malicious|backdoor)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到启用恶意 systemd 服务"
+    },
+    {
+      "pattern": "\\bsystemctl\\s+stop\\s+firewalld\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到停止系统防火墙"
+    },
+    {
+      "pattern": "\\b(?:ufw\\s+disable|iptables\\s+-F)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到关闭/清空防火墙规则"
+    },
+    {
+      "pattern": "\\baws\\s+ec2\\s+authorize-security-group-ingress\\b.*(?:0\\.0\\.0\\.0/0|::/0|--port\\s+0-65535)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到开放安全组全端口全 IP 入站"
+    },
+    {
+      "pattern": "\\bgcloud\\s+compute\\s+instances\\s+delete\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 gcloud 删除计算实例"
+    },
+    {
+      "pattern": "\\baws\\s+ec2\\s+stop-instances\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 AWS EC2 停止实例"
+    },
+    {
+      "pattern": "\\baz\\s+vm\\s+delete\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 Azure 删除虚拟机"
+    },
+    {
+      "pattern": "\\bsocat\\b[^;&|\\n]*\\bTCP:",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 socat TCP 连接（可能外传数据）"
+    },
+    {
+      "pattern": "\\b(?:mysqldump|pg_dump)\\s+.*\\|\\s*(?:ssh|curl|nc|socat)\\b",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到数据库导出经管道外传"
+    },
+    {
+      "pattern": "\\bcurl\\b(?:[^;&|\\n]*?)\\s+-T\\s+[^ ]+\\s+(?:https?|ftp)://(?!127\\.\\d+\\.\\d+\\.\\d+|localhost|\\[::1\\]|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d+\\.\\d+|[^ ]*(?:internal|local|corp|\\.lan\\b|\\.company\\b)[^ ]*)",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 curl -T 上传文件到外部服务器（数据外传，回环/内网除外）"
+    },
+    {
+      "pattern": "\\bcurl\\b(?:[^;&|\\n]*?)\\s+-d\\s+@?[^ ]+\\s+(?:https?|ftp)://(?!127\\.\\d+\\.\\d+\\.\\d+|localhost|\\[::1\\]|10\\.\\d+\\.\\d+\\.\\d+|192\\.168\\.\\d+\\.\\d+)[^ ]*(?:exfil|evil|attacker|c2)",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 curl 提交数据到外部可疑服务器（数据外传）"
+    },
+    {
+      "pattern": "\\bgit\\s+remote\\s+add\\b[^;&|\\n]*https?://(?!127\\.|localhost)[^ ]*(?:exfil|evil|attacker)",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 git remote 指向可疑外部地址"
+    },
+    {
+      "pattern": "\\b(?:npm|yarn)\\s+(?:install|add|i)\\b[^;&|\\n]*(?:^|\\s)--registry\\s+(?:https?|http)://(?!127\\.|localhost|npm\\.|registry\\.|yarn\\.)",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从非标准 registry 安装 npm 包（供应链风险）"
+    },
+    {
+      "pattern": "\\b(?:pip|pip3)\\s+install\\b[^;&|\\n]*(?:^|\\s)--extra-index-url\\s+(?:https?|http)://(?!127\\.|localhost|pypi\\.)",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从非标准源安装 pip 包（供应链风险）"
+    },
+    {
+      "pattern": "\\b(?:pip|pip3)\\s+install\\b[^;&|\\n]*(?:(?:git\\+https?://(?!github\\.com|gitlab\\.com))|(?:https?://(?!pypi\\.org|github\\.com|gitlab\\.com)[^ ]*(?:tar\\.gz|whl|zip)))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从非标准 URL 安装 pip 包（供应链风险，GitHub/GitLab/PyPI 正常源除外）"
+    },
+    {
+      "pattern": "\\b(?:scp|rsync)\\b[^;&|\\n]*(?:(?:exfil|evil|attacker|c2|external|malicious)[^ ;&\\n]*@[^ ;&\\n]+:|@(?:exfil|evil|attacker|c2|external|malicious)[^ ;&\\n]*:|\\b(?:exfil|evil|attacker|c2|external|malicious)\\.[^ ;&\\n]*:)",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 scp/rsync 将文件外传到可疑主机（数据外传）"
+    },
+    {
+      "pattern": "\\b(?:scp|rsync)\\b[^;&|\\n]*\\b(?:~|/home/[^/]+)/\\.(?:ssh|aws|netrc|git-credentials|config/gh|docker)[^ ;&\\n]*[^;&|\\n]*(?:@[^ :]+:|:)",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到 scp/rsync 外传敏感凭据路径（~/.ssh 等）"
+    },
+    {
+      "pattern": "\\brsync\\b[^;&|\\n]*(?:~|/home/[^/]+)/\\.(?:bashrc|zshrc|profile|bash_profile|zprofile)",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到 rsync 覆盖写入 shell 初始化配置（持久化后门）"
+    },
+    {
+      "pattern": "\\bpasswd\\s+(?![-])\\b[a-z_][a-z0-9_-]*",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到修改其他用户密码 (passwd <user>)"
+    },
+    {
+      "pattern": "\\bfind\\s+[^;&|\\n]*(?:id_rsa|id_ecdsa|id_dsa|id_ed25519|\\.pem|\\.key|credentials|\\.pgpass|netrc|\\.aws)[^;&|\\n]*(?:-name|-exec)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到 find 侦察敏感凭据文件"
+    },
+    {
+      "pattern": "\\bls\\s+[^;&|\\n]*/\\.config/?(\\s|$|;|&&|\\|\\|)",
+      "risk_level": "medium",
+      "risk_type": "file_access",
+      "reason": "检测到列出敏感配置目录 .config（可能侦察凭据）"
+    },
+    {
+      "pattern": "\\bfind\\s+(?!\\/?(?:tmp|var\\/tmp|run|dev\\/shm)\\b)[^;&|\\n]*-delete\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 find -delete 批量删除非临时目录文件"
+    },
+    {
+      "pattern": "\\btruncate\\s+-s\\s+0\\s+[^;&|\\n]+",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 truncate 清空文件 (truncate -s 0)"
+    },
+    {
+      "pattern": "\\bmongo(db)?\\s+.*?\\bdb\\.[A-Za-z_][A-Za-z0-9_]*\\.drop\\(\\)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 MongoDB 删除集合 (db.<col>.drop())"
+    },
+    {
+      "pattern": "(?:del|rmdir|rd)\\s+[\\\\/]?[a-zA-Z]:",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到递归删除关键路径 (del/rmdir C:\\)",
+      "os": "windows"
+    },
+    {
+      "pattern": "del\\s+[\\\\/]?[a-zA-Z]:",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到删除卷根目录文件 (del C:\\)",
+      "os": "windows"
+    },
+    {
+      "pattern": "icacls\\s+\\*?\\s*[\\\\/]?[a-zA-Z]:.*Everyone:F",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到授予 Everyone 完全控制权限",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bnet\\s+user\\b[^;&|\\n]*\\s/add\\b",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到添加系统用户 (net user /add)",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bnet\\s+localgroup\\b[^;&|\\n]*\\s/add\\b",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到添加用户到本地组 (net localgroup /add)",
+      "os": "windows"
+    },
+    {
+      "pattern": "reg\\s+delete\\s+HK",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到删除注册表项 (reg delete)",
+      "os": "windows"
+    },
+    {
+      "pattern": "format\\s+[a-zA-Z]:",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到格式化磁盘操作",
+      "os": "windows"
+    },
+    {
+      "pattern": "powershell\\s+.*-EncodedCommand\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 编码命令执行，可能隐藏恶意操作",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\b(?:powershell|pwsh)(?:\\.exe)?\\b[^;&|\\n]*\\s-(?:e|en|enc|enco|encod|encode|encoded|encodedcommand)\\s+[A-Za-z0-9+/=]{20,}",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 编码命令执行，可能隐藏恶意操作",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\b(?:powershell|pwsh)(?:\\.exe)?\\b[^;&|\\n]*-w(?:indowstyle)?\\s+(?:hidden|1)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 隐藏窗口执行（规避用户察觉）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\b(?:powershell|pwsh)(?:\\.exe)?\\b[^;&|\\n]*-(?:ep|executionpolicy)\\s+(?:bypass|unrestricted)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 绕过脚本执行策略",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\b(?:IEX|Invoke-Expression)\\b[^;&|\\n]*(?:DownloadString|DownloadFile|DownloadData|WebClient|WebRequest|https?://)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 下载并内存执行远程内容",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\.(?:DownloadString|DownloadFile|DownloadData)\\s*\\(",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 远程内容下载调用",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bNew-Object\\s+(?:System\\.)?Net\\.(?:WebClient|WebRequest)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 网络客户端构造（下载执行链常见环节）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\[(?:System\\.)?Convert\\]::FromBase64String",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell base64 解码（载荷混淆常见手法）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bStart-BitsTransfer\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 BITS 后台传输（常被用于下载载荷）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bAdd-Type\\b[^;&|\\n]*(?:DllImport|kernel32|VirtualAlloc|CreateRemoteThread|UnsafeNativeMethods)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 PowerShell 反射加载原生代码（进程注入常见手法）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bSet-Content\\b[^;&|\\n]*\\s-[A-Za-z]*Stream\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到写入 NTFS 备用数据流（用于隐藏载荷）",
+      "os": "windows"
+    },
+    {
+      "pattern": "(?:Invoke-WebRequest|Invoke-RestMethod|curl|wget)\\s+.*?\\.(?:ps1|exe|bat)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到远程下载可执行脚本 (powershell curl)",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bwmic\\b[^;&|\\n]*\\bprocess\\s+call\\s+create\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 WMI 远程进程创建",
+      "os": "windows"
+    },
+    {
+      "pattern": "config\\\\SAM",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到访问 Windows SAM 安全账户管理器",
+      "os": "windows"
+    },
+    {
+      "pattern": "ntds\\.dit",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到访问 Active Directory 数据库 (ntds.dit)",
+      "os": "windows"
+    },
+    {
+      "pattern": "Set-MpPreference\\s+.*DisableRealtimeMonitoring\\s+\\$true",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到尝试关闭 Windows Defender 实时监控",
+      "os": "windows"
+    },
+    {
+      "pattern": "netsh\\s+advfirewall\\s+set\\s+allprofiles\\s+state\\s+off",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到尝试关闭 Windows 防火墙",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bschtasks\\b[^;&|\\n]*\\s/create\\b",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到创建计划任务（持久化）",
+      "os": "windows"
+    },
+    {
+      "pattern": "certutil\\s+.*?-(?:urlcache|decode|decodehex)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 certutil 下载或解码 payload（LOLBin 远程代码执行）",
+      "os": "windows"
+    },
+    {
+      "pattern": "bitsadmin\\s+.*?/transfer\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 bitsadmin 下载文件（BITS 远程下载）",
+      "os": "windows"
+    },
+    {
+      "pattern": "mshta\\s+.*?(?:https?://|javascript:|vbscript:)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 mshta 执行远程脚本（HTA 远程代码执行）",
+      "os": "windows"
+    },
+    {
+      "pattern": "regsvr32\\s+.*?(?:https?://|/i:)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 regsvr32 远程脚本注册（Squiblydoo 免杀执行）",
+      "os": "windows"
+    },
+    {
+      "pattern": "rundll32\\s+.*?(?:javascript:|https?://)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 rundll32 远程脚本执行",
+      "os": "windows"
+    },
+    {
+      "pattern": "Add-MpPreference\\s+.*?-Exclusion(?:Path|Process|Extension|IpAddress)",
+      "risk_level": "critical",
+      "risk_type": "persistence",
+      "reason": "检测到添加 Windows Defender 排除项（免杀持久化）",
+      "os": "windows"
+    },
+    {
+      "pattern": "Set-MpPreference\\s+.*?-Disable(?:RealtimeMonitoring|BehaviorMonitoring|IOAVProtection)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到关闭 Windows Defender 防护",
+      "os": "windows"
+    },
+    {
+      "pattern": "vssadmin\\s+delete\\s+shadows",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到删除卷影副本（勒索软件前置破坏）",
+      "os": "windows"
+    },
+    {
+      "pattern": "wbadmin\\s+delete\\s+(?:catalog|backup)",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到删除系统备份（勒索软件前置破坏）",
+      "os": "windows"
+    },
+    {
+      "pattern": "bcdedit\\s+.*?(?:recoveryenabled\\s+no|bootstatuspolicy\\s+ignoreallfailures)",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到禁用系统恢复（勒索软件前置破坏）",
+      "os": "windows"
+    },
+    {
+      "pattern": "wevtutil\\s+cl\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到清空 Windows 事件日志（痕迹清除）",
+      "os": "windows"
+    },
+    {
+      "pattern": "csrutil\\s+disable\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到关闭系统完整性保护 SIP（macOS 核心安全机制）",
+      "os": "macos"
+    },
+    {
+      "pattern": "csrutil\\s+authenticated-root\\s+disable\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到关闭认证根保护（绕过 SIP 的持久化手法）",
+      "os": "macos"
+    },
+    {
+      "pattern": "spctl\\s+(?:--master-disable|--global-disable|(?:-a|--add)\\s+disable)\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到关闭 Gatekeeper（macOS 应用来源校验）",
+      "os": "macos"
+    },
+    {
+      "pattern": "launchctl\\s+(?:load|bootstrap|submit)\\s+.*?(?:LaunchDaemons|LaunchAgents)",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到向 launchd 注册持久化服务（macOS 开机自启后门）",
+      "os": "macos"
+    },
+    {
+      "pattern": "security\\s+(?:find-generic-password|find-internet-password|dump-keychain)\\b.*?(?:\\s-w\\b|$)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到读取钥匙串密码（macOS 凭据存储）",
+      "os": "macos"
+    },
+    {
+      "pattern": "dscl\\s+\\.\\s+.*?-create\\b|dseditgroup\\s+.*?-a\\b",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到修改 macOS 本地目录服务（账户/组管理）",
+      "os": "macos"
+    },
+    {
+      "pattern": "nvram\\s+\\S+=",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到修改 NVRAM（可篡改启动参数）",
+      "os": "macos"
+    },
+    {
+      "pattern": "defaults\\s+write\\s+/Library/Preferences",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到修改系统级偏好设置",
+      "os": "macos"
+    },
+    {
+      "pattern": "chflags\\s+.*?(?:nouchg|noschg|norestricted)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到移除系统文件保护标志（绕过 SIP 前置步骤）",
+      "os": "macos"
+    },
+    {
+      "pattern": "tmutil\\s+delete(?:d)?\\b.*?(?:-a|--all|/)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除 Time Machine 备份（勒索软件前置破坏）",
+      "os": "macos"
+    },
+    {
+      "pattern": "\\bbm\\s+uninstall\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到卸载鸿蒙应用 (bm uninstall)",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bbm\\s+install\\s+(?:-p\\s+|-r\\s+)?(?:https?://|/[^\\s]+\\.(?:hsp|hap|hpm)\\b)",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到安装鸿蒙应用包（可能为恶意供应链）",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\baa\\s+force-stop\\b",
+      "risk_level": "medium",
+      "risk_type": "script_execution",
+      "reason": "检测到强制停止鸿蒙应用 (aa force-stop)",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bparam\\s+set\\b",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到修改鸿蒙系统参数 (param set)",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bparam\\s+dump\\b",
+      "risk_level": "medium",
+      "risk_type": "info_leak",
+      "reason": "检测到导出鸿蒙系统参数 (param dump)",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bhdc\\s+shell\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到 hdc 远程执行 shell（鸿蒙调试通道提权）",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bbegetctl\\s+(?:set|write|param\\s+set)\\b",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到通过 begetctl 修改鸿蒙系统配置",
+      "os": "harmony"
+    },
+    {
+      "pattern": "\\bhilog\\s+-c\\b",
+      "risk_level": "medium",
+      "risk_type": "script_execution",
+      "reason": "检测到清空鸿蒙系统日志（痕迹清除）",
+      "os": "harmony"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sudo\\s+(?:-\\S+\\s+)*|doas\\s+|nohup\\s+|time\\s+)*(?:shutdown|reboot|halt|poweroff)\\b(?!\\s*--help)",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到主机级关机/重启命令（shutdown/reboot/halt/poweroff）"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sudo\\s+(?:-\\S+\\s+)*)?systemctl\\s+(?:-\\S+\\s+)*(?:poweroff|reboot|halt|suspend|hibernate|hybrid-sleep|emergency|rescue|isolate)\\b",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到 systemctl 关机/重启/切换 target 等主机级操作"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*shutdown\\s+/(?:s|r|p|h|l)\\b",
+      "os": "windows",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到 Windows 关机/重启命令（shutdown /s|/r|/p|/h|/l）"
+    },
+    {
+      "pattern": "\\b(?:stop|restart)-computer\\b",
+      "os": "windows",
+      "risk_level": "high",
+      "risk_type": "sensitive_action",
+      "reason": "检测到 PowerShell 关机/重启命令（Stop-Computer/Restart-Computer）"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sudo\\s+(?:-\\S+\\s+)*|doas\\s+)?kill\\s+(?:-\\S+\\s+)*(?:0|1)(?![0-9])(?=\\s*(?:$|[;&|>]))",
+      "risk_level": "critical",
+      "risk_type": "sensitive_action",
+      "reason": "终止 init/systemd (PID 1) 或进程组 (PID 0)，会导致系统崩溃"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sudo\\s+(?:-\\S+\\s+)*|doas\\s+)?kill\\s+(?:-\\S+\\s+)*-\\d+(?=\\s*(?:$|[;&|>]))",
+      "risk_level": "critical",
+      "risk_type": "sensitive_action",
+      "reason": "kill 负 PID（终止所有可终止进程）"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sudo\\s+(?:-\\S+\\s+)*|doas\\s+)?killall5\\b",
+      "risk_level": "critical",
+      "risk_type": "sensitive_action",
+      "reason": "killall5 终止系统上所有进程"
+    },
+    {
+      "pattern": "taskkill\\b[^;&|\\n]*\\/(?:im|pid)\\s+(?:lsass|csrss|wininit|services|winlogon|smss|system)(?:\\.exe)?\\b",
+      "os": "windows",
+      "risk_level": "critical",
+      "risk_type": "sensitive_action",
+      "reason": "终止关键系统进程（lsass/csrss/wininit/services/winlogon/smss），会导致系统崩溃"
+    },
+    {
+      "pattern": "taskkill\\b[^;&|\\n]*\\/pid\\s+4\\b",
+      "os": "windows",
+      "risk_level": "critical",
+      "risk_type": "sensitive_action",
+      "reason": "终止 System 进程 (PID 4)，会导致系统崩溃"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*(?:sc|net)\\s+(?:stop|delete|config)\\s+(?:windefend|wscsvc|mpsSvc|sense|msSense|securityhealthservice|sgrmbroker|wdnisvc|wscsvc)\\b",
+      "os": "windows",
+      "risk_level": "high",
+      "risk_type": "defense_evasion",
+      "reason": "停用/删除 Windows 安全中心服务（Defender/防火墙），属于防御规避"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n(])\\s*([A-Za-z_][A-Za-z0-9_]*|:)\\s*\\(\\s*\\)\\s*\\{[^}]*\\1\\s*\\|[^}]*&",
+      "risk_level": "critical",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到 shell 函数式 fork 炸弹（自递归管道并后台执行）"
+    },
+    {
+      "pattern": "\\bdd\\b[^;&|\\n]*\\bof=/dev/(?:sd|hd|vd|nvme|mmcblk|loop|disk|mapper|md)\\w*",
+      "risk_level": "critical",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到向裸块设备写入 (dd of=/dev/sdX)"
+    },
+    {
+      "pattern": "\\bfor\\s+[A-Za-z_]\\w*\\s+in\\s+\\{1\\.\\.\\d{5,}\\}",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到超大规模循环（≥10000 次迭代）"
+    },
+    {
+      "pattern": "\\bseq\\s+1\\s+\\d{5,}\\b",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到超大规模序列生成（seq 1 N，N≥10000）"
+    },
+    {
+      "pattern": "\\bsleep\\s+\\d{5,}\\b|\\bsleep\\s*\\(\\s*\\d{5,}\\s*\\)",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到超长 sleep（≥10000 秒，疑似挂起耗尽）"
+    },
+    {
+      "pattern": "\\byes\\b[^;&|\\n]*\\|\\s*head\\s+-c\\s*\\d+[KMG]?\\b",
+      "risk_level": "high",
+      "risk_type": "resource_exhaustion",
+      "reason": "检测到大规模填充写入 (yes | head -c)"
+    },
+    {
+      "pattern": "<\\s*\\(\\s*(?:curl|wget|fetch)\\b",
+      "risk_level": "critical",
+      "risk_type": "supply_chain",
+      "reason": "检测到进程替换下载执行 <(curl ...)"
+    },
+    {
+      "pattern": "\\b(?:curl|wget)\\b[^;&|\\n]*\\|\\s*(?:lua|perl|ruby|php|node|python3?|pwsh|powershell)\\b",
+      "risk_level": "critical",
+      "risk_type": "supply_chain",
+      "reason": "检测到下载内容直接管道给解释器执行"
+    },
+    {
+      "pattern": "\\b(?:npm|yarn|pnpm)\\s+config\\s+set\\s+\\S*registry\\s+http://(?!(?:127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.|\\[?::1\\]?))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到把包管理器源改为外部 HTTP 源（明文，可被投毒）"
+    },
+    {
+      "pattern": "\\bpip3?\\s+config\\s+set\\s+\\S*index-url\\s+http://(?!(?:127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到把 pip 源改为外部 HTTP 源"
+    },
+    {
+      "pattern": "\\bgit\\s+remote\\s+set-url\\s+\\S+\\s+http://(?!(?:127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.|\\[?::1\\]?))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到把 git 远端改为外部 HTTP 源"
+    },
+    {
+      "pattern": "\\bgit\\s+submodule\\s+add\\s+http://(?!(?:127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从外部 HTTP 源添加子模块"
+    },
+    {
+      "pattern": "(?:curl|wget)\\b[^;&|\\n]*https?://[^;&|\\n]*(?:&&|;)[^;&|\\n]*\\b(?:dpkg\\s+-i|rpm\\s+-i|apt(-get)?\\s+install\\s+\\./)",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到下载后直接本地安装包（绕过仓库审核）"
+    },
+    {
+      "pattern": "\\busermod\\b[^;&|\\n]*\\b(?:sudo|wheel|admin|adm|root|docker|disk|lxd|shadow)\\b",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到把用户加入高权限组 (usermod -aG sudo|docker|...)"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bALTER\\s+TABLE\\b[^;&|\\n]*\\bDROP\\s+(?:COLUMN|CONSTRAINT)\\b",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到删除表列/约束 (ALTER TABLE ... DROP COLUMN)"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bUPDATE\\s+\\w+\\s+SET\\b(?![^;&|\\n]*\\bWHERE\\b)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到无 WHERE 的全表更新 (UPDATE ... SET ...)"
+    },
+    {
+      "pattern": "(?:^|[;&|\\n])\\s*at\\s+[^;&|\\n]{1,40}?\\s-f\\s+\\S+",
+      "risk_level": "high",
+      "risk_type": "persistence",
+      "reason": "检测到 at 定时任务植入（延后执行脚本）"
+    },
+    {
+      "pattern": "/proc/(?:\\d+|self|thread-self)/environ\\b",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到读取进程环境变量 (/proc/<pid>/environ，含密钥/令牌)"
+    },
+    {
+      "pattern": "\\bgrep\\b[^;&|\\n]*-[a-zA-Z]*r[a-zA-Z]*\\b[^;&|\\n]*(?:password|passwd|secret|token|api[_-]?key|credential)[^;&|\\n]*\\s(?:~|/home/[^/ ]+|\\$HOME)?/\\.(?:config|ssh|aws|gnupg|docker)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到递归搜索凭据关键词（间接读取凭据）"
+    },
+    {
+      "pattern": "\\bcat\\b[^;&|\\n]*\\s/var/log/(?:auth|secure|btmp|wtmp)\\.?log?\\b",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到读取认证日志（登录记录侦察）"
+    },
+    {
+      "pattern": "\\bcat\\b[^;&|\\n]*\\s/proc/net/(?:tcp|udp|raw)\\b",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到读取 /proc/net 连接表（网络侦察）"
+    },
+    {
+      "pattern": "\\bgit\\s+clone\\s+http://(?!(?:127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.|\\[?::1\\]?))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从外部 HTTP 源克隆仓库（明文源，可被投毒）"
+    },
+    {
+      "pattern": "\\bnpm\\s+(?:install|i)\\s+(?:--global\\s+)?https?://(?!(?:registry\\.npmjs\\.org|github\\.com|gitlab\\.com|127\\.|localhost|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.))",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从 URL 直接安装 npm 包（绕过仓库审核）"
+    },
+    {
+      "pattern": "\\beval\\b[^;&|\\n]*\\$\\([^)]*\\bbase64\\b[^)]*-[dD]\\b",
+      "risk_level": "critical",
+      "risk_type": "script_execution",
+      "reason": "检测到 base64 解码后执行（编码载荷规避检测）"
+    },
+    {
+      "pattern": "\\b(?:tar|zip)\\b[^;&|\\n]*\\|\\s*(?:ssh|nc|ncat|socat|curl)\\b",
+      "risk_level": "critical",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到打包后经管道外传（tar … | ssh/nc/curl）"
+    },
+    {
+      "pattern": "\\bgit\\s+config\\s+--global\\s+credential\\.helper\\s+(?:''|\\\"\\\"|store)\\b",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到把 git 凭据改为明文落盘或清空凭据助手"
+    },
+    {
+      "pattern": "\\bgcloud\\s+compute\\s+firewall-rules\\s+delete\\b",
+      "risk_level": "high",
+      "risk_type": "network_access",
+      "reason": "检测到删除云防火墙规则（放开网络边界）"
+    },
+    {
+      "pattern": "\\bssh\\s+(?:-\\w+\\s+)*-D\\s+\\d+",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到建立 SSH 动态代理（SOCKS 隧道）"
+    },
+    {
+      "pattern": "\\b(?:env|printenv)\\b[^;&|\\n]*\\|\\s*grep\\s+-[a-zA-Z]*i[a-zA-Z]*\\s+['\\\"]?(?:passwd|password|token|secret|credential|key)['\\\"]?",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到从环境变量中筛选凭据（env | grep -i <凭据词>）"
+    },
+    {
+      "pattern": "\\becho\\b[^;&|\\n]*\\$\\{?\\w*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|CREDENTIAL)\\w*\\}?",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到打印环境变量中的凭据（echo $…PASSWORD/TOKEN/…）"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3|mongosh|mongo)\\s+.*?\\bSELECT\\b[^;&|\\n]*\\b(?:password|passwd|secret|token|credit[_-]?card|card[_-]?number|cvv|ssn)\\w*",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到查询凭据/PII 字段（SELECT … password/credit_card/ssn）"
+    },
+    {
+      "pattern": "\\b(?:mysql|psql|sqlite3)\\s+.*?\\bSELECT\\s+\\*\\s+FROM\\s+(?:users?|accounts?|customers?|members?|employees?|staff|credit[_-]?cards?|payments?|cards?|admins?|passwd|shadow|secrets?|credentials?|tokens?|wallets?)\\b(?![^;&|\\n]*\\b(?:WHERE|LIMIT)\\b)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到无范围限制地整行读取用户/账户/支付类表（SELECT * FROM users/accounts/… 无 WHERE/LIMIT）"
+    },
+    {
+      "pattern": "\\b(?:mongo|mongosh)\\b[^;&|\\n]*\\bdb\\.(?:users?|accounts?|customers?|members?|employees?|staff|credit[_-]?cards?|payments?|cards?|admins?|passwd|shadow|secrets?|credentials?|tokens?|wallets?)\\.(?:find|findOne|aggregate)\\s*\\(",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到遍历读取用户/账户/支付类集合（db.users.find()）"
+    },
+    {
+      "pattern": "\\bgit\\s+push\\b[^;&|\\n]*(?:--force(?!-with-lease)|(?<![-\\w])-f\\b)",
+      "risk_level": "high",
+      "risk_type": "script_execution",
+      "reason": "检测到强制推送覆盖远端历史（git push --force；--force-with-lease 不受影响）"
+    },
+    {
+      "pattern": "\\bscp\\b[^;&|\\n]*\\s-[a-zA-Z]*r[a-zA-Z]*\\s[^;&|\\n]*(?:~|/home|/etc|/var|/root)[^;&|\\n]*\\s(?:[^\\s:]*@)?(?!\\S*(?:\\.internal|\\.local|\\.corp|\\.lan|localhost|127\\.|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.))[A-Za-z0-9_.-]+:",
+      "risk_level": "high",
+      "risk_type": "data_exfiltration",
+      "reason": "检测到递归复制敏感目录到外部主机（scp -r ~/ /home/… user@host:）"
+    },
+    {
+      "pattern": "\\bssh\\s+(?:-\\w+\\s+)*-[LR]\\s+\\S+",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到建立 SSH 端口转发隧道（ssh -L/-R）"
+    },
+    {
+      "pattern": "\\bpip3?\\s+uninstall\\b[^;&|\\n]*--break-system-packages",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到强制卸载系统包（--break-system-packages）"
+    },
+    {
+      "pattern": "\\b(?:npm|yarn|pnpm)\\s+(?:i|install|add)\\b[^;&|\\n]*\\b(?:malicious|backdoor|evil|attacker|c2)[-\\w]*",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到安装名称明显恶意的包"
+    },
+    {
+      "pattern": "\\bdocker\\s+pull\\s+[a-zA-Z0-9.-]*(?:malicious|backdoor|evil|attacker|c2)[a-zA-Z0-9.:-]*",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到从不可信 registry 拉取镜像"
+    },
+    {
+      "pattern": "\\bpip3?\\s+install\\b[^;&|\\n]*\\b(?:numpy|requests|pandas|flask|django|tensorflow|torch|scipy|setuptools|urllib3|six|wheel)\\d+\\b",
+      "risk_level": "high",
+      "risk_type": "supply_chain",
+      "reason": "检测到疑似仿冒包名（知名包 + 数字后缀，typosquatting）"
+    },
+    {
+      "pattern": "(?:MCP|mcp)[^;&|\\n]*(?:curl\\s+https?://|~/\\.(?:ssh|aws|gnupg)|id_rsa|\\.aws/credentials)",
+      "risk_level": "high",
+      "risk_type": "file_access",
+      "reason": "检测到 MCP 连接请求引用凭据路径或含外联指令（工具描述投毒）"
+    },
+    {
+      "pattern": "(?:MCP|mcp)[^;&|\\n]*(?:(?:drop|delete|sudo|admin|export|write)\\s*:\\s*(?:any|all|\\*)|任意\\s*(?:shell|命令))",
+      "risk_level": "high",
+      "risk_type": "privilege_escalation",
+      "reason": "检测到 MCP 请求通配管理权限（drop:any / sudo:any / delete:any）"
+    },
+    {
+      "pattern": "\\bnet\\s+use\\b[^;&|\\n]*\\\\\\\\[^;&|\\n]*\\\\(?:c|admin|ipc)\\$(?=[\\s/]|$)",
+      "risk_level": "high",
+      "risk_type": "lateral_movement",
+      "reason": "检测到挂载远程管理共享（C$/admin$/IPC$），横向移动的常见手法",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\b(?:procdump|procdump64|sqldumper)(?:\\.exe)?\\b[^;&|\\n]*\\blsass(?:\\.exe)?\\b",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到转储 LSASS 进程内存（用于提取账户凭据）",
+      "os": "windows"
+    },
+    {
+      "pattern": "\\bcomsvcs\\.dll\\b[^;&|\\n]*\\bMiniDump\\b",
+      "risk_level": "critical",
+      "risk_type": "file_access",
+      "reason": "检测到通过 comsvcs.dll MiniDump 转储进程内存",
+      "os": "windows"
     }
   ],
   "injection_detection": [
     {
       "keyword": "ignore previous instructions",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "ignore all previous",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "disregard all prior",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "forget everything",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "忽略之前的指令",
       "risk_level": "critical",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "忽略所有先前的",
       "risk_level": "critical",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "忽略上面所有",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "请忘记之前",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "you are now",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "you are no longer",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "new instructions",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "from now on, you",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "你现在是一个",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "你不再是一个",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "从现在开始你",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "你的新角色是",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "system prompt",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "reveal your instructions",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "output your instructions",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "repeat your instructions",
       "risk_level": "medium",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "系统提示",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "输出你的指令",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "重复你的指令",
       "risk_level": "medium",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "this is an authorized test",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "security audit approved",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "admin override",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "debug mode",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "maintenance mode",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "这是授权的测试",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "安全审计已批准",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "管理员覆盖",
       "risk_level": "critical",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "调试模式",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "<script>",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "javascript:",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "onerror=",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "onload=",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "=== END OF",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "--- END SYSTEM",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "[END OF",
       "risk_level": "high",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "=== 结束",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "--- 结束系统",
       "risk_level": "high",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "developer mode",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "DAN mode",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "jailbreak",
       "risk_level": "critical",
-      "lang": "en"
+      "lang": "en",
+      "os": "all"
     },
     {
       "keyword": "开发者模式",
       "risk_level": "critical",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
     },
     {
       "keyword": "越狱",
       "risk_level": "critical",
-      "lang": "zh"
+      "lang": "zh",
+      "os": "all"
+    },
+    {
+      "keyword": "ignore all security",
+      "risk_level": "critical",
+      "lang": "en",
+      "os": "all"
+    },
+    {
+      "keyword": "bypass audit",
+      "risk_level": "high",
+      "lang": "en",
+      "os": "all"
+    },
+    {
+      "keyword": "disable guard",
+      "risk_level": "critical",
+      "lang": "en",
+      "os": "windows"
+    },
+    {
+      "keyword": "绕过审计",
+      "risk_level": "critical",
+      "lang": "zh",
+      "os": "windows"
+    },
+    {
+      "keyword": "禁用安全检查",
+      "risk_level": "critical",
+      "lang": "zh",
+      "os": "windows"
     }
   ],
   "sensitive_path_access": [
@@ -678,6 +1830,48 @@
       "scope": "root"
     },
     {
+      "path": "/etc/cron.hourly/",
+      "risk_level": "high",
+      "desc": "系统定时任务目录（小时级）——可放置脚本，重启/定时后以 root 执行",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/cron.daily/",
+      "risk_level": "high",
+      "desc": "系统定时任务目录（日级）",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/cron.weekly/",
+      "risk_level": "high",
+      "desc": "系统定时任务目录（周级）",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/cron.monthly/",
+      "risk_level": "high",
+      "desc": "系统定时任务目录（月级）",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/init.d/",
+      "risk_level": "high",
+      "desc": "SysV init 启动脚本目录——agent 写入脚本即持久化（重启后以 root 执行，不依赖 cron）",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
+      "path": "/etc/rc*.d/",
+      "risk_level": "high",
+      "desc": "SysV init 运行级目录——指向 init.d 的符号链接，控制各运行级启动",
+      "deny_mode": "deny_write",
+      "scope": "root"
+    },
+    {
       "path": "/var/spool/cron/",
       "risk_level": "high",
       "desc": "用户级定时任务目录",
@@ -690,6 +1884,20 @@
       "desc": "systemd 服务配置",
       "deny_mode": "deny_write",
       "scope": "root"
+    },
+    {
+      "path": ".config/systemd/user/",
+      "risk_level": "high",
+      "desc": "用户级 systemd 服务目录——写 .service 并 enable 即用户级持久化（登录后运行）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".config/autostart/",
+      "risk_level": "high",
+      "desc": "桌面自启动目录——写 .desktop 即登录自启动（Desktop Entry，持久化）",
+      "deny_mode": "deny_write",
+      "scope": "home"
     },
     {
       "path": "/etc/ssh/sshd_config",
@@ -846,6 +2054,55 @@
       "scope": "credential"
     },
     {
+      "path": ".config/agentmoss/auth_token",
+      "risk_level": "critical",
+      "desc": "AgentMoss 访问 token（拿到即可冒充 agent 调用分析接口、读取其历史）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".agentmoss/stateful_chains",
+      "risk_level": "critical",
+      "desc": "AgentMoss 组合链状态库（各 agent 的动作历史与反例路径）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": "agent_moss_policy_cache",
+      "risk_level": "medium",
+      "desc": "AgentMoss policy 缓存（含会话 id 与策略文档）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
+      "path": "agent_moss/rules",
+      "risk_level": "medium",
+      "desc": "AgentMoss 内置检测规则（读=暴露检测逻辑，可据此构造绕过）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
+      "path": "agent_moss/skills",
+      "risk_level": "medium",
+      "desc": "AgentMoss 内置 Skill（L3 语义检测口径，读=暴露判定标准）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
+      "path": "agent_moss/agents/",
+      "risk_level": "medium",
+      "desc": "三方 agent 定制规则目录（读=暴露针对该 agent 的检测规则）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
+      "path": "agent_moss/scenarios/",
+      "risk_level": "medium",
+      "desc": "场景定制规则目录（读=暴露客户沙箱的目录白名单等部署约束）",
+      "deny_mode": "deny_read",
+      "scope": "root"
+    },
+    {
       "path": ".config/agentmoss/config.json",
       "risk_level": "critical",
       "desc": "AgentMoss 配置中的 LLM api_key（凭据），读=泄露，写=篡改，均不可",
@@ -865,6 +2122,325 @@
       "desc": "AgentMoss Brain 数据（rules.json/skill_meta.json 自学习成果），agent 可读自查但不可写（防投毒）",
       "deny_mode": "deny_write",
       "scope": "home"
+    },
+    {
+      "path": ".pgpass",
+      "risk_level": "critical",
+      "desc": "PostgreSQL 密码文件（明文数据库凭据）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".netrc",
+      "risk_level": "critical",
+      "desc": "网络凭据文件（FTP/HTTP 机器登录凭据）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".bash_history",
+      "risk_level": "high",
+      "desc": "Shell 命令历史（可能含明文密码/敏感操作）——读=泄露、写/清空=毁证，均不可",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".mysql_history",
+      "risk_level": "high",
+      "desc": "MySQL 命令历史（可能含密码）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".psql_history",
+      "risk_level": "high",
+      "desc": "PostgreSQL 命令历史（可能含密码）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".git-credentials",
+      "risk_level": "critical",
+      "desc": "Git 凭据文件（含用户名与访问令牌）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".ssh/id_ecdsa",
+      "risk_level": "critical",
+      "desc": "SSH ECDSA 私钥",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".ssh/id_dsa",
+      "risk_level": "critical",
+      "desc": "SSH DSA 私钥",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".config/gh/hosts.yml",
+      "risk_level": "critical",
+      "desc": "GitHub CLI 凭据（含 OAuth token）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".docker/config.json",
+      "risk_level": "critical",
+      "desc": "Docker registry 凭据（含 auth）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".npmrc",
+      "risk_level": "high",
+      "desc": "npm 凭据文件（含 _authToken）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": "credentials.json",
+      "risk_level": "critical",
+      "desc": "凭据 JSON 文件",
+      "deny_mode": "deny_both",
+      "scope": "credential"
+    },
+    {
+      "path": "C:\\Windows\\System32\\config\\SAM",
+      "risk_level": "critical",
+      "desc": "Windows SAM 安全账户管理器",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\System32\\config\\SECURITY",
+      "risk_level": "critical",
+      "desc": "Windows 安全配置",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\System32\\config\\SYSTEM",
+      "risk_level": "high",
+      "desc": "Windows 系统配置",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\System32\\config\\RegBack",
+      "risk_level": "high",
+      "desc": "注册表备份（含 SAM 副本）",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\System32\\LSA",
+      "risk_level": "high",
+      "desc": "LSA 认证配置",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\NTDS",
+      "risk_level": "critical",
+      "desc": "Active Directory 数据库",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\repair",
+      "risk_level": "high",
+      "desc": "系统修复备份（含 SAM 备份）",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\Windows\\System32\\GroupPolicy",
+      "risk_level": "high",
+      "desc": "组策略配置",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "HKLM\\SAM",
+      "risk_level": "critical",
+      "desc": "注册表 SAM 分支",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "HKLM\\SECURITY",
+      "risk_level": "critical",
+      "desc": "注册表 SECURITY 分支",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "HKLM\\SYSTEM\\CurrentControlSet",
+      "risk_level": "critical",
+      "desc": "注册表系统关键配置",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "HKLM\\SOFTWARE\\Microsoft",
+      "risk_level": "high",
+      "desc": "注册表 HKLM 软件配置",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "HKCU\\SOFTWARE\\Microsoft",
+      "risk_level": "medium",
+      "desc": "注册表 HKCU 软件配置",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": ".ssh\\id_rsa",
+      "risk_level": "critical",
+      "desc": "SSH 私钥 (Windows)",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".ssh\\id_ed25519",
+      "risk_level": "critical",
+      "desc": "SSH 私钥 (Windows, ed25519)",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".ssh\\authorized_keys",
+      "risk_level": "high",
+      "desc": "SSH 授权密钥 (Windows)",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".aws\\credentials",
+      "risk_level": "critical",
+      "desc": "AWS 云凭据 (Windows)",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".ssh",
+      "risk_level": "high",
+      "desc": "SSH 配置目录（Windows）——整目录删除拦截，目录创建/权限设置放行",
+      "deny_mode": "deny_write",
+      "dir_del_only": true,
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".aws",
+      "risk_level": "critical",
+      "desc": "AWS 配置目录（Windows）——整目录删除拦截，目录创建/权限设置放行",
+      "deny_mode": "deny_write",
+      "dir_del_only": true,
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": "C:\\ProgramData",
+      "risk_level": "medium",
+      "desc": "程序数据目录（共享配置）",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "windows"
+    },
+    {
+      "path": "Library/Keychains",
+      "risk_level": "critical",
+      "desc": "macOS 钥匙串目录（系统/用户凭据）",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "macos"
+    },
+    {
+      "path": "/Library/LaunchDaemons",
+      "risk_level": "high",
+      "desc": "系统级 launchd 服务（开机自启持久化）",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "macos"
+    },
+    {
+      "path": "/Library/LaunchAgents",
+      "risk_level": "high",
+      "desc": "全局 launchd 用户代理（持久化）",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "macos"
+    },
+    {
+      "path": "Library/LaunchAgents",
+      "risk_level": "high",
+      "desc": "用户级 launchd 代理（持久化）",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "macos"
+    },
+    {
+      "path": "/private/var/db/dslocal",
+      "risk_level": "critical",
+      "desc": "本地目录服务数据库（账户哈希）",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "macos"
+    },
+    {
+      "path": "/System/Library",
+      "risk_level": "high",
+      "desc": "macOS 系统框架与内核扩展",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "macos"
+    },
+    {
+      "path": "/data/app",
+      "risk_level": "high",
+      "desc": "鸿蒙应用安装目录（含系统应用）",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "harmony"
+    },
+    {
+      "path": "/data/service/el1/public/param",
+      "risk_level": "critical",
+      "desc": "鸿蒙系统参数持久化目录",
+      "deny_mode": "deny_both",
+      "scope": "root",
+      "os": "harmony"
+    },
+    {
+      "path": "/data/log",
+      "risk_level": "high",
+      "desc": "鸿蒙系统日志目录",
+      "deny_mode": "deny_write",
+      "scope": "root",
+      "os": "harmony"
     }
-  ]
+  ],
+  "_comment": "\n2026-09-11 新增：iptables 防火墙规则修改（T1562.004）+ SSH 跳过密钥验证（横向移动），原在 user_rules.json 下沉至此——攻击形态清晰、可静态判定，user_rules 回归仅存用户自定义例外的本位。"
 }

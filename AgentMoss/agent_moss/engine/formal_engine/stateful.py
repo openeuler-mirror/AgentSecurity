@@ -70,6 +70,10 @@ class StateNode:
     is_error: bool = False
     # 生命周期："" (默认) | "alive" | "dead" | "never_activated"
     lifecycle: str = ""
+    #: 动作来源（哪个 agent 上报的）。仅用于取证/告警展示，不参与链匹配。
+    agent_id: str = ""
+    #: 来源实例（哪个 agent 安装/实例上报的）。仅用于展示层脱敏，不参与链匹配。
+    instance_id: str = ""
     # 真实发生时间（ISO 字符串，来自 action.called_at；无则 None → 退化为 seq 序号）
     timestamp: str | None = None
 
@@ -106,6 +110,36 @@ class ChainMatch:
             "reason": self.reason,
             "risk_level": self.risk_level,
             "path": self.path,
+            "graph": self.build_graph(),
+        }
+
+    def build_graph(self) -> dict:
+        """把链路径转成前端可画的结构化图（相邻节点用 next 边）。"""
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        for k, item in enumerate(self.path):
+            nodes.append({
+                "session_id": item[0],
+                "seq": item[1],
+                "stage": self.stages[k] if k < len(self.stages) else "",
+                "action_detail": str(item[2]) if len(item) > 2 else "",
+                "resources": [],
+                "role": self.stages[k] if k < len(self.stages) else "",
+                "instance_id": str(item[5]) if len(item) > 5 else "",
+            })
+            if k > 0:
+                edges.append({"from": k - 1, "to": k, "type": "next"})
+        if nodes:
+            nodes[-1]["witness"] = True
+        return {
+            "property_id": "cross-" + self.chain_id,
+            "property_short": "P1",
+            "property_name": "跨会话组合链",
+            "property_expression": [
+                {"token": s, "node_index": i} for i, s in enumerate(self.stages)
+            ],
+            "nodes": nodes,
+            "edges": edges,
         }
 
 
@@ -227,6 +261,13 @@ class StatefulChainTracker:
         self._tainted: set = set()
         # 敏感数据 taint 反索引：资源路径 → 已染毒（O(1) 命中，避免扫描全部染毒节点）
         self._tainted_resources: set = set()
+        # taint 传播路径（前端攻击链图用）：
+        # node_idx -> 使该节点染毒的前驱 node_idx（CRED 源为 None）
+        self._taint_parent: dict[int, int | None] = {}
+        # (parent_idx, child_idx) -> 触发传播的共享资源（图上的 data 边标签）
+        self._taint_edge_label: dict[tuple[int, int], str] = {}
+        # 资源 -> 首次染毒该资源的节点 seq（给传播节点找父）
+        self._taint_origin: dict[str, int] = {}
         # 生命周期：资源路径 -> 最近活跃 seq（"alive" 判定）
         self._alive_resources: dict[str, int] = {}
 
@@ -365,7 +406,7 @@ class StatefulChainTracker:
         for s in sessions or []:
             sid = str(s.get("session_id", "s"))
             for a in s.get("action_history", []) or []:
-                node = self._append(a, sid)
+                node = self._append(a, sid, instance_id=str(s.get("instance_id") or ""))
                 if node is None:
                     continue
                 added += 1
@@ -381,6 +422,8 @@ class StatefulChainTracker:
         session_id: str = "current",
         is_error: bool = False,
         external_resources: dict | None = None,
+        agent_id: str = "",
+        instance_id: str = "",
     ) -> "AdvanceResult":
         """增量推进：把当前动作追加到时间线 → 链指针推进 → 判定。
 
@@ -391,7 +434,10 @@ class StatefulChainTracker:
         """
         # 1. 新节点
         seq = self.seq_next
-        node = self._append(a_next, session_id, is_error=is_error)
+        node = self._append(
+            a_next, session_id, is_error=is_error,
+            agent_id=agent_id, instance_id=instance_id,
+        )
         if node is None:
             return AdvanceResult(seq=self.seq_next)
         seq = self.seq_next  # 追加后的下一个序号（节点 seq 索引为 seq_next-1）
@@ -417,7 +463,14 @@ class StatefulChainTracker:
             exfil=exfil_violations,
         )
 
-    def _append(self, action: dict, session_id: str, is_error: bool = False) -> StateNode | None:
+    def _append(
+        self,
+        action: dict,
+        session_id: str,
+        is_error: bool = False,
+        agent_id: str = "",
+        instance_id: str = "",
+    ) -> StateNode | None:
         """构造并追加一个节点，返回节点；空 detail 跳过。
 
         时间线上限保护：防无限增长（高频大项目下平凡动作会持续产生节点）。
@@ -444,6 +497,8 @@ class StatefulChainTracker:
             resources=_extract_resources(ad),
             instances=_extract_instances(ad, stage),
             is_error=is_error,
+            agent_id=str(action.get("agent_id") or agent_id or ""),
+            instance_id=str(action.get("instance_id") or instance_id or ""),
             lifecycle=self._lifecycle_for(ad, stage, is_error),
             # 调用方带 called_at → 用真实发生时间；否则用本地接收时刻（实时路径）
             timestamp=(str(action.get("called_at", "")) or self._now()),
@@ -540,7 +595,10 @@ class StatefulChainTracker:
         want = stages[0]
         for n in self.nodes:
             if n.stage == want:
-                path.append((n.session_id, n.seq, n.action_detail[:60], n.timestamp))
+                path.append(
+                    (n.session_id, n.seq, n.action_detail[:60], n.timestamp,
+                     n.agent_id, n.instance_id)
+                )
                 idx = stages.index(n.stage)
                 if idx + 1 < len(stages):
                     want = stages[idx + 1]
@@ -551,42 +609,125 @@ class StatefulChainTracker:
     # ---------------- 敏感数据 taint（P2） ----------------
 
     def _advance_taint(self, node: StateNode) -> None:
-        """增量 taint：新节点若染毒则记录；若有共享载体则传播。"""
+        """增量 taint：新节点若染毒则记录；若有共享载体则传播。
+
+        同时记录传播来源（parent + 共享资源），供前端画攻击链图。
+        """
         if node.lifecycle == "dead":
             return
         idx = node.seq
         tainted_res: set = set()
+        parent: int | None = None
+        label = ""
         for r in node.resources:
             if self._resource_tainted(r):
                 tainted_res.add(r)
+                if parent is None:
+                    parent = self._taint_origin.get(r)
+                    label = r
         if node.stage == "CRED" and any(_CRED_FILE_RE.search(r) for r in node.resources):
             self._tainted.add(idx)
+            parent = None  # 凭据源 = 链头
+            label = ""
             for r in node.resources:
                 tainted_res.add(r)
         if tainted_res:
             self._tainted.add(idx)
-            self._tainted_resources.update(tainted_res)
+            self._taint_parent[idx] = parent
+            if parent is not None:
+                self._taint_edge_label[(parent, idx)] = label
+            # 节点一旦染毒，它的**全部资源**都视为携带同一份敏感数据：
+            # mv/cp 的目标路径也是这份数据的载体，必须一起染毒。旧实现只
+            # update(tainted_res)（命中的旧资源），目标路径没染毒 → 改名链
+            # 在第二次 mv 处断开（2026-10 修，双端同步）。
+            for r in node.resources:
+                self._tainted_resources.add(r)
+                self._taint_origin.setdefault(r, idx)
 
     def _resource_tainted(self, resource: str) -> bool:
         """某个资源是否已被染毒（O(1) 反索引，避免每次扫描全部染毒节点）。"""
         return resource in self._tainted_resources
+
+    def _trace_taint_chain(self, idx: int) -> list[int]:
+        """沿 taint parent 回溯出 CRED 源 → 当前节点的完整路径。"""
+        chain = [idx]
+        seen = {idx}
+        while True:
+            parent = self._taint_parent.get(chain[-1])
+            if parent is None or parent in seen:
+                break
+            chain.append(parent)
+            seen.add(parent)
+        return list(reversed(chain))
+
+    def _taint_graph(self, chain: list[int]) -> dict:
+        """把 taint 路径转成前端可画的结构化图（data 边带共享资源标签）。"""
+        g_nodes: list[dict] = []
+        g_edges: list[dict] = []
+        for k, ni in enumerate(chain):
+            n = self.nodes[ni]
+            role = "source" if k == 0 else ("sink" if k == len(chain) - 1 else "carrier")
+            g_nodes.append({
+                "session_id": n.session_id,
+                "seq": n.seq,
+                "stage": n.stage,
+                "action_detail": n.action_detail,
+                "resources": sorted(n.resources),
+                "role": role,
+                "instance_id": n.instance_id,
+            })
+            if k > 0:
+                prev = chain[k - 1]
+                g_edges.append({
+                    "from": k - 1,
+                    "to": k,
+                    "type": "data",
+                    "label": self._taint_edge_label.get((prev, ni), ""),
+                })
+        if g_nodes:
+            g_nodes[-1]["witness"] = True
+        expr: list[dict] = [{"token": "CRED", "node_index": 0}]
+        if len(chain) > 2:
+            expr.append({"token": "共享载体", "node_index": list(range(1, len(chain) - 1))})
+        expr.append({"token": "EXFIL", "node_index": len(chain) - 1})
+        return {
+            "property_id": "sensitive-data-flow",
+            "property_short": "P2",
+            "property_name": "敏感数据传播外传",
+            "property_expression": expr,
+            "nodes": g_nodes,
+            "edges": g_edges,
+        }
 
     def _check_exfil_after_taint(self, node: StateNode) -> list:
         """若当前节点已染毒且是外传形态 → 敏感数据传播外传。"""
         if node.seq not in self._tainted:
             return []
         if _EXFIL_RE.search(node.action_detail):
-            src = self._taint_source(node)
+            chain = self._trace_taint_chain(node.seq)
+            src = self._taint_source(node, chain)
             return [{
                 "property_id": "sensitive-data-flow",
                 "reason": f"敏感数据传播外传：{src} → {node.session_id}#{node.seq} 经共享载体外发",
                 "risk_level": "critical",
-                "path": [(node.session_id, node.seq, node.action_detail[:60])],
+                "path": [
+                    (self.nodes[j].session_id, self.nodes[j].seq,
+                     self.nodes[j].action_detail[:60], self.nodes[j].timestamp,
+                     self.nodes[j].agent_id, self.nodes[j].instance_id)
+                    for j in chain
+                ],
+                "graph": self._taint_graph(chain),
                 "node_idx": node.seq,
             }]
         return []
 
-    def _taint_source(self, node: StateNode) -> str:
+    def _taint_source(self, node: StateNode, chain: list[int] | None = None) -> str:
+        if chain:
+            n = self.nodes[chain[0]]
+            for r in node.resources:
+                if r in n.resources:
+                    return f"{n.session_id}#{n.seq} 访问 {r}"
+        # 兜底（旧状态无 parent 信息）
         for i in sorted(self._tainted):
             if i != node.seq:
                 n = self.nodes[i]
@@ -607,6 +748,10 @@ class StatefulChainTracker:
             ],
             "ptrs": dict(self._ptr),
             "tainted": sorted(self._tainted),
+            # taint 传播路径（前端攻击链图）；taint_edge_label 是 tuple key，
+            # 不入快照（重启后可从 parent + 资源交集重建，结构不受影响）。
+            "taint_parent": {str(k): v for k, v in self._taint_parent.items()},
+            "taint_origin": dict(self._taint_origin),
             "alive": {k: v for k, v in self._alive_resources.items()},
             "seq_next": self.seq_next,
         }
@@ -626,6 +771,8 @@ class StatefulChainTracker:
                 resources=tuple(raw.get("resources") or ()),
                 instances=tuple(raw.get("instances") or ()),  # 旧快照无此字段 → 空
                 is_error=bool(raw.get("is_error", False)),
+                agent_id=str(raw.get("agent_id", "")),  # 旧快照无此字段 → 空
+                instance_id=str(raw.get("instance_id", "")),  # 旧快照无此字段 → 空
                 lifecycle=str(raw.get("lifecycle", "")),
                 timestamp=(raw.get("timestamp") or None),  # 旧快照无此字段 → None
             )
@@ -633,14 +780,39 @@ class StatefulChainTracker:
         self.seq_next = int(snapshot.get("seq_next", len(self.nodes)))
         self._ptr = {str(k): int(v) for k, v in (snapshot.get("ptrs") or {}).items()}
         self._tainted = set(int(i) for i in (snapshot.get("tainted") or []))
+        self._taint_parent = {
+            int(k): (int(v) if v is not None else None)
+            for k, v in (snapshot.get("taint_parent") or {}).items()
+        }
+        self._taint_origin = {
+            str(k): int(v) for k, v in (snapshot.get("taint_origin") or {}).items()
+        }
+        self._taint_edge_label = {}  # 旧快照无此字段：边标签缺失，图结构不受影响
         # 重建 taint 资源反索引：由染毒节点的 resources 推导（并集 all）
         self._tainted_resources = set()
         for i in self._tainted:
             if 0 <= i < len(self.nodes):
                 self._tainted_resources.update(self.nodes[i].resources)
+        if self._tainted and not self._taint_parent:
+            self._rebuild_taint_parent()
+        if not self._taint_origin:
+            for i in sorted(self._tainted):
+                for r in self.nodes[i].resources:
+                    self._taint_origin.setdefault(r, i)
         self._alive_resources = {
             str(k): int(v) for k, v in (snapshot.get("alive") or {}).items()
         }
+
+    def _rebuild_taint_parent(self) -> None:
+        """旧快照无 parent 信息时，按 seq 顺序找最近的资源相交染毒前驱。"""
+        for i in sorted(self._tainted):
+            n = self.nodes[i]
+            parent = None
+            for j in range(i - 1, -1, -1):
+                if j in self._tainted and (self.nodes[j].resources & n.resources):
+                    parent = j
+                    break
+            self._taint_parent[i] = parent
 
 
 @dataclass

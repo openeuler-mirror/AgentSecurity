@@ -2,7 +2,7 @@
 
 ## 文件
 
-- `rules.json` — xiaoO 专属规则的单一事实源，Python 与 TypeScript 两端共享
+- `rules.json` — xiaoO 专属规则的单一事实源
 
 ## 规则内容
 
@@ -32,7 +32,6 @@ xiaoO 专属绕过词（同步自 audit_agent heuristic_detector.py 行 361–36
 ## 加载机制
 
 - py: `agent_moss.agents.get_agent_extensions("xiaoo")` → `AgentExtensions`
-- ts: `ts/src/agents/index.ts:getAgentExtensions("xiaoo")` → `AgentExtensions`
 
 detection pipeline 把 `extra_*` 追加到通用规则之后；通用规则先匹配命中即短路。
 

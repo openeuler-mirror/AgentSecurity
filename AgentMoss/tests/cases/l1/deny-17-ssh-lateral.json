@@ -6,7 +6,7 @@
   "expected_layers": [
     "1.1"
   ],
-  "expected_risk_level": "high",
+  "expected_risk_level": "critical",
   "expected_risk_type": "file_access",
   "input": {
     "session_id": "test-ssh-lateral",

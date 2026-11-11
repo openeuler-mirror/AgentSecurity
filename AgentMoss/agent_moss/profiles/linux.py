@@ -6,65 +6,10 @@
 
 import os
 import re
+from functools import cached_property
 from pathlib import Path
 
 from .base import OSProfile, CommandPattern, SensitivePath, IntentDeviationPattern
-
-_DEFAULT_INJECTION_KEYWORDS: list[dict] = [
-    # ---- 指令覆盖 / Instruction Override ----
-    {"keyword": "ignore previous instructions", "risk_level": "critical", "lang": "en"},
-    {"keyword": "ignore all previous", "risk_level": "critical", "lang": "en"},
-    {"keyword": "disregard all prior", "risk_level": "critical", "lang": "en"},
-    {"keyword": "forget everything", "risk_level": "high", "lang": "en"},
-    {"keyword": "忽略之前的指令", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "忽略所有先前的", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "忽略上面所有", "risk_level": "high", "lang": "zh"},
-    {"keyword": "请忘记之前", "risk_level": "high", "lang": "zh"},
-    # ---- 角色劫持 / Role Hijacking ----
-    {"keyword": "you are now", "risk_level": "high", "lang": "en"},
-    {"keyword": "you are no longer", "risk_level": "high", "lang": "en"},
-    {"keyword": "new instructions", "risk_level": "high", "lang": "en"},
-    {"keyword": "from now on, you", "risk_level": "high", "lang": "en"},
-    {"keyword": "你现在是一个", "risk_level": "high", "lang": "zh"},
-    {"keyword": "你不再是一个", "risk_level": "high", "lang": "zh"},
-    {"keyword": "从现在开始你", "risk_level": "high", "lang": "zh"},
-    {"keyword": "你的新角色是", "risk_level": "high", "lang": "zh"},
-    # ---- 命令注入 / Command Injection ----
-    {"keyword": "system prompt", "risk_level": "high", "lang": "en"},
-    {"keyword": "reveal your instructions", "risk_level": "high", "lang": "en"},
-    {"keyword": "output your instructions", "risk_level": "high", "lang": "en"},
-    {"keyword": "repeat your instructions", "risk_level": "medium", "lang": "en"},
-    {"keyword": "系统提示", "risk_level": "high", "lang": "zh"},
-    {"keyword": "输出你的指令", "risk_level": "high", "lang": "zh"},
-    {"keyword": "重复你的指令", "risk_level": "medium", "lang": "zh"},
-    # ---- 社会工程 / Social Engineering ----
-    {"keyword": "this is an authorized test", "risk_level": "high", "lang": "en"},
-    {"keyword": "security audit approved", "risk_level": "high", "lang": "en"},
-    {"keyword": "admin override", "risk_level": "critical", "lang": "en"},
-    {"keyword": "debug mode", "risk_level": "high", "lang": "en"},
-    {"keyword": "maintenance mode", "risk_level": "high", "lang": "en"},
-    {"keyword": "这是授权的测试", "risk_level": "high", "lang": "zh"},
-    {"keyword": "安全审计已批准", "risk_level": "high", "lang": "zh"},
-    {"keyword": "管理员覆盖", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "调试模式", "risk_level": "high", "lang": "zh"},
-    # ---- XSS / 注入 ----
-    {"keyword": "<script>", "risk_level": "high", "lang": "en"},
-    {"keyword": "javascript:", "risk_level": "high", "lang": "en"},
-    {"keyword": "onerror=", "risk_level": "high", "lang": "en"},
-    {"keyword": "onload=", "risk_level": "high", "lang": "en"},
-    # ---- 伪造边界 / Fake Boundaries ----
-    {"keyword": "=== END OF", "risk_level": "high", "lang": "en"},
-    {"keyword": "--- END SYSTEM", "risk_level": "high", "lang": "en"},
-    {"keyword": "[END OF", "risk_level": "high", "lang": "en"},
-    {"keyword": "=== 结束", "risk_level": "high", "lang": "zh"},
-    {"keyword": "--- 结束系统", "risk_level": "high", "lang": "zh"},
-    # ---- 开发者模式 ----
-    {"keyword": "developer mode", "risk_level": "critical", "lang": "en"},
-    {"keyword": "DAN mode", "risk_level": "critical", "lang": "en"},
-    {"keyword": "jailbreak", "risk_level": "critical", "lang": "en"},
-    {"keyword": "开发者模式", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "越狱", "risk_level": "critical", "lang": "zh"},
-]
 
 
 class LinuxProfile(OSProfile):
@@ -72,15 +17,19 @@ class LinuxProfile(OSProfile):
 
     os_type_value = "linux"
 
-    @property
+    @cached_property
     def os_type(self) -> str:
         return self.os_type_value
 
     # ─── 层1：危险命令模式 ───
 
-    @property
+    @cached_property
     def dangerous_commands(self) -> list[CommandPattern]:
-        """危险命令正则模式列表（归一化自 rules/l1_rules.json 的危险命令段）。"""
+        """危险命令正则模式列表（归一化自 rules/l1_rules.json 的危险命令段）。
+
+        按 os 字段过滤：Windows 专属条目（del/icacls/certutil/注册表等）不进
+        Linux Profile，避免跨平台误判；不带 os 字段的历史条目视为 linux。
+        """
         from ..rules_loader import load_l1
         cmds = load_l1().get("dangerous_commands", [])
         return [
@@ -89,79 +38,34 @@ class LinuxProfile(OSProfile):
                 risk_level=c["risk_level"],
                 risk_type=c["risk_type"],
                 reason=c["reason"],
+                # 原始平台归属（不是加载它的 Profile）——MacOSProfile 继承
+                # Linux 规则时，Linux 条目仍标 linux，供 runtime 种子去重
+                os=str(c.get("os") or "linux").lower(),
             )
             for c in cmds
+            if str(c.get("os") or "linux").lower() in self.accepted_os
         ]
 
 
-    # ─── 安全命令白名单（两级） ───
+    # 安全命令白名单（fully_safe_commands / readonly_sensitive_commands /
+    # safe_action_types / readonly_sensitive_action_types）已迁到
+    # rules/platform_traits.json，由 OSProfile 基类统一读取 —— 本类不再覆盖。
 
-    @property
-    def fully_safe_commands(self) -> list[str]:
-        """完全安全的 bash 子命令：跳过 L2 + L3（不涉及文件内容读取）"""
-        return [
-            r"^ls(?:\s|$)", r"^dir(?:\s|$)",
-            r"^pwd(?:\s|$)", r"^which\s+", r"^whereis\s+", r"^realpath\s+",
-            r"^basename\s+", r"^dirname\s+",
-            r"^file\s+", r"^stat\s+", r"^du(?:\s|$)",
-            r"^echo\s+", r"^printf\s+",
-            r"^type\s+", r"^command\s+",
-            # 系统信息查询（只读，不涉及文件/网络/权限）
-            r"^whoami(?:\s|$)", r"^id(?:\s|$)",
-            r"^hostname(?:\s|$)", r"^uname(?:\s|$)",
-            r"^date(?:\s|$)", r"^env(?:\s|$)",
-            r"^printenv(?:\s|$)", r"^tty(?:\s|$)",
-            r"^arch(?:\s|$)", r"^uptime(?:\s|$)",
-            r"^groups(?:\s|$)", r"^logname(?:\s|$)",
-        ]
-
-    @property
-    def readonly_sensitive_commands(self) -> list[str]:
-        """安全但可能访问敏感路径的 bash 子命令：跳过 L3，保留 L2"""
-        return [
-            r"^cat\s+\S", r"^head(?:\s|$)", r"^tail(?:\s|$)",
-            r"^less(?:\s|$)", r"^more(?:\s|$)", r"^wc(?:\s|$)",
-            r"^grep(?:\s|$)", r"^find\s+",
-            r"^ag(?:\s|$)", r"^rg(?:\s|$)",
-            r"^awk\s+", r"^sed\s+", r"^cut\s+",
-            r"^sort(?:\s|$)", r"^uniq(?:\s|$)",
-        ]
-
-    @property
-    def safe_commands(self) -> list[str]:
-        """向后兼容：合并为完整安全列表"""
-        return self.fully_safe_commands + self.readonly_sensitive_commands
-
-    @property
-    def safe_action_types(self) -> frozenset[str]:
-        """完全安全操作类型：跳过 L2 + L3"""
-        return frozenset({
-            "ask_user_question", "glob", "list_dir", "ls", "count_text_length",
-            "filemgr-globfiles",
-        })
-
-    @property
-    def readonly_sensitive_action_types(self) -> frozenset[str]:
-        """安全但可能访问敏感路径的操作类型：跳过 L3，保留 L2"""
-        return frozenset({
-            "read", "file_read", "read_file", "head", "tail", "grep",
-            "filemgr-readfile", "filemgr-grepfiles",
-        })
-
-    @property
-    def injection_keywords(self) -> list[dict]:
-        """Prompt 注入检测关键词列表（归一化自 rules/l1_rules.json 的注入段）。"""
-        from ..rules_loader import load_l1
-        return load_l1().get("injection_detection", [])
+    # injection_keywords 各平台实现相同，已收拢到 OSProfile 基类（读
+    # rules/l1_rules.json 的注入段 + 按 os 过滤），本类不再覆盖。
 
     # ─── 层2：敏感路径 ───
 
-    @property
+    @cached_property
     def sensitive_paths(self) -> list[SensitivePath]:
         """敏感路径列表（归一化自 rules/l1_rules.json 的敏感路径段）。
 
         字段：path / risk_level / desc / deny_mode。deny_mode 为源数据，
         与 credential/read_only 向后兼容推导无关（deny_mode 优先）。
+
+        按 os 字段过滤：Windows 专属条目（os=windows）不进 Linux Profile，
+        避免 Windows 路径（C:\\Windows\\...、HKLM\\...）在 Linux 判定中误报。
+        不带 os 字段的历史条目视为 linux（向后兼容）。
         """
         from ..rules_loader import load_l1
         sps = load_l1().get("sensitive_path_access", [])
@@ -171,32 +75,30 @@ class LinuxProfile(OSProfile):
                 risk_level=sp["risk_level"],
                 desc=sp["desc"],
                 deny_mode=sp.get("deny_mode", ""),
+                # ⚠️ credential / read_only 必须从 deny_mode 派生（TS 侧
+                # _loadSensitivePathScope 一直这么干）。历史 bug：这里不派生，
+                # 于是 sp.credential **恒为 False** —— _check_indirect_file_access
+                # 的 found_credential 分支成死代码，cwd 里只有凭据文件时 Python
+                # 判不出来（TS 能），两端分叉。
+                credential=sp.get("deny_mode", "") == "deny_both",
+                read_only=sp.get("deny_mode", "") == "deny_read",
                 dir_del_only=sp.get("dir_del_only", False),
+                os=str(sp.get("os") or "linux").lower(),
             )
             for sp in sps
+            if str(sp.get("os") or "linux").lower() in self.accepted_os
         ]
 
-    @property
-    def write_keywords(self) -> list[str]:
-        return [
-            "write", "写入", "save", "保存", "modify", "修改",
-            "update", "更新", "delete", "删除", "remove", "移除",
-            "create", "创建", "append", "追加", "truncate", "截断",
-            "overwrite", "覆盖", "replace", "替换",
-            "edit",  # filemgr-editfile 是写操作，action_type 含 "edit" 需被检测为写
-        ]
+    # write_keywords / read_keywords 已迁到 rules/platform_traits.json
+    # （由 OSProfile 基类统一读取），本类不再覆盖。
 
-    @property
-    def read_keywords(self) -> list[str]:
-        return [
-            "read", "读取", "cat", "head", "tail", "less", "more",
-            "view", "查看", "open", "打开", "load", "加载",
-            "grep", "search", "搜索", "find", "查找",
-        ]
-
-    @property
+    @cached_property
     def intent_deviation_patterns(self) -> list[IntentDeviationPattern]:
-        """意图偏离关键词对（归一化自 rules/l2_rules.json 的 intent_consistency）。"""
+        """意图偏离关键词对（归一化自 rules/l2_rules.json 的 intent_consistency）。
+
+        按 os 字段过滤（同危险命令/敏感路径）：Windows 专属意图模式
+        （del/rmdir/reg delete 等动作词）不进 Linux 判定。
+        """
         from ..rules_loader import load_l2
         pats = load_l2().get("intent_consistency", [])
         return [
@@ -204,8 +106,10 @@ class LinuxProfile(OSProfile):
                 intent_keywords=p["intent_keywords"],
                 dangerous_actions=p["dangerous_actions"],
                 reason=p["reason"],
+                os=str(p.get("os") or "linux").lower(),
             )
             for p in pats
+            if str(p.get("os") or "linux").lower() in self.accepted_os
         ]
 
     # ─── 路径提取 ───

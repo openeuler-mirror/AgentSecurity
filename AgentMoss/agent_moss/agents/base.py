@@ -1,8 +1,7 @@
 """三方 agent 定制化扩展 — 数据载体
 
 `AgentExtensions` 描述某个宿主 agent（xiaoO / opencode / opendesk）在通用安全规则
-之上需要追加的专属规则。规则以 JSON 单一事实源存储（agent_moss/agents/<id>/rules.json），
-Python 与 TypeScript 两端共享同一份文件。
+之上需要追加的专属规则。规则以 JSON 单一事实源存储（agent_moss/agents/<id>/rules.json）。
 
 设计原则：
 - 所有字段以 `extra_` 为前缀，表示"追加到通用规则之后"，不覆盖通用规则。
@@ -54,7 +53,7 @@ class AgentExtensions:
     extra_sensitive_paths: list[SensitivePath] = field(default_factory=list)
     builtin_safe_skills: list[str] = field(default_factory=list)
     # agent 专属"完全安全操作"白名单（精确名或前缀，前缀以 '-' 结尾）→ 跳过 L2+L3。
-    # 对齐 TS ts/src/agents/types.ts。前缀匹配（如 "memory-"）走 startswith，精确名走 ==。
+    # 前缀匹配（如 "memory-"）走 startswith，精确名走 ==。
     builtin_safe_action_types: list[str] = field(default_factory=list)
     extra_skills: list[dict] = field(default_factory=list)
 

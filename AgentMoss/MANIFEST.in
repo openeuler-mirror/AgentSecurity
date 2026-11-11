@@ -4,3 +4,17 @@ recursive-include agent_moss/rules *.json
 recursive-include agent_moss/agents *
 recursive-include agent_moss/data *
 recursive-include agent_moss/console/static *
+# infra/*.example: 默认配置模板（首次运行据此生成 ~/.config/agentmoss/config.json）。
+# 缺失时 load_config 曾对 None 调 .exists() 崩溃（wheel 安装场景，0.15.1 修复）。
+recursive-include agent_moss/infra *.example
+# scenarios/*/rules.json: 场景定制规则（如 bank 客户沙箱目录白名单/禁 ssh）。
+# 缺失时 scenario_id 加载不到扩展规则，静默失效。
+recursive-include agent_moss/scenarios *.json
+# 测试用例不进交付物：顶层 tests/ 不是包（无 __init__.py），packages.find
+# 收不到它，所以 wheel 一直是干净的；但 sdist 默认会收该目录（setuptools 行为），
+# 实测 0.16.8 sdist 混入 46 个测试文件。prune 后在 sdist 源头切断。
+prune tests
+# 兜底：排除 Python 字节码缓存。上面 agents/ data/ 用的是裸 `*` 通配，会把
+# __pycache__/ 一并收进 sdist，再经 `python -m build` 的 sdist→wheel 流程传染进
+# wheel（0.15.5 wheel 实测混入 8 个 .pyc，且内嵌构建机绝对路径）。
+global-exclude __pycache__ *.pyc *.pyo

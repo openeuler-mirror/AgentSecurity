@@ -201,7 +201,10 @@ body {
 .ag-link:hover { text-decoration: underline; }
 
 /* Toast */
-.ag-toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,.15); animation: ag-slide-in .3s ease; }
+.ag-toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 10000; box-shadow: 0 4px 12px rgba(0,0,0,.15); animation: ag-slide-in .3s ease; }
+/* 仅内置规则模式的顶部横幅是 sticky + z-index 9999；toast 必须在其之上，
+   并下移一个横幅高度，否则错误提示会被横幅挡住。 */
+body.builtin-only-mode .ag-toast { top: calc(20px + var(--am-builtin-banner-height, 48px)); }
 .ag-toast-success { background: var(--ag-green); color: #fff; }
 .ag-toast-error { background: var(--ag-red); color: #fff; }
 .ag-toast-warning { background: var(--ag-orange); color: #fff; }
@@ -246,6 +249,10 @@ body {
 </style>
 </head>
 <body>
+<div id="builtin-only-banner" style="display:none;background:#b45309;color:#fff;padding:6px 14px;font-size:12px;line-height:1.5;text-align:center;position:sticky;top:0;z-index:9999">
+  仅内置规则模式：已忽略 runtime 配置与 Console 自定义，修改规则不会生效。需重启服务并移除 <code>AGENT_MOSS_RULES_BUILTIN_ONLY</code> 后再改规则。<br>
+  Built-in rules only: runtime config and Console changes are ignored. Restart without <code>AGENT_MOSS_RULES_BUILTIN_ONLY</code> to edit rules.
+</div>
 <div class="ag-wrap">
   <div class="ag-tabs" id="tabs">
     <div class="ag-tab active" data-page="overview">概览</div>
@@ -337,6 +344,18 @@ document.documentElement.lang = isEn ? 'en' : 'zh-CN';
 
 // ===== API client =====
 const TOKEN_KEY = 'am_console_token';
+// ?token=xxx：桌面端（OpenDesk）用 iframe 嵌入时注入。iframe 与父页面不同源，
+// localStorage 不共享，只能走 URL；读到后立刻从地址栏移除，避免留在历史记录里。
+(function adoptTokenFromUrl() {
+  try {
+    const u = new URL(location.href);
+    const t_ = u.searchParams.get('token');
+    if (!t_) return;
+    localStorage.setItem(TOKEN_KEY, t_);
+    u.searchParams.delete('token');
+    history.replaceState(null, '', u.pathname + (u.search || '') + u.hash);
+  } catch (e) { /* 受限环境：忽略 */ }
+})();
 function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
 function authHeaders() {
   const t_ = getToken();
@@ -553,6 +572,24 @@ function agPrompt(title, opts = {}) {
 // ===== Pages =====
 async function refreshConfig() {
   state.config = await api('config');
+  // cold / builtin 模式：顶部显示只读横幅（写接口由后端统一 403）
+  const rulesMode = state.config.rules_mode || (state.config.builtin_only ? 'builtin' : 'hot');
+  if (rulesMode === 'cold' || rulesMode === 'builtin') {
+    const banner = el('builtin-only-banner');
+    if (banner) {
+      banner.innerHTML = rulesMode === 'cold'
+        ? '冷启动规则模式：runtime 配置与 Console 自定义已忽略；规则目录仅在启动时读取一次，修改规则目录需重启服务。<br>'
+          + 'Cold-start rules mode: runtime config and Console changes are ignored. Rule directories are loaded once at startup; restart to apply changes.'
+        : '仅内置规则模式：已忽略 runtime 配置与 Console 自定义，修改规则不会生效。需重启服务并移除 <code>AGENT_MOSS_RULES_BUILTIN_ONLY</code> 后再改规则。<br>'
+          + 'Built-in rules only: runtime config and Console changes are ignored. Restart without <code>AGENT_MOSS_RULES_BUILTIN_ONLY</code> to edit rules.';
+      banner.style.display = 'block';
+      // 记录横幅实际高度（窄屏会换行），让 toast 显示在横幅下方而不是被挡住
+      document.documentElement.style.setProperty(
+        '--am-builtin-banner-height', banner.offsetHeight + 'px'
+      );
+      document.body.classList.add('builtin-only-mode');
+    }
+  }
   state.envOverrides = await loadEnvOverrides();
   state.agentRules = await api('agents');
   // 场景定制规则：后端按 AGENT_MOSS_SCENARIO env 过滤（无 env 返回空 → 场景页显示"未启用"提示）

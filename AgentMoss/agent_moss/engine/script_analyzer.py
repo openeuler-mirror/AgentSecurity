@@ -14,44 +14,31 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..rules_loader import compile_rule_regex, load_script_rules, resolve_keyword_set
+
 logger = logging.getLogger(__name__)
 
+# 脚本分析词表：单一事实源 rules/script_rules.json（与 script_content_analyzer 共用）。
+# ⚠️ 缺失/损坏 → 词表为空（更松），故必须报错。
+_SCRIPT_RULES = load_script_rules()
+if not _SCRIPT_RULES:
+    logger.error(
+        "规则文件 script_rules.json 缺失或损坏 —— 脚本关键词扫描将不命中任何模式"
+        "（比正常更松）。请检查包完整性。"
+    )
+
 # 高风险检测规则 — (名称, 正则模式)
-# 仅保留误报率极低、几乎必然指示恶意行为的模式
+# 仅保留误报率极低、几乎必然指示恶意行为的模式。数据见 rules/script_rules.json。
 SUSPICIOUS_PATTERNS: list[tuple[str, re.Pattern]] = [
-    # 网络外传（curl/wget POST 在脚本中几乎无合法用途）
-    ("curl POST", re.compile(r"curl\s+(.*\s)?-X\s+POST", re.IGNORECASE)),
-    ("curl --data", re.compile(r"curl\s+(.*\s)?--data", re.IGNORECASE)),
-    ("curl -d", re.compile(r"curl\s+(.*\s)?-d\s", re.IGNORECASE)),
-    ("wget --post-data", re.compile(r"wget\s+(.*\s)?--post-data", re.IGNORECASE)),
-    ("wget --post-file", re.compile(r"wget\s+(.*\s)?--post-file", re.IGNORECASE)),
-    # 反弹 shell
-    ("nc -e", re.compile(r"\bnc\s+.*-e\b")),
-    ("ncat -e", re.compile(r"\bncat\s+.*-e\b")),
-    ("/dev/tcp", re.compile(r"/dev/tcp/")),
-    ("/dev/udp", re.compile(r"/dev/udp/")),
-    # base64 编码执行（混淆逃逸的强信号）
-    ("$(base64", re.compile(r"\$\(\s*base64")),
-    ("`base64", re.compile(r"`\s*base64")),
-    ("base64 decode pipe", re.compile(r"base64\s+(-d|--decode)\s*\|")),
-    # 敏感文件读取（正常脚本不会读 shadow/ssh 密钥）
-    ("/etc/shadow", re.compile(r"/etc/shadow")),
-    ("id_rsa", re.compile(r"\bid_rsa\b")),
-    ("id_ed25519", re.compile(r"\bid_ed25519\b")),
-    # 持久化后门
-    ("crontab install", re.compile(r"crontab\s+-")),
-    ("authorized_keys", re.compile(r"authorized_keys")),
-    ("ssh no host key check", re.compile(r"ssh\s+.*StrictHostKeyChecking\s*=\s*no")),
+    (str(r["name"]), compile_rule_regex(r))
+    for r in (_SCRIPT_RULES.get("suspicious_patterns") or [])
 ]
 
-# 脚本执行模式匹配
+# 脚本执行模式匹配：本模块（供 L3 提示词用）只认 .sh，故用 script_exec_patterns.legacy。
+# 递归追踪用的是 chain 那份（认解释器 + 任意后缀），两份不可互换。
 SCRIPT_EXEC_PATTERNS = [
-    r"bash\s+(\S+\.sh)",  # bash script.sh
-    r"sh\s+(\S+\.sh)",  # sh script.sh
-    r"\./(\S+\.sh)",  # ./script.sh
-    r"source\s+(\S+\.sh)",  # source script.sh
-    r"\.\s+(\S+\.sh)",  # . script.sh
-    r"zsh\s+(\S+\.sh)",  # zsh script.sh
+    str(p["pattern"])
+    for p in ((_SCRIPT_RULES.get("script_exec_patterns") or {}).get("legacy") or [])
 ]
 
 
@@ -103,37 +90,25 @@ def scan_script_for_keywords(script_content: str) -> list[str]:
     return matched
 
 
-# 关键词组合风险评估规则
-# (关键词集合, 风险等级, 风险原因)
-KEYWORD_COMBINATION_RISKS: list[tuple[set[str], str, str]] = [
-    # Critical: 数据外传 - 凭证/密钥
+# 关键词组合风险评估规则：数据见 rules/script_rules.json。
+# group1/group2 里以 `$` 开头的是对 keyword_sets 的引用（如 `$network_post`）。
+_KEYWORD_SETS: dict[str, list[str]] = dict(_SCRIPT_RULES.get("keyword_sets") or {})
+
+KEYWORD_COMBINATION_RISKS: list[tuple[set[str], set[str], str, str]] = [
     (
-        {"curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"},
-        {"$(base64", "`base64", "base64 decode pipe"},
-        "critical",
-        "检测到网络数据发送 + Base64编码组合，构成 Critical 级别数据外传风险。攻击者可能将敏感数据编码后外传。",
-    ),
-    (
-        {"curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"},
-        {"/etc/shadow", "id_rsa", "id_ed25519"},
-        "critical",
-        "检测到网络数据发送 + 敏感文件访问组合，构成 Critical 级别凭证外传风险。",
-    ),
-    # High: 反弹 Shell
-    (
-        {"nc -e", "ncat -e", "/dev/tcp", "/dev/udp"},
-        set(),  # 单独出现即为 High
-        "high",
-        "检测到反弹 Shell 特征，攻击者可能建立远程控制通道。",
-    ),
-    # High: 持久化后门
-    (
-        {"crontab install", "authorized_keys", "ssh no host key check"},
-        set(),
-        "high",
-        "检测到持久化后门特征，攻击者可能在系统中植入后门。",
-    ),
+        resolve_keyword_set(r.get("group1"), _KEYWORD_SETS),
+        resolve_keyword_set(r.get("group2"), _KEYWORD_SETS),
+        str(r["level"]),
+        str(r["reason"]),
+    )
+    for r in (_SCRIPT_RULES.get("keyword_combination_risks") or [])
 ]
+
+
+SINGLE_KEYWORD_RISKS: dict[str, tuple[str, str]] = {
+    str(k): (str(v["level"]), str(v["reason"]))
+    for k, v in (_SCRIPT_RULES.get("single_keyword_risks") or {}).items()
+}
 
 
 def assess_keyword_combination_risk(
@@ -164,10 +139,10 @@ def assess_keyword_combination_risk(
 
     # 额外检测：curl POST + env 变量外传
     # 这是一个常见的数据外传模式，即使没有匹配到 base64 关键词
-    has_network_post = bool(keyword_set & {"curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"})
+    has_network_post = bool(keyword_set & set(_KEYWORD_SETS.get("network_post") or []))
     if has_network_post:
         # 检查脚本中是否包含 env、$USER、$(hostname) 等系统信息收集
-        env_patterns = ["$env", "$(env)", "$USER", "$(hostname)", "$(pwd)", "$HOME"]
+        env_patterns = [str(p) for p in (_SCRIPT_RULES.get("env_exfil_patterns") or [])]
         content_lower = script_content.lower()
         for pattern in env_patterns:
             if pattern.lower() in content_lower:
@@ -177,26 +152,7 @@ def assess_keyword_combination_risk(
                 )
 
     # 单独关键词的默认风险等级
-    single_keyword_risks = {
-        "curl POST": ("high", "检测到 curl POST 请求，可能向外部服务器发送数据。"),
-        "curl --data": ("high", "检测到 curl --data 参数，可能向外部服务器发送数据。"),
-        "curl -d": ("high", "检测到 curl -d 参数，可能向外部服务器发送数据。"),
-        "wget --post-data": ("high", "检测到 wget POST 请求，可能向外部服务器发送数据。"),
-        "wget --post-file": ("high", "检测到 wget 文件上传，可能向外部服务器发送文件。"),
-        "nc -e": ("critical", "检测到 nc -e 反弹 Shell 特征。"),
-        "ncat -e": ("critical", "检测到 ncat -e 反弹 Shell 特征。"),
-        "/dev/tcp": ("critical", "检测到 /dev/tcp 反弹 Shell 特征。"),
-        "/dev/udp": ("critical", "检测到 /dev/udp 反弹 Shell 特征。"),
-        "$(base64": ("high", "检测到 Base64 编码执行，可能是混淆逃逸。"),
-        "`base64": ("high", "检测到 Base64 编码执行，可能是混淆逃逸。"),
-        "base64 decode pipe": ("high", "检测到 Base64 解码后管道执行，可能是混淆逃逸。"),
-        "/etc/shadow": ("critical", "检测到访问系统密码文件。"),
-        "id_rsa": ("critical", "检测到访问 SSH 私钥。"),
-        "id_ed25519": ("critical", "检测到访问 SSH 私钥。"),
-        "crontab install": ("high", "检测到修改定时任务，可能是持久化后门。"),
-        "authorized_keys": ("high", "检测到修改 SSH 授权密钥，可能是持久化后门。"),
-        "ssh no host key check": ("high", "检测到 SSH 跳过主机密钥验证，可能是横向移动。"),
-    }
+    single_keyword_risks = SINGLE_KEYWORD_RISKS
 
     # 取最高风险等级
     best_level = ""

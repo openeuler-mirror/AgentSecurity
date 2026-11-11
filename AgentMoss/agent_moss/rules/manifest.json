@@ -1,0 +1,6 @@
+{
+  "_comment": "规则包清单。schema_version 是**契约**：引擎启动时按自己认识的版本校验，不匹配直接报错（不会'读不懂就当空'）。结构有破坏性变更时才 +1；新增文件/新增可选键不用动。",
+  "schema_version": 1,
+  "name": "agent-moss-rules",
+  "description": "AgentMoss 内置规则包：L1/L2/L3 规则、平台特征、脚本与形式化引擎识别名单。契约与校验见 agent_moss/rules_contract.py。"
+}

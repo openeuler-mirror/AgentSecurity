@@ -1,6 +1,6 @@
 """脚本分析引擎（Script Engine）行为测试 — Python 端。
 
-镜像 TS ts/src/__tests__/script-engine.test.ts。验证引擎三项核心能力：
+验证引擎三项核心能力：
 1. 深层链全追踪（旧版固定 max_depth=3 时第 4 层后漏追踪）
 2. 跨脚本参数传递（子脚本用自己的调用参数做分支感知，修复子调用参数丢失）
 3. 控制流（case $1 / if [ "$1" = x ] / case $MODE fail-closed）

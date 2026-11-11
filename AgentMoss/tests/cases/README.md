@@ -1,24 +1,25 @@
 # tests/cases — AgentMoss 安全分析引擎基准测试集
 
 > 本文档记录 `tests/cases/` 下全部测试用例的统计与实测通过率数据。
-> 数据口径：对 331 个用例逐一调用 `agent_moss.engine.analyzer.analyze()`，比较实际 `decision` 与用例期望 `expected_decision`。
+> 数据口径：对 430 个用例逐一调用 `agent_moss.engine.analyzer.analyze()`，比较实际 `decision` 与用例期望 `expected_decision`。
 > 复现命令见文末。
 
 ---
 
 ## 一、用例总量
 
-`tests/cases/` 共 **331** 个测试用例，其中 **Deny 189 个、Allow 142 个**。
+`tests/cases/` 共 **1221** 个测试用例，其中 **Deny 546 个、Allow 675 个**（2026-11 内联补位/重定向误报修复用例后重算）。
 
 按子目录分层（对应 AgentMoss 三层规则 + agent 专属规则 + 场景定制规则）：
 
 | 子目录 | 层级 | 用例数 | 说明 |
 |---|---|---|---|
-| `l1/` | L1 特征匹配 | 253 | 危险命令正则 + 敏感路径 + 内联脚本 + 脚本分支感知（case $1 / python sys.argv） + 用户规则 |
-| `l2/` | L2 逻辑规则 | 32 | read_before_write / 意图一致 / 提权 / 授权 / 间接访问 / 通配 / 重定向 / 组合攻击链（combo_chain）/ 跨会话组合链（formal_engine） |
-| `l3/` | L3 LLM 语义 | 28 | security skill 命中+放行，需有效 LLM key 真跑 |
+| `l1/` | L1 特征匹配 | 848 | 危险命令正则 + 敏感路径 + 内联脚本 + 脚本分支感知（case $1 / python sys.argv） + 用户规则 |
+| `os/<平台>/` | **平台专属规则** | 213 | `os/windows/`(154) + `os/macos/`(36) + `os/harmony/`(23)：子目录名即 `input.os_type`。**客户交付集默认排除**（客户沙箱是麒麟/Linux，平台用例在此判定必然失败） |
+| `l2/` | L2 逻辑规则 | 82 | read_before_write / 意图一致 / 提权 / 授权 / 间接访问 / 通配 / 重定向 / 组合攻击链（combo_chain）/ 跨会话组合链 + P2–P8 形式化性质（formal_engine） |
+| `l3/` | L3 LLM 语义 | 32 | security skill 命中+放行，需有效 LLM key 真跑 |
 | `agent/` | Agent 专属规则 | 9 | xiaoo/opendesk 的 extra_* / builtin_safe_* 看护（见下节） |
-| `scenario/<id>/` | 场景定制规则 | 9 | 客户沙箱部署级约束（如 bank 的目录白名单/禁 ssh），见下节 |
+| `scenario/<id>/` | 场景定制规则 | 37 | 客户沙箱部署级约束（如 bank 的目录白名单/禁 ssh），见下节 |
 
 > **配套真实执行环境**：`tests/cases_exec/`（与 `tests/cases/` 并列）把这里的命令转成**客户可真实执行**的版本（建文件/目录、起本地服务、替换 `AM_YOUR_HOME`），用于对比"无 AgentMoss vs 有 AgentMoss"的拦截率。详见 **`tests/cases_exec/README.md`**。
 
@@ -64,30 +65,31 @@
 `conftest.py` 的 `_clear_agent_cache` autouse fixture 同时清理 agent 与场景扩展缓存，防止
 用例间串扰。
 
-**关于测试数字（"tests/cases 与 Python/TS passed 数不一致"）**：`tests/cases/` 的 331 个 JSON 是 Python 与 TS **完全共用**的归一化用例（单一事实源）——双端加载器读同一批文件，**规则覆盖考察的是同一批用例**。两端 pytest/vitest 报告的总 passed 数更大且**互不相同**（Python 379 / TS 734），是因为**各自端还有语言特有的手写单测**（不读 JSON、直接测引擎子模块）：
-- **Python 额外单测**：`test_all_cases.py::TestHeuristicDetector`/`TestLogicRules`/`TestOSProfile`/`TestCoordinator` 等手写方法、`test_agents_*`、`test_brain`、`test_runtime_config_merge`、`test_instance_paths`。
-- **TS 额外单测**：`heuristic.test.ts`、`logic-rules.test.ts`、`coordinator.test.ts`、`console-routes.test.ts`、`agents.test.ts`、`dual-parity.test.ts`、`rules-loader.test.ts`、`script-engine.test.ts`、`formal-pattern-miner.test.ts` 等。
+**关于测试数字（"tests/cases 与 Python/TS passed 数不一致"）**：`tests/cases/` 的 430 个 JSON 是 Python 与 TS **完全共用**的归一化用例（单一事实源）——双端加载器读同一批文件，**规则覆盖考察的是同一批用例**。两端 pytest/vitest 报告的总 passed 数更大且**互不相同**（Python 483 / TS 877），是因为**各自端还有语言特有的手写单测**（不读 JSON、直接测引擎子模块）：
+- **Python 额外单测**：`test_all_cases.py::TestHeuristicDetector`/`TestLogicRules`/`TestOSProfile`/`TestCoordinator` 等手写方法、`test_agents_*`、`test_brain`、`test_runtime_config_merge`、`test_instance_paths`、`test_cases_exec_smoke`（cases_exec 工具链冒烟看护：警告文案命令替换 lint + 匹配器决策表 + 命令集「判定集/执行集不串台」决策表）。
+- **TS 额外单测**：`rule-audit-matrix.test.ts`、`heuristic.test.ts`、`logic-rules.test.ts`、`coordinator.test.ts`、`console-routes.test.ts`、`agents.test.ts`、`dual-parity.test.ts`、`rules-loader.test.ts`、`script-engine.test.ts`、`asset-paths.test.ts`、`platform-traits.test.ts`、`formal-*.test.ts` 等。
 
-**结论：两端真实独立 JSON 用例数一致（331）**，passed 总数差异只来自各自补充的单元测试，**不代表规则或用例不一致**。判断"规则是否双端一致"看 JSON 用例 + 双端同步校验测试，不看 passed 总数。
+**结论：两端真实独立 JSON 用例数一致（430）**，passed 总数差异只来自各自补充的单元测试，**不代表规则或用例不一致**。判断"规则是否双端一致"看 JSON 用例 + 双端同步校验测试，不看 passed 总数。
 
-**精确分解（为什么 Python 379 / TS 734，数字如何凑出）**：
-
-共用部分（双端跑同一批 331 个 JSON）：
-- 279 个 L1/L2 用例（禁 LLM 跑）
+共用部分（双端跑同一批 630 个 JSON）：
+- 536 个 L1/L2 用例（禁 LLM 跑；2026-10 修复批次 +24：编码混淆 6 + 内网探测 8 + rbw 管道 3 + sed 3 + file_write 2 + python -c 5 等）
 - 28 个 L3 LLM 用例（禁 LLM 时 **skip**，需真 LLM key）
 - 9 个 agent 专属用例（xiaoo/opendesk，禁 LLM 跑）
-- 9 个 scenario 场景用例（如 bank，禁 LLM 跑）
+- 37 个 scenario 场景用例（如 bank，禁 LLM 跑）
+- 57 个平台专属用例（`os/windows`43 + `os/macos`7 + `os/harmony`7，禁 LLM 跑；**不进客户交付集**，见上表说明）
 
 | 端 | 共用 JSON | 其中 L3(skip) | 语言特有手写单测 | 总用例 | passed |
 |---|---|---|---|---|---|
-| **Python**（`pytest tests/test_all_cases.py`） | 331 | 28 | 76 | 407 | **379** |
-| **TS**（`vitest`） | 331 | 28 | 431 | 762 | **734** |
+| **Python**（`pytest tests/test_all_cases.py`） | 630 | 28 | 91 | 721 | **693** |
+| **TS**（`vitest`） | 630 | 28 | 480 | 1110 | **1082** |
 
-- **Python 的 407 = 331 JSON + 76 手写**（`TestCoordinator`6 + `TestHeuristicDetector`12 + `TestLogicRules`40 + `TestOSProfile`18）。379 passed = 407 − 28(L3 skip)。
-- **TS 的 762 = 331 JSON + 431 手写**（文件列举非穷尽：heuristic 58 + logic-rules 50 + coordinator 33 + console-routes 23 + dual-parity 26 + agents 16 + runtime-config-seed 10 + paths 6 + llm-analyzer 5 + find-free-port 4 + rules-loader 5 + script-engine 22 + symbolic 12 + brain 12 + **formal-stateful 9** + **formal-chain-state 3** + **formal-pattern-miner 6** + **formal-ebpf 4** + **formal-decode 5** + **formal-abstract-properties 5** + 其它 suite + json-cases 331）。734 passed = 762 − 28(L3 skip)。
-- 注：若跑 `pytest tests/`（全部测试文件，含 `test_agents_*`/`test_brain`/`test_runtime_config_merge`/`test_instance_paths`/`test_find_free_port`/`test_rules_loader`/`test_script_engine`/**`test_stateful`**/**`test_chain_state`**/**`test_pattern_miner`**），Python 全量是 `701 collected − 30 skip = 671 passed`（2026-09 审查批次2 新增 6 个 L1 用例后）。CLAUDE.md 的标准命令只跑 `test_all_cases.py`，故日常报告 379。
+> 2026-10-09 修复批次实测：Python `test_all_cases.py` 693 passed（721 − 28 L3 skip；手写 +10 = TestUserRuleMatcherGuard 5 + TestLayer1And2 内联等）；TS 全量 vitest 1226 passed（1254 − 28 skip），其中 json-cases 630 + 手写 624。手写单测精确列举随批次增长有漂移，以上为实测口径。
 
-两者差异全部来自**语言特有单元测试的数量**（TS 的单元测试比 Python 多），**共用 JSON 的 331 个完全一致**，因此规则覆盖口径相同。
+- **Python 的 511 = 430 JSON + 81 手写**（`TestCoordinator`6 + `TestHeuristicDetector`16 + `TestLogicRules`41 + `TestOSProfile`18）。483 passed = 511 − 28(L3 skip)。
+- **TS 的 905 = 430 JSON + 475 手写**（28 个测试文件精确列举：`rule-audit-matrix` 79 + `heuristic` 63 + `logic-rules` 51 + `coordinator` 37 + `script-engine` 28 + `console-routes` 26 + `dual-parity` 26 + `formal-stateful` 18 + `agents` 16 + `runtime-config-seed` 16 + `brain` 12 + `symbolic` 12 + `formal-abstract-properties` 11 + `formal-ltl` 9 + `formal-rule5` 9 + `formal-decode` 8 + `platform-traits` 7 + `formal-pattern-miner` 6 + `paths` 6 + `rules-loader` 6 + `formal-rule12` 5 + `llm-analyzer` 5 + `asset-paths` 5 + `find-free-port` 4 + `formal-ebpf` 4 + `cli-analyze` 3 + `formal-chain-state` 3 + json-cases 430）。877 passed = 905 − 28(L3 skip)。
+- 注：若跑 `pytest tests/`（全部测试文件），Python 全量是 `860 passed + 28 skipped`（2026-09-22 实测）。CLAUDE.md 的标准命令只跑 `test_all_cases.py`，故日常报告 483。
+
+两者差异全部来自**语言特有单元测试的数量**（TS 的单元测试比 Python 多），**共用 JSON 的 430 个完全一致**，因此规则覆盖口径相同。
 
 > **2026-09 rm-root-recursion 降级（NEW-FP）**：新增 2 个 L1 用例（deny-132-rm-log-wildcard + allow-109-rm-log-dir 一拦一放）。A3 `rm -r /...` 规则从 high 降 medium（交 L2/L3 意图判断），`rm -rf /logs` 这类根下普通业务目录清理不再被当"删根"误伤；非临时通配 `rm -rf /logs/*` 仍由 wildcard+delete high 拦截（详见 SECURITY_RULES.md A3 节）。
 
@@ -108,6 +110,15 @@
 > - **NEW-FP（.ssh.bak 目录级误拦）**：删 `~/.ssh.bak`/`~/.ssh_backup`（独立备份目录）被 `.ssh` 条目子串误拦。目录级条目改目录前缀匹配（前导 + 尾随 `/|空白|引号|行尾`）。对应 allow-119（放）+ `rm -rf ~/.ssh` 仍拦。
 > 全部双端同步（Python heuristic/logic_rules ↔ TS heuristic/logic-rules，runtime seed 透传 `dir_del_only`）+ sync 断言更新（`[246][0-7]{3}` + 目录级 `dir_del_only` 防线）。详见 SECURITY_RULES.md A5/A52/D5 节。
 
+> **2026-09-11 符号链接逃逸原语 + L3 边界修正（6 个新用例 + 3 个用例修正 + skill 口径对齐）**：
+> - **NEW-FN（symlink 逃逸原语漏报，新增规则 A53）**：`ln -s / x`、`ln -s ~ x`、`ln -s $HOME x`、`ln -s ~/.. x`（创建指向根/主目录本身的软链）此前全部放行——这是 symlink 逃逸的前置原语（有链接点后 `rm -rf <link>/../` 等即可越权触达系统树）。新增 `deny-152/153/154/155`（拦）+ `allow-153/154`（放：项目子路径软链 `ln -s ~/src ~/dst`、部署原子切换 `ln -sfn releases/r2 current`）一拦一放，边界靠 `(?![.a-zA-Z0-9_~-])` 负向前瞻区分「`~/` 后跟路径段」与「`~/` 后跟分隔符」。
+> - **skill 口径对齐（修 L3 误拦正常运维）**：`agent_moss/skills/script_execution_guard.md` 把裸 `sudo`、`rm -rf ~`、`rm -rf /var/log/*` 一律列为 Critical/High 必须 Deny，与 L1/L2 已收紧的放行边界冲突（L2 明确放行 `sudo apt install` 等包管理）。改为分级：包/服务管理提权 Medium（意图明确时放行）、定向清理与临时目录 Medium、仅根/主目录本身 Critical → 6 个被 L3 误拦的正常运维用例恢复（实测 5 个直接恢复 + 1 个经路径上下文恢复）。
+> - **用例修正**：`allow-61-crontab-noarg` 命令误写为 `crontab /tmp/my-tasks`（从任何人可写的 `/tmp` 装载持久化任务，与 desc「不带参数」不符、语义应为拦）→ 修正为只读形态 `crontab -l`；`allow-58-useradd-nop` 补授权 prompt（原 prompt 为空，L3 因「意图未提及」保守判 Deny 属合理，期望 Allow 站不住）；`deny-10-git-force-push` 标注 `policy_dependent`（覆盖远端主干历史属团队政策选择，非安全定论）。
+> - **L3 路径事实上下文（新增能力）**：`buildPathContext`（Python `heuristic.py` / TS `heuristic.ts`）对含 `..` 的写类操作（rm/ln/mv/cp/dd/chmod…）产出「词法解析事实（确定）+ 运行时符号链接未验证（非事实）」两段注入 L3 prompt——修正 L3 曾以「解析依赖 `~/a` 是否存在」这一**错误理由**判 Deny（`allow-116` 的 `rm -rf ~/a/../b`，词法上恒等于 `~/b`）。纯词法、不读文件系统（无 TOCTOU、无远程部署依赖）。
+> 双端同步：`l1_rules.json` 危险命令 56→57（`test_rules_loader.py` + `rules-loader.test.ts` 计数断言同步）；sync 断言新增 symlink 片段（Python `TestOSProfile::test_linux_profile_rule_sync_with_ts` + TS `dual-parity.test.ts`）；新增 4 个 Python 手写单测 + 4 个 TS 单测（路径上下文形态、symlink 一拦一放）。详见 SECURITY_RULES.md **A53** 节。
+
+> **2026-09 内联脚本补位判定（NEW-FN，4 个新用例一拦一放）**：`python3 -c "import os; os.system('rm -rf $HOME')"` 此前**三层都没人管**——L1 rm 正则只认 `/` 开头的绝对路径、L1 HomeDeletionChecker 只认「命令段首词是 `rm`」（此段首词是 `python3`）、而 `inline_analyzer` 的静态判定虽能识别却被绑在「L1/L2 file_access 已命中」块内未执行。修复：L1/L2 完全未命中时对内联脚本**补一次语义判定**，只采纳其 Deny 结论。新增 `inline-17/18`（`$HOME`/`~` 形态拦，critical）+ `inline-19/20`（正常脚本放、`print('/etc/shadow')` 字面量放——防误报关键对照）。上线前实测 8 个正常形态 + 4 个字面量零误伤。详见 SECURITY_RULES.md **L2 第 9 条**。
+
 > **2026-08 用例扩充（重大）**：新增 53 个 L1 用例（deny-107..131 共 25 个 + allow-81..108 共
 > 28 个），主要覆盖此前 0 用例覆盖的正则规则变体（curl|sh、wget|bash|sh、eval $(curl)、
 > 反弹 shell /dev/tcp、nc -e/-l、pip/npm/git clone \| bash 供应链、下载 .sh、命令替换 $()/反引号、
@@ -117,7 +128,9 @@
 > （URL 误判修复 + 场景 allow 误伤修复后的当前值；历史说法 "deny 44→79、allow 54→81" 是
 > 仅修 URL 误判时的中间值）。
 
-**关于 Windows 覆盖**：当前 `tests/cases/` 的 331 个 JSON 用例**全部是 Linux profile**（无 `os_type: "windows"` 用例）。Windows 的 `dangerous_commands`/`sensitive_paths` 规则在代码里有实现（`profiles/windows.py`），但**没有 JSON 用例覆盖**，仅 Python 侧有少量对 Windows profile 的单元测试断言（`test_agents_*` 内）。如需 Windows 规则纳入双端回归，需新增 `os_type: "windows"` 的 JSON 用例——目前未覆盖。
+**关于 Windows 覆盖**：已由 `tests/cases/os/windows/` 的 6 个 JSON 用例覆盖（`input.os_type: "windows"`，
+含危险命令与敏感路径的一拦一放）。另有 `os/macos/` 7 个、`os/harmony/` 7 个。这些用例双端都跑，
+但**不进客户交付集**（客户沙箱是麒麟/Linux）。
 
 ---
 
@@ -162,11 +175,21 @@
 | `expected_decision` | ✅ | 期望判定：`Allow` 或 `Deny` | **是（Python + TS 两端）** |
 | `expected_layers` | ✅ | 期望命中的层（**参考性**，见下方层编号；当前测试**不自动断言**它）| 否 |
 | `expected_risk_level` | 可选 | 期望风险等级：`low`/`medium`/`high`/`critical` | **是（仅 L1/L2 用例，TS 端）** |
-| `expected_risk_type` | 可选 | 期望风险类型（见取值表）| 否（当前未断言）|
+| `expected_risk_type` | 可选 | 期望风险类型（见取值表）| **是（`l1/ l2/ agent/` 两端；已知偏差清单豁免）** |
 | `llm_required` | L3 必填 | `true` 表示该用例需 LLM 真跑（只能配在 `l3/` 目录）| 控制 L3 gate |
 | `note` | 可选 | 补充说明 / 历史修正记录 | 否 |
 
-> **断言范围说明**：当前测试流程实际断言的只有 `expected_decision`（两端）和 `expected_risk_level`（L1/L2）。`expected_layers`/`expected_risk_type` 是参考性元数据，暂不自动断言——加了也要填对，作为文档与人工核对依据。
+> **断言范围说明**：
+> - `expected_decision`：两端都断言。
+> - `expected_risk_level`：L1/L2 用例断言（TS 端 + Python 端；L3 有非确定性，不断言）。
+> - `expected_risk_type`：**2026-10 起断言**（`tests/test_case_metadata.py`），
+>   范围限 `l1/ l2/ agent/`（确定性判定）。
+>   历史上这条字段从没被校验过，导致出现过「用例声称在测 L2 授权，实际被 L1 先拦」
+>   的假绿（`l2/logic-06`、`logic-08`）。历史偏差登记在
+>   `tests/parity/known_risk_type_drift.json`，偏差集合必须与清单**完全一致**：
+>   新漂移 → 失败；清单过期 → 失败并提示删除。清理历史债时从清单删对应条目即可。
+> - `expected_layers`：**仍不断言**（层标签写法不统一，且多余命中时 `violated_layers`
+>   内容不稳定）。填它仍是好习惯，但别指望测试帮你抓错。
 
 ### input 对象字段
 
@@ -195,7 +218,6 @@
 
 **加载器展开**：双端加载器读到 `AM_YOUR_HOME` 后，展开成**当前用户家目录的绝对路径**（如 `/home/hkl`）再传给引擎：
 - Python `tests/conftest.py::_expand_placeholder`（`os.path.expanduser("~")`）
-- TS `ts/src/__tests__/json-cases.test.ts::expandPlaceholder`（`os.homedir()`）
 
 **判定稳定性**：`AM_YOUR_HOME` 展开成绝对路径后，引擎判定与原来的 `/home/me`、`/home/user` **完全一致**（这些路径本身不敏感，判定不依赖具体用户名）。**注意**：不能展开成 `~` —— `rm -rf ~` 不含 `/`，不命中 L1 的 `rm -rf` 正则会变 Allow；展开成绝对路径 `/home/xxx` 才命中 Deny。
 
@@ -219,9 +241,15 @@
 | `memory-addMemory` | 记忆写入 | 1 |
 | `mailbox-getEmailList` | 邮箱列表 | 1 |
 
-### `expected_risk_type` 取值（22 种）
+### `expected_risk_type` 取值（27 种）
 
-`file_access`(51)、`script_execution`(32)、`sensitive_action`(18)、`privilege_escalation`(7)、`lateral_movement`(4)、`intent_deviation`(3)、`prompt_injection`(2)、`consent_missing`(2)、`config_tampering`(2)、`indirect_file_access`(1)、`read_before_write`(1)、`dangerous_redirect`(1)、`dangerous_wildcard_operation`(1)、`indirect_access`(1)、`skill_installation`(1)、`data_exfiltration`(1)、`email_operation`(1)、`supply_chain`(1)、`general_tool_risk`(1)、`browser_web_access`(1)、`resource_exhaustion`(1)、`persistence_backdoor`(1)
+`file_access`(125)、`script_execution`(64)、`sensitive_action`(23)、`supply_chain`(18)、`privilege_escalation`(16)、`resource_exhaustion`(12)、`lateral_movement`(12)、`data_exfiltration`(9)、`persistence`(6)、`network_access`(5)、`read_before_write`(5)、`prompt_injection`(4)、`config_tampering`(3)、`intent_deviation`(3)、`combo_chain`(2)、`consent_missing`(2)、`indirect_file_access`(1)、`formal_verification`(1)、`dangerous_redirect`(1)、`dangerous_wildcard_operation`(1)、`indirect_access`(1)、`skill_installation`(1)、`email_operation`(1)、`general_tool_risk`(1)、`browser_web_access`(1)、`persistence_backdoor`(1)、`defense_evasion`(1)
+
+> 注：括号里是**用例数量快照**，随用例增减而过期，别当权威统计。
+> `consent_missing` 目前**不出现在任何用例的 `expected_risk_type` 里** ——
+> 改密 / 删用户的 L1 规则（`\buserdel\s`、`\|\s*passwd\b` 等）先于 L2 授权规则命中，
+> 实际 `risk_type` 是 `script_execution`。L2 授权规则作为**纵深防御**保留（控制台
+> 关掉 L1 规则时兜底），其判定强度由 `tests/test_consent_strength.py` 直接覆盖。
 
 ### `expected_layers` 层编号系统
 
@@ -280,13 +308,13 @@
 - **Allow 用例**：`expected_decision: "Allow"`，用于防误报（合法运维不该被拦）。**L1/L2 用例会被强制禁 LLM 测试**，只测静态结果。
 - **对照用例**：强烈建议对每种风险配一个对应 Allow 对照（如 `chmod 777` Deny ↔ `chmod 644` Allow），防止规则过宽。
 - **risk_level**：L1/L2 用例被 TS 断言 risk_level，必须与引擎实际判定一致（不确定就跑一次看实际值再填）。
-- **action_detail 构造**：用真实命令，注意 `2>/dev/null`、`-o /dev/null`、引号内字面量等边界（这些是历史 FP/FN 重灾区，见 `docs/MAINTENANCE_WORKFLOW.md`）。
+- **action_detail 构造**：用真实命令，注意 `2>/dev/null`、`-o /dev/null`、引号内字面量等边界（这些是历史 FP/FN 重灾区）。
 
 ---
 
 ## 四、场景覆盖与分层分布
 
-> 场景归类为**人工整理的攻击面快照**（按攻击场景归类，非硬性口径）。当前用例集 331 个（Deny 189 / Allow 142），其中 18 个场景内 215 个（含 edge/inline 边界用例，统计时点 231 个时整理），另有 agent 专属用例 9 个、scenario 场景用例 9 个、以及部分边界用例未计入场景分类。下表为历史整理的攻击面视图（统计时点：用例集 231 个时），精确计数以第一章为准。用例随规则演进增删后，本表不再逐增逐改。
+> 场景归类为**人工整理的攻击面快照**（按攻击场景归类，非硬性口径）。当前用例集 355 个（Deny 199 / Allow 156），其中 18 个场景内 215 个（含 edge/inline 边界用例，统计时点 231 个时整理），另有 agent 专属用例 9 个、scenario 场景用例 9 个、以及部分边界用例未计入场景分类。下表为历史整理的攻击面视图（统计时点：用例集 231 个时），精确计数以第一章为准。用例随规则演进增删后，本表不再逐增逐改。
 
 按攻击场景归类，共 18 个场景，合计 215：
 
@@ -319,7 +347,9 @@
 
 ## 五、误报率与漏报率（基于整个 tests/cases）
 
-> **统计时点**：下表为**历史统计**（统计时点：用例集 231 个时）的实测结果，**精确计数以第一章为准**（当前 331 个，Deny 189 / Allow 142，非 L3 303 个）。口径与 §6.3 一致：对**非 L3 用例（203 个，历史时点）**逐一跑 `analyze()` 三档（不启用 / 仅 L1 / L1+L2），L3 用例（28 个）禁 LLM 时 skip（fail-open 放行，对应"漏报"），由 §6.2 的 LLM 真跑单独验证。用例增删后本节数字为历史快照，不随用例集自动更新；复现方法见 §6.3（脚本需在完整 pytest fixture 环境下才与 test_all_cases.py 同口径）。**2026-08 扩充的 53 个 + 2026-09 新增的 24 个 L1 用例（rm-root 降级 2 个 + 主目录删除根 + 主目录穿越拦截 2 个 + 定向清理放行 + chmod -R/-- 2 个 + setuid 组合位 + SSH/AWS 目录初始化放行 + 相对 temp 放行 + 敏感路径补空 1 个 + 审查批次2 的 6 个）均为静态可拦/可放行（已双端实测通过），不改变"L1+L2 零误报、L3 全通过"的结论**。
+> **统计时点**：下表为**历史统计**（统计时点：用例集 231 个时）的实测结果，**精确计数以第一章为准**（当前 355 个，Deny 199 / Allow 156，非 L3 327 个）。口径与 §6.3 一致：对**非 L3 用例（203 个，历史时点）**逐一跑 `analyze()` 三档（不启用 / 仅 L1 / L1+L2），L3 用例（28 个）禁 LLM 时 skip（fail-open 放行，对应"漏报"），由 §6.2 的 LLM 真跑单独验证。用例增删后本节数字为历史快照，不随用例集自动更新；复现方法见 §6.3（脚本需在完整 pytest fixture 环境下才与 test_all_cases.py 同口径）。**2026-08 扩充的 53 个 + 2026-09 新增的 24 个 L1 用例（rm-root 降级 2 个 + 主目录删除根 + 主目录穿越拦截 2 个 + 定向清理放行 + chmod -R/-- 2 个 + setuid 组合位 + SSH/AWS 目录初始化放行 + 相对 temp 放行 + 敏感路径补空 1 个 + 审查批次2 的 6 个）均为静态可拦/可放行（已双端实测通过），不改变"L1+L2 零误报、L3 全通过"的结论**。
+
+> **⚠️ 当前能力已超出本表（2026-09-11 更新）**：用例集已扩至 355 个，引擎新增 L2.2 形式化组合链 / 脚本引擎 / 内联分析等能力，本表数字**不再反映当前水平**。按同口径（§6.3 + 完整 pytest fixture 环境）实测：非 L3 的 317 个用例（182 应拦 / 135 应放）在 **L1+L2 档与 L1+L2+L3 档均零漏报、零误报**；另有 28 个语义类 L3 用例（14 应拦 / 11 应放）在全开档同样零漏报、零误报。L3 档此前残留的边界误报已按「误报改用例、非误报改引擎」的二分原则处置：`deny-10`（`git push --force`）属 L3 重复评估前置已降级为 medium 的已知风险 → 在 L3 模板补「不重复评估已知风险」原则修复；`allow-147`（`tar -xzf /tmp/... -C ~/.ssh`）属用例选了个来源即安全歧义的场景 → 改用用户自有备份目录作来源。**注意 L3 存在模型波动**：同一用例不同次跑判定可能翻转，单次数字仅供参考。
 
 口径：对 203 个非 L3 用例逐一跑 `analyze()`，比较实际 `decision` 与期望 `expected_decision`。
 - **FP（误报）** = 期望 Allow 却 Deny
@@ -427,11 +457,15 @@ for f in sorted(glob.glob("tests/cases/l*/*.json")):
 
 > 说明：上述脚本覆盖不启用 / L1 / L1+L2 三档（禁用 LLM 时 L3 走 fail_open 放行，对应"漏报"）。L1+L2+L3 全通过行由 §6.2 的 LLM 真跑补齐。
 
-### 6.4 关于计数口径（331 vs Python/TS 报告数值）
+### 6.4 关于计数口径（430 vs Python/TS 报告数值）
 
-`tests/cases/` 的 331 个 JSON 是双端**共用**的归一化用例。Python `pytest` / TS `vitest` 报告的总 passed 数 > 331，是因为各自端还有**额外的手写单测**（不读 JSON，直接测引擎子模块）。两端真实独立 JSON 用例数一致（331）；passed 总数差异只来自各自补充的单元测试，不是用例集不一致。详见顶部"关于测试数字"节。
+`tests/cases/` 的 430 个 JSON 是双端**共用**的归一化用例。Python `pytest` / TS `vitest` 报告的总 passed 数 > 430，是因为各自端还有**额外的手写单测**（不读 JSON，直接测引擎子模块）。两端真实独立 JSON 用例数一致（430）；passed 总数差异只来自各自补充的单元测试，不是用例集不一致。详见顶部"关于测试数字"节。
 
-> **Windows 覆盖说明**：当前 331 个 JSON 全为 Linux profile，Windows 规则无 JSON 用例、仅 Python 少量单测断言。需要 Windows 回归覆盖时新增 `os_type: "windows"` 用例。
+> **平台覆盖说明**：Linux 之外的规则已由 `tests/cases/os/<平台>/` 的 23 个用例覆盖
+> （`os/windows` 6 + `os/macos` 7 + `os/harmony` 7，子目录名即 `input.os_type`；
+> macos / harmony 各含一条**继承 Linux** 的验证用例）。这些用例**不进客户交付集**
+> （`generate_bash_exc.py` 提取命令集时排除 `os/`，客户沙箱是麒麟/Linux，平台用例
+> 在那里判定必然失败）。
 
 ---
 

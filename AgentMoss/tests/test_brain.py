@@ -1077,3 +1077,20 @@ def run_all():
 if __name__ == "__main__":
     success = run_all()
     sys.exit(0 if success else 1)
+
+
+# ==================== 贡献器：URL 解析（双端镜像，2026-10 修） ====================
+
+
+def test_extract_repo_path_strips_host_for_all_url_forms():
+    """三种写法都要得到 owner/repo（镜像 TS contributor.test 的同名断言）。
+
+    历史 bug：https 分支不剥 host，返回 "gitcode.com/kenhkl/AgentMoss"，而调用方
+    拿它拼**回退 MR 链接** → `https://gitcode.com/gitcode.com/kenhkl/...`（坏链）。
+    双端同款，2026-10 一起修。
+    """
+    from agent_moss.brain.contributor import _extract_repo_path as f
+
+    assert f("ssh://git@atomgit.com/kenhkl/AgentMoss.git") == "kenhkl/AgentMoss"
+    assert f("git@gitcode.com:kenhkl/AgentMoss.git") == "kenhkl/AgentMoss"
+    assert f("https://gitcode.com/kenhkl/AgentMoss.git") == "kenhkl/AgentMoss"

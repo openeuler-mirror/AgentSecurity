@@ -25,6 +25,7 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..rules_loader import compile_rule_regex, load_script_rules, resolve_keyword_set
 from .types import ScriptNode, ScriptChainAnalysisResult
 
 if TYPE_CHECKING:
@@ -32,102 +33,61 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 脚本分析词表：单一事实源 rules/script_rules.json（Python/TS 四份副本收拢成一份）。
+# 模块导入时读一次 —— 与迁移前的硬编码常量行为一致（进程内不变，改 JSON 需重启）。
+# ⚠️ 缺失/损坏 → 词表为空，脚本关键词扫描一条都不命中（更松），故必须报错。
+_SCRIPT_RULES = load_script_rules()
+if not _SCRIPT_RULES:
+    logger.error(
+        "规则文件 script_rules.json 缺失或损坏 —— 脚本内容关键词扫描将不命中任何模式"
+        "（比正常更松）。请检查包完整性。"
+    )
+
 
 # ==================== 高风险检测规则（关键词扫描，兼容 L3） ====================
-# 仅保留误报率极低、几乎必然指示恶意行为的模式
+# 仅保留误报率极低、几乎必然指示恶意行为的模式。数据见 rules/script_rules.json。
 
 SUSPICIOUS_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("curl POST", re.compile(r"curl\s+(.*\s)?-X\s+POST", re.IGNORECASE)),
-    ("curl --data", re.compile(r"curl\s+(.*\s)?--data", re.IGNORECASE)),
-    ("curl -d", re.compile(r"curl\s+(.*\s)?-d\s", re.IGNORECASE)),
-    ("wget --post-data", re.compile(r"wget\s+(.*\s)?--post-data", re.IGNORECASE)),
-    ("wget --post-file", re.compile(r"wget\s+(.*\s)?--post-file", re.IGNORECASE)),
-    ("nc -e", re.compile(r"\bnc\s+.*-e\b")),
-    ("ncat -e", re.compile(r"\bncat\s+.*-e\b")),
-    ("/dev/tcp", re.compile(r"/dev/tcp/")),
-    ("/dev/udp", re.compile(r"/dev/udp/")),
-    ("$(base64", re.compile(r"\$\(\s*base64")),
-    ("`base64", re.compile(r"`\s*base64")),
-    ("base64 decode pipe", re.compile(r"base64\s+(-d|--decode)\s*\|")),
-    ("/etc/shadow", re.compile(r"/etc/shadow")),
-    ("id_rsa", re.compile(r"\bid_rsa\b")),
-    ("id_ed25519", re.compile(r"\bid_ed25519\b")),
-    ("crontab install", re.compile(r"crontab\s+-")),
-    ("authorized_keys", re.compile(r"authorized_keys")),
-    ("ssh no host key check", re.compile(r"ssh\s+.*StrictHostKeyChecking\s*=\s*no")),
+    (str(r["name"]), compile_rule_regex(r))
+    for r in (_SCRIPT_RULES.get("suspicious_patterns") or [])
 ]
 
 
 # ==================== 脚本执行模式匹配 ====================
 # 入口命令的脚本路径提取（从 action_detail 提取）
 
+# 数据见 rules/script_rules.json 的 script_exec_patterns.chain（13 条，识别解释器 +
+# 任意后缀，供递归追踪）。注意 legacy 那份只认 .sh，两份不可互换。
 SCRIPT_EXEC_PATTERNS: list[str] = [
-    r"(?:^|\s|&&|\|\|)\s*bash\s+(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*/bin/bash\s+(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*sh\s+(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*zsh\s+(\S+)",
-    r"\./(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*source\s+(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*\.\s+(\S+)",
-    r"(?:^|\s|&&|\|\|)\s*python3?\s+(\S+\.py)",
-    r"(?:^|\s|&&|\|\|)\s*node\s+(\S+\.js)",
-    r"(?:^|\s|&&|\|\|)\s*ruby\s+(\S+\.rb)",
-    r"(?:^|\s|&&|\|\|)\s*perl\s+(\S+\.pl)",
-    r"(?:^|\s|&&|\|\|)\s*php\s+(\S+\.php)",
-    r"(?:^|\s|&&|\|\|)\s*lua\s+(\S+\.lua)",
+    str(p["pattern"])
+    for p in ((_SCRIPT_RULES.get("script_exec_patterns") or {}).get("chain") or [])
 ]
 
-_SCRIPT_EXEC_COMPILED = [re.compile(p, re.IGNORECASE) for p in SCRIPT_EXEC_PATTERNS]
+_SCRIPT_EXEC_COMPILED = [
+    compile_rule_regex(p)
+    for p in ((_SCRIPT_RULES.get("script_exec_patterns") or {}).get("chain") or [])
+]
 
 
 # ==================== 关键词组合风险评估规则 ====================
 
+# 组合放大规则：group1/group2 里以 `$` 开头的是对 keyword_sets 的引用
+# （如 `$network_post`），免得同一组词写两遍。数据见 rules/script_rules.json。
+_KEYWORD_SETS: dict[str, list[str]] = dict(_SCRIPT_RULES.get("keyword_sets") or {})
+
 KEYWORD_COMBINATION_RISKS: list[tuple[set[str], set[str], str, str]] = [
     (
-        {"curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"},
-        {"$(base64", "`base64", "base64 decode pipe"},
-        "critical",
-        "检测到网络数据发送 + Base64编码组合，构成 Critical 级别数据外传风险。攻击者可能将敏感数据编码后外传。",
-    ),
-    (
-        {"curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"},
-        {"/etc/shadow", "id_rsa", "id_ed25519"},
-        "critical",
-        "检测到网络数据发送 + 敏感文件访问组合，构成 Critical 级别凭证外传风险。",
-    ),
-    (
-        {"nc -e", "ncat -e", "/dev/tcp", "/dev/udp"},
-        set(),
-        "high",
-        "检测到反弹 Shell 特征，攻击者可能建立远程控制通道。",
-    ),
-    (
-        {"crontab install", "authorized_keys", "ssh no host key check"},
-        set(),
-        "high",
-        "检测到持久化后门特征，攻击者可能在系统中植入后门。",
-    ),
+        resolve_keyword_set(r.get("group1"), _KEYWORD_SETS),
+        resolve_keyword_set(r.get("group2"), _KEYWORD_SETS),
+        str(r["level"]),
+        str(r["reason"]),
+    )
+    for r in (_SCRIPT_RULES.get("keyword_combination_risks") or [])
 ]
 
 SINGLE_KEYWORD_RISKS: dict[str, tuple[str, str]] = {
-    "curl POST": ("high", "检测到 curl POST 请求，可能向外部服务器发送数据。"),
-    "curl --data": ("high", "检测到 curl --data 参数，可能向外部服务器发送数据。"),
-    "curl -d": ("high", "检测到 curl -d 参数，可能向外部服务器发送数据。"),
-    "wget --post-data": ("high", "检测到 wget POST 请求，可能向外部服务器发送数据。"),
-    "wget --post-file": ("high", "检测到 wget 文件上传，可能向外部服务器发送文件。"),
-    "nc -e": ("critical", "检测到 nc -e 反弹 Shell 特征。"),
-    "ncat -e": ("critical", "检测到 ncat -e 反弹 Shell 特征。"),
-    "/dev/tcp": ("critical", "检测到 /dev/tcp 反弹 Shell 特征。"),
-    "/dev/udp": ("critical", "检测到 /dev/udp 反弹 Shell 特征。"),
-    "$(base64": ("high", "检测到 Base64 编码执行，可能是混淆逃逸。"),
-    "`base64": ("high", "检测到 Base64 编码执行，可能是混淆逃逸。"),
-    "base64 decode pipe": ("high", "检测到 Base64 解码后管道执行，可能是混淆逃逸。"),
-    "/etc/shadow": ("critical", "检测到访问系统密码文件。"),
-    "id_rsa": ("critical", "检测到访问 SSH 私钥。"),
-    "id_ed25519": ("critical", "检测到访问 SSH 私钥。"),
-    "crontab install": ("high", "检测到修改定时任务，可能是持久化后门。"),
-    "authorized_keys": ("high", "检测到修改 SSH 授权密钥，可能是持久化后门。"),
-    "ssh no host key check": ("high", "检测到 SSH 跳过主机密钥验证，可能是横向移动。"),
+    str(k): (str(v["level"]), str(v["reason"]))
+    for k, v in (_SCRIPT_RULES.get("single_keyword_risks") or {}).items()
 }
 
 _RISK_PRIORITY = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -157,11 +117,9 @@ def assess_keyword_combination_risk(
         if hit_group1 and hit_group2:
             return level, reason
 
-    has_network_post = bool(keyword_set & {
-        "curl POST", "curl --data", "curl -d", "wget --post-data", "wget --post-file"
-    })
+    has_network_post = bool(keyword_set & set(_KEYWORD_SETS.get("network_post") or []))
     if has_network_post:
-        env_patterns = ["$env", "$(env)", "$USER", "$(hostname)", "$(pwd)", "$HOME"]
+        env_patterns = [str(p) for p in (_SCRIPT_RULES.get("env_exfil_patterns") or [])]
         content_lower = script_content.lower()
         for pattern in env_patterns:
             if pattern.lower() in content_lower:
@@ -185,13 +143,35 @@ def assess_keyword_combination_risk(
 
 
 def extract_script_path(command: str) -> str | None:
-    """从 bash 命令中提取脚本路径。"""
+    """从 bash 命令中提取脚本路径。
+
+    ⚠️ 必须剥掉包裹引号：`bash "/root/s.sh"` 的捕获组带引号，直接当路径用会变成
+    **相对路径**（`"/root/s.sh"` 不以 / 开头），后续按 cwd 拼成 `/root/"/root/s.sh"`
+    这种怪物路径 → 文件系统探测抛异常 → fail-closed。TS 侧一直有剥引号
+    （`tok.replace(/^['"]|['"]$/g, '')`），Python 漏了。
+    """
     for compiled in _SCRIPT_EXEC_COMPILED:
         match = compiled.search(command)
         if match:
-            return match.group(1)
+            return match.group(1).strip().strip("'\"")
     return None
 
+
+def _is_existing_file(path) -> bool:
+    """该路径是否存在且是文件。**任何文件系统异常一律当"不是"**。
+
+    ⚠️ Python 3.12 的 ``Path.exists()`` / ``is_file()`` 在**父目录不可读**时会抛
+    ``PermissionError``（不是返回 False，``os.path.exists`` 才是返回 False）。
+    不设防的话异常会一路上抛 → 外层 fail-closed → 同一条命令的判定**随 cwd/
+    文件权限变化**且不可复现（实测 ``cat "/etc/./shadow"`` 在 cwd=/root 时 Deny、
+    换 cwd 就 Allow，差异纯粹来自这里探测 `/root/...` 时抛不抛异常）。
+    路径探测只是"这个词像不像脚本文件"的辅助判断，探测失败按"不是"处理最合理。
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        return p.exists() and p.is_file()
+    except OSError:
+        return False
 
 def extract_script_path_with_args(command: str) -> tuple[str | None, list[str]]:
     """从 bash 命令中同时提取脚本路径和其后的位置参数/选项。
@@ -300,21 +280,18 @@ def _extract_inline_script_path(action_detail: str) -> str | None:
             tokens = shlex.split(cand) if cand else []
         for tok in tokens:
             if _looks_like_script_path(tok):
-                p = Path(tok).expanduser().resolve()
-                if p.exists() and p.is_file():
-                    return str(p)
+                if _is_existing_file(tok):
+                    return str(Path(tok).expanduser().resolve())
         # 字符串形态：整个 cand 若是单个脚本路径（无解释器前缀）
         if not tokens and _looks_like_script_path(cand.strip()):
-            p = Path(cand.strip()).expanduser().resolve()
-            if p.exists() and p.is_file():
-                return str(p)
+            if _is_existing_file(cand.strip()):
+                return str(Path(cand.strip()).expanduser().resolve())
 
     # 3. 兜底：open('x.py').read() 形态（原有逻辑）
     for m in re.finditer(r"""open\s*\(\s*['"]([^'"]+)['"]\s*\)""", code):
         path = m.group(1)
-        resolved = Path(path).expanduser().resolve()
-        if resolved.exists() and resolved.is_file():
-            return str(resolved)
+        if _is_existing_file(path):
+            return str(Path(path).expanduser().resolve())
     return None
 
 

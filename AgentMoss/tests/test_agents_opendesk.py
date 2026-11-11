@@ -241,12 +241,33 @@ class TestAgentRulesRuntimeConfigOverride:
         assert "todomgr-" in ext2.builtin_safe_action_types
 
     def test_merge_preserves_user_disabled(self):
-        """merge_config 后用户禁用的 agent 规则保留 enabled=False。"""
-        from agent_moss.infra.runtime_config import (
-            generate_source_defaults, merge_config, _rule_fingerprint,
-        )
+        """**带 user_disabled 标记**的禁用（用户在 Console 主动关的）必须保留。"""
+        from agent_moss.infra.runtime_config import generate_source_defaults, merge_config
         src = generate_source_defaults()
-        # 用户配置：opendesk 的第一条 builtin_safe_action_types 禁用
+        user = {"agent_rules": {"opendesk": {
+            "builtin_safe_action_types": {
+                "category_enabled": True, "category_desc": "",
+                "rules": [{"value": "memory-", "enabled": False, "builtin": True,
+                           "user_disabled": True}],
+            }}}}
+        merged = merge_config(user, src)
+        rules = merged["agent_rules"]["opendesk"]["builtin_safe_action_types"]["rules"]
+        memory_rule = next(r for r in rules if r["value"] == "memory-")
+        assert memory_rule["enabled"] is False
+        assert memory_rule["user_disabled"] is True
+        # 其余出厂条目被补进来且 enabled=True
+        todomgr_rule = next(r for r in rules if r["value"] == "todomgr-")
+        assert todomgr_rule["enabled"] is True
+
+    def test_merge_heals_unmarked_disabled(self):
+        """**无标记**的 enabled=False 视为历史污染/系统自动禁用 → merge 时自动痊愈为启用。
+
+        历史 bug：不动 runtime 文件，内置规则却莫名被禁用，必须手动删掉 runtime 才能
+        恢复（2026-09 用户实测反复踩到）。根因是 merge 时区分不了「谁禁的」，只能无条件
+        沿用旧值 → 一次污染永久锁死。现在只有 user_disabled 标记才代表用户意图。
+        """
+        from agent_moss.infra.runtime_config import generate_source_defaults, merge_config
+        src = generate_source_defaults()
         user = {"agent_rules": {"opendesk": {
             "builtin_safe_action_types": {
                 "category_enabled": True, "category_desc": "",
@@ -255,10 +276,7 @@ class TestAgentRulesRuntimeConfigOverride:
         merged = merge_config(user, src)
         rules = merged["agent_rules"]["opendesk"]["builtin_safe_action_types"]["rules"]
         memory_rule = next(r for r in rules if r["value"] == "memory-")
-        assert memory_rule["enabled"] is False
-        # 其余出厂条目被补进来且 enabled=True
-        todomgr_rule = next(r for r in rules if r["value"] == "todomgr-")
-        assert todomgr_rule["enabled"] is True
+        assert memory_rule["enabled"] is True, "无标记的禁用必须自愈（源码里这条规则还在）"
 
     def test_merge_adds_new_agent(self):
         """新增 agent（源有、用户无）→ 整体加入。"""

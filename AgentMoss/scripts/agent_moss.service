@@ -16,6 +16,10 @@ Environment=AGENT_MOSS_CONFIG_PATH=/etc/agent_moss/agent_moss.yaml
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/agent_moss/agent_moss.env
 # Environment=AGENT_MOSS_DISABLE_LLM=0
+# 规则来源模式：cold=冷启动（规则目录启动时读一次，忽略 runtime/Console）
+# Environment=AGENT_MOSS_RULES_MODE=cold
+# builtin=仅内置（连规则目录也不读）
+# Environment=AGENT_MOSS_RULES_MODE=builtin
 # Environment=AGENT_MOSS_LLM_MODEL=glm-5.0
 # Environment=AGENT_MOSS_LLM_BASE_URL=https://api.nextapi.store/v1
 

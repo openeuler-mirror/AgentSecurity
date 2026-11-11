@@ -225,9 +225,7 @@ def _mark_node_lines(node: ast.AST, lines: set, source_lines: list) -> None:
         return
     if end is None:
         end = start
-    for i in range(start, end + 1):
-        if 1 <= i <= len(source_lines):
-            lines.add(i)
+    lines.update(range(max(1, start), min(end, len(source_lines)) + 1))
 
 
 def _reconstruct(source_lines: list, lines: set) -> str:
@@ -316,12 +314,12 @@ def _process_stmt(stmt: ast.AST, env: _Env, source_lines: list, lines: set, bran
             case_env = _Env(argv=env.argv, vars=dict(env.vars))
             _process_stmts(case.body, case_env, source_lines, lines, branches)
         return
-    # def / class / import / 普通表达式等：全部保留（调用时环境未知，不可剪）
-    _mark_node_lines(stmt, lines, source_lines)
     # def/class 体内不做剪枝（保守）；但若体内有嵌套 if，不处理（保持 fail-closed）
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         _mark_def_tree(stmt, lines, source_lines)
         return
+    # import / 普通表达式等：全部保留。
+    _mark_node_lines(stmt, lines, source_lines)
     # 顶层表达式语句（含 subprocess.run(...) / os.system(...) / 用户函数调用）：
     # 非纯函数调用（Name 形态）可能修改全局变量 → 失效 env（漏报防护）。
     if isinstance(stmt, ast.Expr):
@@ -329,9 +327,12 @@ def _process_stmt(stmt: ast.AST, env: _Env, source_lines: list, lines: set, bran
 
 
 def _mark_def_tree(stmt: ast.AST, lines: set, source_lines: list) -> None:
-    """def/class 体整树保守标记（不剪枝）。"""
-    for n in ast.walk(stmt):
-        _mark_node_lines(n, lines, source_lines)
+    """保留定义及装饰器；解析器的定义范围已包含整个定义体。"""
+    _mark_node_lines(stmt, lines, source_lines)
+    # ast.parse 的顶层装饰器位于定义范围之前；内部定义的装饰器已在
+    # 外层范围内。分别标记表达式，避免额外加入装饰器之间的空白/注释。
+    for decorator in stmt.decorator_list:
+        _mark_node_lines(decorator, lines, source_lines)
 
 
 def _process_if(stmt: ast.If, env: _Env, source_lines: list, lines: set, branches: list) -> None:
@@ -369,6 +370,7 @@ def _extract_calls_ast(tree: ast.Module, source: str, reachable_lines: set | Non
     避免不可达分支的子调用被递归追踪）。
     """
     calls: list[ScriptCall] = []
+    import_calls: list[ScriptCall] = []
 
     def _line_reachable(node: ast.AST) -> bool:
         if reachable_lines is None:
@@ -389,6 +391,14 @@ def _extract_calls_ast(tree: ast.Module, source: str, reachable_lines: set | Non
         return None
 
     for node in ast.walk(tree):
+        # Collect imports in the same traversal, but append them after command
+        # calls to preserve the original ordering and reachability behavior.
+        if isinstance(node, ast.ImportFrom) and node.level and node.level >= 1:
+            if node.module:
+                import_calls.append(ScriptCall(path=node.module.replace(".", "/") + ".py", args=[], interpreter="python3"))
+            for alias in node.names:
+                if alias.name != "*":
+                    import_calls.append(ScriptCall(path=alias.name.replace(".", "/") + ".py", args=[], interpreter="python3"))
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if not _line_reachable(node):
@@ -428,14 +438,7 @@ def _extract_calls_ast(tree: ast.Module, source: str, reachable_lines: set | Non
                 if sc is not None:
                     calls.append(sc)
 
-    # 相对导入：from . import x / from .x import y → 本地模块链
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level and node.level >= 1:
-            if node.module:
-                calls.append(ScriptCall(path=node.module.replace(".", "/") + ".py", args=[], interpreter="python3"))
-            for alias in node.names:
-                if alias.name != "*":
-                    calls.append(ScriptCall(path=alias.name.replace(".", "/") + ".py", args=[], interpreter="python3"))
+    calls.extend(import_calls)
 
     # 去重（保持顺序）
     seen: set = set()

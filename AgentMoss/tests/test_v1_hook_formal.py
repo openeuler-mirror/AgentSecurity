@@ -4,7 +4,7 @@
 - 多 session 历史由 Agent 携带（无需 AgentMoss 自采、无需 eBPF）
 - FormalEngine 应能跨会话检出组合链 / P3 / P4 抽象性质
 
-这对应 docs/L2.2_FORMAL_COMBO_ENGINE.md §B.6"纯文本 hook（V1/V3/鸿蒙全兼容）不依赖 eBPF"。
+纯文本 hook（V1/V3/鸿蒙全兼容）不依赖 eBPF。
 """
 from agent_moss.engine.formal_engine.engine import FormalEngine
 
@@ -56,7 +56,7 @@ def test_v1_encoded_variant_still_detected():
         {"session_id": "B", "action_history": [
             {"action_type": "bash", "action_detail": "echo c3VicHJvY2Vzcw== | base64 -d | bash"}]},
     ]
-    r = _hook_analyze(hist, {"action_type": "bash", "action_detail": "nc -z 10.0.0.5 22"})
+    r = _hook_analyze(hist, {"action_type": "bash", "action_detail": "nc -z scan-target.internal 22"})
     assert not r.verified
 
 

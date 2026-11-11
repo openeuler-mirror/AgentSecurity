@@ -20,6 +20,10 @@ from pathlib import Path
 # MAINTENANCE_WORKFLOW.md「验证真实运行」）。
 # 注：conftest 是 pytest 首个加载的测试文件，本语句在 agent_moss 任何 import 之前执行，
 # 之后加载的 agent_moss.infra.paths 首次调用 get_data_root() 即读到该 env，无缓存问题。
+# 测试默认关闭鉴权（2026-10 起产品默认 auto：首次启动自动生成 token）。
+# 需要验证鉴权行为的用例在用例内显式设 AGENT_MOSS_AUTH_MODE=auto 覆盖。
+os.environ.setdefault("AGENT_MOSS_AUTH_MODE", "off")
+
 if os.getenv("AGENT_MOSS_TEST_USE_RUNTIME") != "1":
     _AM_TEST_DATA_DIR = tempfile.mkdtemp(prefix="agentmoss_test_data_")
     os.environ["AGENT_MOSS_DATA_DIR"] = _AM_TEST_DATA_DIR
@@ -143,6 +147,38 @@ def shell_shift_cwd():
     """为 shell shift 漏报防护 JSON case 创建含 deploy_shift.sh 的临时目录。"""
     d = Path(tempfile.mkdtemp(prefix="agentmoss-shell-shift-"))
     (d / "deploy_shift.sh").write_text(_SHIFT_BRANCH_SCRIPT)
+    yield str(d)
+    shutil.rmtree(str(d), ignore_errors=True)
+
+
+# ========== 复杂嵌套脚本分支感知（deploy-large.sh / build-large.py）测试环境 ==========
+# 这两个脚本是多分支 case 嵌套调用 build-script/ 子模块（deploy.sh / prepare.sh / install.sh /
+# cleanup.sh）。**内容单一事实源 = tests/cases_exec/assets/premise/**（与 prep.sh / judge_agentmoss.py
+# 同源）——fixture 直接把素材拷到临时 cwd，不改写内容（避免和 cases_exec 侧漂移）。
+# 供一拦一放用例使用：clean/full-clean → Deny（子模块危险分支），full/quick → Allow（安全分支）。
+
+_CASES_EXEC_PREMISE = Path(__file__).parent / "cases_exec" / "assets" / "premise"
+# 2026-09 补：大脚本样本（732/1990 行）也走同一 fixture —— 篇幅接近真实
+# 生产脚本，验证长文本扫描；且「有函数定义时整层不剪枝」这个行为也一并被看护。
+_NESTED_SCRIPT_MAIN = ("deploy-large.sh", "build-large.py", "deploy-xlarge.sh", "build-xlarge.py")
+_NESTED_SCRIPT_SUBDIR = "build-script"
+
+
+@pytest.fixture(scope="session")
+def nested_script_branch_cwd():
+    """为复杂嵌套脚本 JSON case 创建含 deploy-large.sh / build-large.py + build-script/ 的临时目录。"""
+    d = Path(tempfile.mkdtemp(prefix="agentmoss-nested-script-"))
+    for name in _NESTED_SCRIPT_MAIN:
+        src = _CASES_EXEC_PREMISE / name
+        if src.is_file():
+            (d / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    sub_src = _CASES_EXEC_PREMISE / _NESTED_SCRIPT_SUBDIR
+    if sub_src.is_dir():
+        sub_dst = d / _NESTED_SCRIPT_SUBDIR
+        sub_dst.mkdir(exist_ok=True)
+        for child in sub_src.iterdir():
+            if child.is_file():
+                (sub_dst / child.name).write_text(child.read_text(encoding="utf-8"), encoding="utf-8")
     yield str(d)
     shutil.rmtree(str(d), ignore_errors=True)
 
@@ -417,21 +453,11 @@ def _prep_file_state(case: dict, profile) -> None:
                     pass
 
 
-def load_all_cases() -> list[dict]:
-    """加载所有测试用例 JSON 文件（递归扫 cases/ 下所有子目录，按 L1/L2/L3 分类）"""
-    cases = []
-    for f in sorted(CASES_DIR.rglob("*.json")):
-        with open(f, "r", encoding="utf-8") as fh:
-            case = _expand_placeholder(json.load(fh))
-            case["_file"] = f.name
-            case["_layer"] = f.parent.name  # l1 / l2 / l3
-            cases.append(case)
-    return cases
-
-
-def pytest_generate_tests(metafunc):
-    """参数化测试用例"""
-    if "case" in metafunc.fixturenames:
-        cases = load_all_cases()
-        ids = [c["id"] for c in cases]
-        metafunc.parametrize("case", cases, ids=ids)
+# ⚠️ 这里原本有一个 `load_all_cases()` + `pytest_generate_tests()` 参数化钩子，
+# 声称「自动参数化所有测试用例」。但它挂钩的是名为 `case` 的 fixture，而**没有任何
+# 测试声明过这个参数** —— 钩子永不触发，是彻底的死代码，却被误当成"用例会自动跑到"。
+# 2026-09 实测：`l1/allow-77-*.json` 在 Python 侧从未执行过（TS 递归扫目录所以跑到了），
+# 两端用例总数只是恰好"漏 1 个 + 重复跑 1 个"才相抵。真正驱动 l1/l2/l3 的是
+# test_all_cases.py 里的硬编码 parametrize 列表 —— 那条路径有护栏
+# （TestCaseRegistration::test_every_l1_l2_l3_case_file_is_registered）。
+# 删掉这个钩子，避免再次误导。用到的 `_expand_placeholder` 保留（test_all_cases 会用）。

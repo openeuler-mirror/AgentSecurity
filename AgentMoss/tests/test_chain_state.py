@@ -5,7 +5,7 @@
 - /api/v1/review seed 后返回前序链；
 - analyze 走 metadata[stateful_incremental]=true 时，若当前动作补全
   历史前序链 → 补充 Deny（risk_type=formal_verification）；未启用 → 零回归。
-双端镜像：TS 无 HTTP 服务，此测试仅 Python 侧（TS 侧由 formal-stateful.test.ts 覆盖引擎一致性）。
+本文件测 Python 侧入口行为（含 `/review` 回退用状态库累积节点、violations 带 path）。
 """
 
 import pytest
@@ -127,7 +127,7 @@ def test_analyze_stateful_off_no_change():
     assert "L2.2-stateful" not in (body.get("violated_layers") or [])
 
 
-def test_review_reads_agentgate_sqlite_db(tmp_path):
+def test_review_reads_agentgate_sqlite_db(tmp_path, monkeypatch):
     """/api/v1/review 直接读 AgentGate SQLite（db_path）→ 全量 seed + 前序提取。
 
     这是"数据不双份存储"的核心：AgentMoss 不复制事件流，直读 AgentGate 本地库。
@@ -168,6 +168,9 @@ def test_review_reads_agentgate_sqlite_db(tmp_path):
     conn.commit()
     conn.close()
 
+    # db_path 现在受白名单约束（2026-10 安全加固）：标准 AgentGate 部署走默认白名单，
+    # 这个用例用的是临时目录模拟自定义部署，显式登记即可。
+    monkeypatch.setenv("AGENT_MOSS_REVIEW_PATHS", str(tmp_path))
     app = create_app()
     client = TestClient(app)
     r = client.post("/api/v1/review", json={

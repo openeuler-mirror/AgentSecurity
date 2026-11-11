@@ -40,6 +40,10 @@ from ..infra.runtime_config import (
     get_runtime_config_path,
     RUNTIME_CONFIG_DIR,
 )
+from ..infra.rules_mode import (
+    get_rules_mode, is_builtin_only, is_runtime_config_disabled,
+)
+from ..engine.skill_engine import default_skills_dir
 from ..infra.token_stats import (
     get_token_stats,
     get_recent_records,
@@ -49,6 +53,24 @@ from ..infra.token_stats import (
 )
 
 router = APIRouter(prefix="/console")
+
+
+def _runtime_for_view() -> dict:
+    """Console **读接口**的 runtime 数据源。
+
+    - 正常模式：用户 runtime 配置（含 Console 自定义规则）。
+    - cold / builtin 模式：随包内置规则的只读视图（``generate_source_defaults``），
+      **绝不读用户 runtime 文件**。写接口已由 server 中间件统一 403。
+
+    ⚠️ **正常模式下返回的是 ``load_runtime_config()`` 的进程内缓存对象本身**，
+    调用方**一律只读**（``.get(...)`` / 取值）。要往里塞键（如附加视图、标记）必须先
+    ``dict(...)`` 浅拷贝，否则会污染缓存并被后续写操作落盘 —— 2026-10 的
+    ``/api/config`` 500 就是这么来的（详见 ``get_full_config`` 注释）。
+    """
+    if is_runtime_config_disabled():
+        return generate_source_defaults()
+    return load_runtime_config()
+
 
 # ==================== Auth ====================
 
@@ -66,7 +88,9 @@ def _verify_auth(request: Request) -> bool:
         return True
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        return auth_header[7:] == token
+        # 恒定时间比较：避免按字节比较带来的时序侧信道（2026-10 安全加固）
+        import hmac as _hmac
+        return _hmac.compare_digest(auth_header[7:].encode("utf-8"), token.encode("utf-8"))
     return False
 
 
@@ -265,8 +289,13 @@ async def index():
 @router.get("/api/layers", dependencies=[Depends(auth_dependency)])
 async def get_layers():
     """获取 L1/L2/L3 开关状态 + env 覆盖"""
-    runtime = load_runtime_config()
-    return {"layers": runtime.get("layers", {}), "env_overrides": get_env_overrides()}
+    runtime = _runtime_for_view()
+    return {
+        "layers": runtime.get("layers", {}),
+        "env_overrides": get_env_overrides(),
+        "builtin_only": is_builtin_only(),
+        "rules_mode": get_rules_mode(),
+    }
 
 
 @router.put("/api/layers", dependencies=[Depends(auth_dependency)])
@@ -347,10 +376,19 @@ def _get_l2_2_view() -> dict:
     except Exception:
         mc = {}
     rules = mc.get("rules", []) or []
+    # category_enabled 必须**从 runtime 读**，不能恒 True：Console 关掉 LTL 大类后
+    # 前端会重新拉 /api/config 并按此字段渲染卡片开关，恒 True 会把用户的关闭操作
+    # 显示回「开启」（且与写端点返回的 _l2_2_runtime_to_view 自相矛盾）。
+    # load_mc() 只合并单条 enabled，不读大类开关（对齐 TS getL22View 的读法）。
+    try:
+        _l2_2 = (_runtime_for_view() or {}).get("L2_2") or {}
+        _cat_enabled = (((_l2_2.get("ltl_rules") or {}) or {}).get("category_enabled", True)) is not False
+    except Exception:
+        _cat_enabled = True
     return {
         "enabled_via": "L2_logic_rules",
         "description": "时序与数据流攻击检测（L2.2 模型检测）",
-        "category_enabled": True,
+        "category_enabled": _cat_enabled,
         "ltl_rules": [
             {"id": r.get("id"), "type": r.get("type"),
              "formula": "<公式>" if isinstance(r.get("formula"), list) else r.get("formula"),
@@ -390,7 +428,7 @@ def _l2_2_runtime_to_view(runtime_l2_2: dict) -> dict:
 
 @router.get("/api/rules", dependencies=[Depends(auth_dependency)])
 async def get_rules(layer: str | None = None, category: str | None = None):
-    runtime = load_runtime_config()
+    runtime = _runtime_for_view()
     result: dict = {}
     for layer_key in ["L1_rules", "L2_rules"]:
         if layer and layer != layer_key:
@@ -416,7 +454,10 @@ def _with_l2_2_view(runtime: dict) -> dict:
     """
     l22 = runtime.get("L2_2")
     if isinstance(l22, dict) and isinstance(l22.get("ltl_rules"), dict):
-        runtime["L2_2"] = _l2_2_runtime_to_view(l22)
+        # 不原地修改：runtime 可能来自 load_runtime_config 的进程内缓存，原地改会把
+        # view 结构（ltl_rules=list）写进缓存，污染后续规则加载（rules_loader 按
+        # dict 取 ltl_rules.rules → list.get 会崩）。改为浅拷贝后替换。
+        runtime = {**runtime, "L2_2": _l2_2_runtime_to_view(l22)}
     return runtime
 
 
@@ -482,7 +523,7 @@ async def remove_rule(body: DeleteRule):
 
 @router.get("/api/skills", dependencies=[Depends(auth_dependency)])
 async def get_skills():
-    runtime = load_runtime_config()
+    runtime = _runtime_for_view()
     return runtime.get("L3_skills", {})
 
 
@@ -515,11 +556,13 @@ async def get_skill_content(skill_id: str):
     # 防路径穿越：skill_id 只允许字母数字下划线横线
     if not skill_id.replace("-", "").replace("_", "").isalnum():
         raise HTTPException(status_code=400, detail="非法 skill id")
-    # 用户自定义 skill 目录
+    # 用户自定义 skill 目录（cold / builtin 模式下不读，只展示包内 skill）
     user_skills_dir = RUNTIME_CONFIG_DIR / "agent_moss_skills"
     # 内置 skill 目录（agent_moss/skills/）
-    builtin_skills_dir = Path(__file__).parent.parent / "skills"
-    for base in (user_skills_dir, builtin_skills_dir):
+    builtin_skills_dir = default_skills_dir()
+    bases = ((builtin_skills_dir,) if is_runtime_config_disabled()
+             else (user_skills_dir, builtin_skills_dir))
+    for base in bases:
         p = base / f"{skill_id}.md"
         if p.exists():
             return {"skill_id": skill_id, "path": str(p), "content": p.read_text(encoding="utf-8")}
@@ -532,7 +575,7 @@ async def get_skill_content(skill_id: str):
 @router.get("/api/agents", dependencies=[Depends(auth_dependency)])
 async def get_agents():
     """获取所有 agent 定制规则（含 enabled 状态，供 console 展示）。"""
-    return {"agents": get_agent_rules(load_runtime_config())}
+    return {"agents": get_agent_rules(_runtime_for_view())}
 
 
 @router.put("/api/agents/rules/enabled", dependencies=[Depends(auth_dependency)])
@@ -594,7 +637,7 @@ async def get_scenarios():
     只返回**已启用**的场景（由 AGENT_MOSS_SCENARIO env 决定）——没有 env 时不显示
     也不启用（部署级场景未配置）；有 env（如 AGENT_MOSS_SCENARIO=bank）时显示该场景。
     """
-    all_scenarios = get_scenario_rules(load_runtime_config())
+    all_scenarios = get_scenario_rules(_runtime_for_view())
     enabled = _enabled_scenario_ids()
     if not enabled:
         return {"scenarios": {}, "enabled": []}
@@ -646,14 +689,32 @@ async def toggle_scenario_category(body: ScenarioCategoryToggle):
 @router.get("/api/config", dependencies=[Depends(auth_dependency)])
 async def get_full_config():
     """获取完整 runtime config（含 L2_2 形式化只读视图，供前端"形式化"页展示）"""
-    cfg = load_runtime_config()
+    # ⚠️ `dict(...)` 这层浅拷贝**不能省**：`_runtime_for_view()` 在正常模式下返回的是
+    # `load_runtime_config()` 的**进程内缓存对象本身**，直接往上面写 L2_2 / builtin_only
+    # / rules_mode 会**污染缓存**。污染后：
+    #   ① 紧接着任何一次写操作都会 `save_runtime_config(load_runtime_config())`，
+    #      把视图结构（L2_2.ltl_rules 由 dict 变 list，另多出 enabled_via / description
+    #      两个**字符串**键）与两个伪层级键**落盘**；
+    #   ② 再下一次 merge 时，`_merge_rule_categories` 的"清理源码已移除的类目"分支对
+    #      `enabled_via`(str) 调 `.get("rules")` → AttributeError → 该接口 500。
+    # 复现路径（2026-10 实测，前端页面加载即触发第 ①步）：
+    #   打开 Console（GET /api/config）→ 点**第一次**开关 200（但已写坏文件）
+    #   → 点**第二次**开关 500。
+    # 写路径的 `_with_l2_2_view` 早已做了同样的浅拷贝（见其注释），读路径此前漏了。
+    cfg = dict(_runtime_for_view())
     cfg["L2_2"] = _get_l2_2_view()
+    cfg["builtin_only"] = is_builtin_only()
+    cfg["rules_mode"] = get_rules_mode()
     return cfg
 
 
 @router.get("/api/env-overrides", dependencies=[Depends(auth_dependency)])
 async def get_env_status():
-    return get_env_overrides()
+    # ⚠️ 必须包一层 ``{"overrides": ...}``：前端（console/static/index.html）
+    # `loadEnvOverrides()` 读的是 ``resp?.overrides``，直接返回扁平 map 会让
+    # 「环境变量接管」信息**恒为空**（禁用了哪些层看不出来）。TS 端
+    # console/router.ts 一直是 ``{overrides: ...}``，双端在此分叉（2026-10 修正）。
+    return {"overrides": get_env_overrides()}
 
 
 @router.post("/api/reset", dependencies=[Depends(auth_dependency)])

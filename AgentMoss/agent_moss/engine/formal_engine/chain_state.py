@@ -8,8 +8,7 @@ taint + 存活资源），并暴露增量的"种子/推进"入口。服务重启
 表：
 - chain_state(agent_id PRIMARY KEY, state_json, updated_at)
 
-双端镜像：TS 端 ts/src/engine/formal-engine/chain_state.ts（JSON 文件形态，对应
-无 sqlite 环境；AgentGate 侧逻辑一致）。
+JSON 文件形态，对应无 sqlite 环境；AgentGate 侧逻辑一致）。
 """
 
 from __future__ import annotations
@@ -46,13 +45,24 @@ class ChainStateStore:
     def __init__(self, db_path: str = ""):
         self.db_path = db_path or default_state_db_path()
         self._lock = threading.RLock()
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        _parent = Path(self.db_path).parent
+        _parent.mkdir(parents=True, exist_ok=True)
+        # 安全（2026-10）：库里存的是**各 agent 的动作历史**，是最敏感的数据。
+        # 目录 0700、文件 0600，避免同机其他用户直接读走。
+        try:
+            os.chmod(_parent, 0o700)
+        except OSError:
+            pass
         self._conn = sqlite3.connect(
             self.db_path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             if self.db_path != ":memory:":
+                try:
+                    os.chmod(self.db_path, 0o600)
+                except OSError:
+                    pass
                 # WAL:并发读写不互锁,且 NORMAL 同步下 commit 不再 fsync(性能大头)
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -123,6 +133,8 @@ class ChainStateStore:
         a_next: dict,
         session_id: str,
         is_error: bool = False,
+        source_agent: str = "",
+        instance_id: str = "",
     ) -> AdvanceResult:
         """有状态的实时增量：对某 agent 的 tracker 推送一条当前动作并判定。
 
@@ -135,6 +147,8 @@ class ChainStateStore:
             a_next=a_next,
             session_id=session_id,
             is_error=is_error,
+            agent_id=source_agent,
+            instance_id=instance_id,
         )
         self.save(t)
         return r

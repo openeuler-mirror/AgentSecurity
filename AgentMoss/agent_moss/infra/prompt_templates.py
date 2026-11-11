@@ -97,6 +97,7 @@ def get_security_judge_prompt(
     script_analysis_text: str = "",
     skip_l3_hints: str = "",
     prompt_history_text: str = "（未提供历史意图）",
+    path_context: str = "",
 ) -> str:
     """
     生成安全判断 prompt 的完整内容。
@@ -133,4 +134,5 @@ def get_security_judge_prompt(
         hints_text=hints_text,
         script_analysis_text=script_analysis_text,
         skip_l3_hints=skip_l3_hints,
+        path_context=path_context or "（本命令无主目录相关路径段，不适用）",
     )

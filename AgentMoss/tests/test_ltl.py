@@ -88,18 +88,22 @@ def test_mc_ltl_006_sensitive_then_clear_logs_blocks():
     assert any(v.property_id == "mc-ltl-006" for v in r.violations)
 
 
-def test_mc_ctl_001_clear_logs_blocks():
-    """拦：安全不变量 AG(!clear_logs) → 任何情况清日志都拦（当前动作即 witness）。"""
+def test_mc_ctl_001_removed_no_longer_blocks():
+    """单动作规则 mc-ctl-001 已移除（F clear_logs）。原因：
+    - 误伤 journalctl --vacuum、> /var/log/、history -c 等标准运维命令（FP）
+    - 攻击场景（读敏感数据→清日志灭迹）已由链式规则 mc-ltl-006 覆盖（见上行 006 测试）
+    删除后 history -c 应放行（verified）。"""
     r = _verify([], {"action_type": "bash", "action_detail": "history -c"})
-    assert not r.verified
-    assert any(v.property_id == "mc-ctl-001" for v in r.violations)
+    assert r.verified, "单动作清日志不再阻断，应 verified"
 
 
-def test_mc_ltl_010_persistence_approval():
-    """拦：持久化安装（mc-ltl-010，approval 语义）。"""
+def test_mc_ltl_010_removed_no_longer_blocks():
+    """单动作规则 mc-ltl-010 已移除（F install_persistence）。原因：
+    - 误伤 systemctl enable、crontab -e、chkconfig on 等标准运维命令（FP）
+    - 攻击场景（提权后装持久化 / 下载后装持久化）已由链式规则 mc-ltl-007/008 覆盖
+    删除后 crontab -e 应放行（verified）。"""
     r = _verify([], {"action_type": "bash", "action_detail": "crontab -e"})
-    assert not r.verified
-    assert any(v.property_id == "mc-ltl-010" for v in r.violations)
+    assert r.verified, "单动作装持久化不再阻断，应 verified"
 
 
 # ==================== witness 语义 ====================

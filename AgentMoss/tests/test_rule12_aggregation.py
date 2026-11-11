@@ -22,16 +22,23 @@ def _verify(sessions, a_next, properties=None):
     return FormalEngine(properties=properties).verify(sessions=sessions, a_next=a_next)
 
 
-# 载体 /tmp/agg.txt：A 写、B 读 → 2 个事件源接触
+# 载体 /tmp/agg.txt：A 读、B 读 → 2 个数据来源
 _HIST_TWO_SOURCES = [
     {"session_id": "A", "action_history": [
-        {"action_type": "file_write", "action_detail": "echo x > /tmp/agg.txt"}]},
-    {"session_id": "B", "action_history": [
         {"action_type": "file_read", "action_detail": "cat /tmp/agg.txt"}]},
+    {"session_id": "B", "action_history": [
+        {"action_type": "file_read", "action_detail": "head /tmp/agg.txt"}]},
 ]
-# 单源：仅 A 写载体
+# 单源：仅 A 读载体
 _HIST_ONE_SOURCE = [
     {"session_id": "A", "action_history": [
+        {"action_type": "file_read", "action_detail": "cat /tmp/agg.txt"}]},
+]
+# 只有元数据查看 + 普通写入接触载体（ls 不看内容、echo 是写入）→ 不算数据来源
+_HIST_METADATA_AND_WRITE = [
+    {"session_id": "A", "action_history": [
+        {"action_type": "bash", "action_detail": "ls -l /tmp/agg.txt"}]},
+    {"session_id": "B", "action_history": [
         {"action_type": "file_write", "action_detail": "echo x > /tmp/agg.txt"}]},
 ]
 # 历史已含聚合外发：A 写、B 读、C 外发
@@ -54,6 +61,13 @@ def test_rule12_two_sources_then_egress_blocks():
 def test_rule12_one_source_allows():
     """放：仅 1 个源接触载体 → 不触发 Rule 12。"""
     r = _verify(_HIST_ONE_SOURCE, _A_NEXT_EXFIL, properties=_rule12_only())
+    assert r.verified
+
+
+def test_rule12_metadata_and_write_only_allows():
+    """放（2026-10 误报修复）：载体只被 ls 元数据查看和 echo 写入接触，没有
+    读取内容 → 不构成数据聚合，普通外传不应判"聚合 2 源"。"""
+    r = _verify(_HIST_METADATA_AND_WRITE, _A_NEXT_EXFIL, properties=_rule12_only())
     assert r.verified
 
 

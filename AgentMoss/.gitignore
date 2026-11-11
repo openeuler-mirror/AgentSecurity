@@ -50,6 +50,13 @@ tests/cases_exec/.env
 tests/cases_exec/deploy.sh
 tests/cases_exec/deploy.py
 tests/cases_exec/deploy_shift.sh
+# 嵌套脚本用例的前提素材（judge/prep 从 assets/premise/ 补齐到此处，只补缺失不覆盖）
+# —— 源文件在 tests/cases_exec/assets/premise/ 下同名，必须提交，勿用通配符
+tests/cases_exec/deploy-large.sh
+tests/cases_exec/deploy-xlarge.sh
+tests/cases_exec/build-xlarge.py
+tests/cases_exec/build-large.py
+tests/cases_exec/build-script/
 # 场景子目录（bank 等）下生成的同名命令集，同样不入 git
 tests/cases_exec/*/allow.sh
 tests/cases_exec/*/deny.sh
@@ -58,10 +65,14 @@ tests/cases_exec/*/deny-root-only.sh
 tests/cases_exec/*/deny-needs-context.sh
 tests/cases_exec/*/config.yaml
 tests/cases_exec/*/.env
+# 通过率汇总（run_all.sh 真执行基线 / judge_agentmoss.py 判定模式各自落盘，供对比）
+tests/cases_exec/.last_run_sandbox.txt
+tests/cases_exec/.last_run_agentmoss.txt
+tests/cases_exec/*/.last_run_sandbox.txt
+tests/cases_exec/*/.last_run_agentmoss.txt
 
 # ===== 兜底：根目录所有隐藏文件/目录，仅保留 .gitignore =====
 # 覆盖 .claude/ .atomcode/ .opendesk/ .mimocode/ .pytest_cache/ 等工具本地缓存
-# 前导 / 限定根目录，不影响子目录如 ts/.gitignore
+# 前导 / 限定根目录，不影响子目录
 /.*
 !/.gitignore
-node_modules/

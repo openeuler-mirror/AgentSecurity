@@ -16,9 +16,17 @@ import os
 import re
 from pathlib import Path
 
+from .rules_mode import get_rules_mode, is_runtime_config_disabled
+
+from . import security_policy as sp
+
 logger = logging.getLogger(__name__)
 
 ENV_RUNTIME_CONFIG_PATH = "AGENT_MOSS_RUNTIME_CONFIG_PATH"
+
+
+class RuntimeConfigReadOnlyError(RuntimeError):
+    """cold / builtin 模式下禁止写入 runtime 配置。"""
 
 
 def _runtime_dir() -> Path:
@@ -102,6 +110,10 @@ def _l1_command_patterns_to_rules(profile) -> list[dict]:
             "reason": p.reason,
             "enabled": True,
             "builtin": True,
+            # 平台归属取**条目自身**的 os（不是加载它的 Profile）——MacOSProfile
+            # 继承 Linux 规则时，加载到的 Linux 条目必须仍标 linux，否则 runtime
+            # 种子会把它们重复写成 macos 条目（去重失效）。
+            "os": getattr(p, "os", "") or "linux",
         })
     return rules
 
@@ -113,12 +125,19 @@ def _l1_injection_keywords_to_rules(profile) -> list[dict]:
         keyword = kw["keyword"]
         lang = kw.get("lang", "en")
         rules.append({
-            "id": f"inj_{_slugify(keyword)}",
+            # slug 会抹平前导符号：'=== END OF' 与 '[END OF' 同 slug 成 end_of，
+            # 撞 id → Console 操作歧义。hash 覆盖完整 keyword 保证唯一。
+            "id": f"inj_{_slugify(keyword)}_{_fnv1a_32(keyword)}",
             "keyword": keyword,
             "risk_level": kw["risk_level"],
             "lang": lang,
             "enabled": True,
             "builtin": True,
+            # ⚠️ 带上**条目自己的** os，不要标成 profile 的 os。
+            # 旧实现标 profile 自身（调用方只传 linux profile）→ 全被标成 linux，
+            # Windows 按 os 过滤后一条不剩 → 静默回退到 profile 里那份 14 条的
+            # 历史副本，与 TS 分叉。现在 JSON 里通用条目标 `all`、平台独有标平台。
+            "os": str(kw.get("os") or "all").lower(),
         })
     return rules
 
@@ -182,8 +201,14 @@ def _l2_sensitive_paths_to_rules(profile) -> list[dict]:
             "dir_del_only": getattr(sp, "dir_del_only", False),
         }
         deny_mode = _derive_deny_mode(sp_dict)
+        os_tag = getattr(sp, "os", "") or "linux"
+        # id = path_<平台>_<slug>_<hash8>：
+        # - 平台段：Linux/Windows 存在同名 path（.ssh/.aws 各一条），不加会跨平台撞 id
+        # - hash 段：同平台内 slug 也可能撞（macOS 的 /Library/LaunchAgents 系统级与
+        #   Library/LaunchAgents 用户级，slug 后同名但语义不同）——hash 覆盖完整 path 保证唯一
+        # Console 按 id 操作（改 deny_mode/启停），撞 id 会取到第一条 = 误改别的规则。
         rule = {
-            "id": f"path_{_slugify(sp.path)}",
+            "id": f"path_{os_tag}_{_slugify(sp.path)}_{_fnv1a_32(sp.path)}",
             "path": sp.path,
             "risk_level": sp.risk_level,
             "desc": sp.desc,
@@ -192,6 +217,10 @@ def _l2_sensitive_paths_to_rules(profile) -> list[dict]:
             "skip_l3_on_disabled": True,
             "enabled": True,
             "builtin": True,
+            # 标记平台归属：runtime 覆盖按 os 过滤，条目必须自报平台。
+            # 取条目自身的 os（非 Profile 的）——MacOSProfile 继承的 Linux 条目
+            # 仍标 linux，保证种子去重与 Console 分组正确。
+            "os": getattr(sp, "os", "") or "linux",
         }
         _sync_deny_mode_fields(rule)
         if getattr(sp, "dir_del_only", False):
@@ -204,14 +233,18 @@ def _l2_intent_patterns_to_rules(profile) -> list[dict]:
     """profile.intent_deviation_patterns (list[IntentDeviationPattern]) → rules"""
     rules = []
     for i, pat in enumerate(profile.intent_deviation_patterns):
+        os_tag = getattr(pat, "os", "") or "linux"
         rules.append({
-            "id": f"intent_{i+1}_{_slugify(pat.reason[:30])}",
+            # id 含平台段：三平台的意图模式 reason 可能相同（如 macOS 继承 Linux），
+            # 不加平台段会撞 id → Console 操作歧义。
+            "id": f"intent_{os_tag}_{i+1}_{_slugify(pat.reason[:30])}",
             "intent_keywords": pat.intent_keywords,
             "dangerous_actions": pat.dangerous_actions,
             "reason": pat.reason,
             "skip_l3_on_disabled": True,
             "enabled": True,
             "builtin": True,
+            "os": getattr(pat, "os", "") or "linux",
         })
     return rules
 
@@ -279,13 +312,14 @@ def _agent_rules_to_defaults() -> dict:
     缺失 agents 目录或无 rules.json 时返回 {}（无 agent 规则，不影响通用规则）。
     """
     try:
-        from ..agents import _AGENTS_DIR
+        from ..agents import _agents_dir
     except Exception:
         return {}
-    if not _AGENTS_DIR.exists():
+    _agents = _agents_dir()
+    if not _agents.exists():
         return {}
     out = {}
-    for agent_dir in sorted(_AGENTS_DIR.iterdir()):
+    for agent_dir in sorted(_agents.iterdir()):
         rules_file = agent_dir / "rules.json"
         if not rules_file.is_file():
             continue
@@ -344,19 +378,30 @@ def _scenario_rules_to_defaults() -> dict:
     与 agent 分区结构对齐，console 渲染共用一套模板。
 
     缺失 scenarios 目录或无 rules.json 时返回 {}。
+
+    ⚠️ 每个场景的 rules.json 走**覆盖目录链**解析（AGENT_MOSS_OVERRIDE_RULES_DIR /
+    data_root 的 scenarios/<id>/rules.json 优先）—— 覆盖文件替换了场景规则时，
+    种子必须反映覆盖后的内容，否则 runtime 分区会把覆盖文件盖回去（覆盖失效）。
     """
     try:
-        from ..scenarios import _SCENARIOS_DIR
+        from ..rules_loader import resolve_scenario_rules_file
+        from ..scenarios import _scenarios_dir
     except Exception:
         return {}
-    if not _SCENARIOS_DIR.exists():
+    _scenarios = _scenarios_dir()
+    if not _scenarios.exists():
         return {}
     out = {}
-    for scen_dir in sorted(_SCENARIOS_DIR.iterdir()):
-        rules_file = scen_dir / "rules.json"
+    for scen_dir in sorted(_scenarios.iterdir()):
+        scenario_id = scen_dir.name
+        # __pycache__ 等以 __ 开头的运行时目录不是场景。不跳过的话，每次生成
+        # 种子都会走一遍 resolve_scenario_rules_file 并刷一条「非法 scenario_id」
+        # 告警 —— 那是给"目录穿越尝试"用的信号，不该被缓存目录淹掉。
+        if not scen_dir.is_dir() or scenario_id.startswith("__"):
+            continue
+        rules_file = resolve_scenario_rules_file(scenario_id)
         if not rules_file.is_file():
             continue
-        scenario_id = scen_dir.name
         try:
             with open(rules_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -399,29 +444,65 @@ def generate_source_defaults(profile=None) -> dict:
     """从 Profile + 模块常量，提取为 JSON 结构（出厂默认种子）。
 
     Args:
-        profile: OSProfile 实例。为 None 时调用 ..profiles.get_profile() 自动检测。
+        profile: OSProfile 实例。为 None 时**遍历所有平台**（linux/windows/macos）
+            产出带 `os` 标记的全量规则集 —— 这样：
+            1. Policy Console 能显示并配置各平台规则（只生成当前平台会让
+               Windows/macOS 规则在 Console 里不可见、不可配）；
+            2. merge 时各平台条目独立合并（`_rule_fingerprint` 含 os，互不覆盖）；
+            3. 运行时按 `os_type` 过滤取对应平台（见 `_rules_for_os`）。
+            显式传入 profile 时只生成该平台（兼容旧调用）。
     """
-    if profile is None:
+    if profile is not None:
+        profiles = [profile]
+    else:
         from ..profiles import get_profile
-        profile = get_profile()
+        profiles = [
+            get_profile(os_name) for os_name in ("linux", "windows", "macos", "harmony")
+        ]
+
+    def _collect(fn) -> list:
+        """按平台遍历收集规则（各条自带 os 标记），按指纹去重。
+
+        去重必要性：`MacOSProfile` 继承 `LinuxProfile`，其 `accepted_os` 含
+        'linux' —— 遍历到 macOS 时会**再生成一遍全部 Linux 条目**（os 标记仍是
+        linux）。指纹（含 os 维度）去重后，macOS 只贡献自己的专属条目，
+        Linux 条目不被重复写入。最终各平台条目数 == JSON 中该平台条目数。
+        """
+        out: list = []
+        seen: set = set()
+        for prof in profiles:
+            for rule in fn(prof):
+                fp = _rule_fingerprint(rule)
+                if fp in seen:
+                    continue
+                seen.add(fp)
+                out.append(rule)
+        return out
+
     return {
         "version": 1,
         "layers": dict(DEFAULT_LAYERS),
         "L1_rules": {
             "dangerous_commands": {
                 "category_enabled": True,
-                "category_desc": "危险命令检测（递归删除、全权限设置、提权执行等）",
-                "rules": _l1_command_patterns_to_rules(profile),
+                "category_desc": "危险命令检测（递归删除、全权限设置、提权执行等；含平台专属）",
+                "rules": _collect(_l1_command_patterns_to_rules),
             },
             "injection_detection": {
                 "category_enabled": True,
                 "category_desc": "Prompt 注入攻击检测",
-                "rules": _l1_injection_keywords_to_rules(profile),
+                # ⚠️ 必须 `_collect` 遍历**全部平台**，不能只取 `profiles[0]`。
+                # 旧实现的理由是"注入与操作系统无关、三平台 keyword 集相同"，但
+                # `WindowsProfile` 实际自带 3 条独有关键词 —— 只取 linux 一份，
+                # 这 3 条永远进不了种子，Windows 判定时静默少检（2026-10 修）。
+                # 现在 JSON 里通用条目标 `os: "all"`、平台独有标平台，靠指纹去重
+                # （`all` 条目四平台各贡献一次、指纹相同 → 只留一份）。
+                "rules": _collect(_l1_injection_keywords_to_rules),
             },
             "sensitive_path_access": {
                 "category_enabled": True,
-                "category_desc": "敏感路径访问检测（deny_both/deny_read/deny_write）",
-                "rules": _l2_sensitive_paths_to_rules(profile),
+                "category_desc": "敏感路径访问检测（deny_both/deny_read/deny_write；含平台专属）",
+                "rules": _collect(_l2_sensitive_paths_to_rules),
             },
             "user_custom": {
                 "category_enabled": True,
@@ -432,8 +513,8 @@ def generate_source_defaults(profile=None) -> dict:
         "L2_rules": {
             "intent_consistency": {
                 "category_enabled": True,
-                "category_desc": "意图一致性检测",
-                "rules": _l2_intent_patterns_to_rules(profile),
+                "category_desc": "意图一致性检测（含平台专属动作词）",
+                "rules": _collect(_l2_intent_patterns_to_rules),
             },
             "password_modify_consent": {
                 "category_enabled": True,
@@ -470,10 +551,15 @@ def get_runtime_config_path() -> Path:
     """获取 runtime 配置文件路径。
 
     优先级：env AGENT_MOSS_RUNTIME_CONFIG_PATH > agent_moss_settings.json 同名键 > 默认路径
+
+    cold / builtin 模式下不再回落 settings JSON（连路径解析都尽量不碰用户配置；
+    该路径只用于日志展示，引擎不会读写它）。
     """
     env_path = os.getenv(ENV_RUNTIME_CONFIG_PATH)
     if env_path:
         return Path(env_path)
+    if is_runtime_config_disabled():
+        return RUNTIME_CONFIG_PATH
     from .config import get_agent_moss_setting
     settings_path = get_agent_moss_setting(ENV_RUNTIME_CONFIG_PATH, "")
     if settings_path:
@@ -481,26 +567,88 @@ def get_runtime_config_path() -> Path:
     return RUNTIME_CONFIG_PATH
 
 
+def get_rule_source_fingerprint() -> tuple:
+    """规则来源指纹（runtime 配置文件的 path / mtime_ns / size）。
+
+    供 agent/scenario 扩展缓存判断是否需要重新加载：手工编辑 runtime JSON 或
+    Console 写盘后，下一次判定会自动重建扩展，而不是一直使用首次加载的副本。
+
+    cold / builtin 模式返回常量（runtime 配置本就不参与判定）；文件不存在时返回
+    ``("absent",)``，文件出现/被删/被改都会改变指纹。
+    """
+    if is_runtime_config_disabled():
+        return (f"mode:{get_rules_mode()}",)
+    try:
+        path = get_runtime_config_path()
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ("absent",)
+
+
 def save_runtime_config(config: dict) -> None:
-    """保存运行时配置到用户本地文件"""
+    """保存运行时配置到用户本地文件。
+
+    cold / builtin 模式下**拒绝写入**：Console / CLI 的修改一律不落盘，服务重启也
+    不会读到用户配置。抛异常而不是静默 no-op —— 静默会让调用方以为保存成功。
+    """
+    if is_runtime_config_disabled():
+        raise RuntimeConfigReadOnlyError(
+            f"规则来源模式为 {get_rules_mode()}（runtime 配置已禁用）："
+            "修改规则不会生效，请改用 hot 模式（AGENT_MOSS_RULES_MODE=hot）"
+            "或调整规则目录后重启服务。"
+        )
     config_path = get_runtime_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    sp.write_private_text(config_path, json.dumps(config, indent=2, ensure_ascii=False))
+    # 落盘即失效进程内缓存，保证写后读一致（mtime 指纹之外的第二道保险）
+    _RUNTIME_CONFIG_CACHE.clear()
+    _HAS_RUNTIME_CONFIG_CACHE.clear()
     logger.info("配置已保存: %s", config_path)
 
 
+#: load_runtime_config 的进程内缓存：(path, mtime_ns, size) → 合并后的配置。
+#: 缓存键含文件指纹——用户手工编辑 / console 保存 / save_runtime_config 落盘后
+#: mtime 变化 → 自动失效，热生效语义不变（见模块 docstring「热生效原理」）。
+#: 收益：单次 analyze 会调用本函数 6 次（各检测器各自取配置），缓存把重复的
+#: 「读 69KB JSON + 深拷贝 + merge + 生成源码默认」收敛为一次（实测 49ms → 个位 ms）。
+#: 约定：调用方**不得原地修改**返回的 dict（需改请 copy 后改，或改完落盘使缓存失效）。
+_RUNTIME_CONFIG_CACHE: dict[tuple[str, int, int], dict] = {}
+
+
 def load_runtime_config() -> dict:
-    """加载运行时配置：缺失则从种子生成并写入，已有则合并新出厂规则。"""
+    """加载运行时配置：缺失则从种子生成并写入，已有则合并新出厂规则。
+
+    结果按文件指纹缓存（见 `_RUNTIME_CONFIG_CACHE`），改文件后自动失效。
+
+    cold / builtin 模式下**完全不碰用户配置文件**：不读、不 seed、不 merge、不写回，
+    直接返回只含默认层级开关的空配置；各 `*_or_default` 取数函数因此自动回退到
+    包内 profile / 模块常量（cold 模式再叠加规则目录）。
+    """
+    if is_runtime_config_disabled():
+        return {"version": 1, "layers": dict(DEFAULT_LAYERS)}
     config_path = get_runtime_config_path()
     if not config_path.exists():
         defaults = generate_source_defaults()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            config_path.write_text(json.dumps(defaults, indent=2, ensure_ascii=False), encoding="utf-8")
+            sp.write_private_text(config_path, json.dumps(defaults, indent=2, ensure_ascii=False))
             logger.info("首次运行，已生成默认配置: %s", config_path)
         except OSError as e:
             logger.warning("无法写入配置文件 %s: %s，使用内存默认值", config_path, e)
         return defaults
+
+    # 命中缓存直接返回（文件未变：mtime + size 相同）
+    try:
+        st = config_path.stat()
+        cache_key: tuple[str, int, int] | None = (str(config_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        cached = _RUNTIME_CONFIG_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     try:
         user_config = json.loads(config_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
@@ -514,10 +662,18 @@ def load_runtime_config() -> dict:
     merged = merge_config(user_config, source_defaults)
     if merged != original:
         try:
-            config_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+            sp.write_private_text(config_path, json.dumps(merged, indent=2, ensure_ascii=False))
             logger.info("配置已合并更新: %s", config_path)
         except OSError as e:
             logger.warning("无法写入合并后的配置: %s", e)
+
+    # 写回后文件指纹已变，重新取一次再入缓存（只保留最新一份，避免条目累积）
+    try:
+        st_new = config_path.stat()
+        _RUNTIME_CONFIG_CACHE.clear()
+        _RUNTIME_CONFIG_CACHE[(str(config_path), st_new.st_mtime_ns, st_new.st_size)] = merged
+    except OSError:
+        pass
     return merged
 
 
@@ -599,20 +755,30 @@ def _normalize_pattern_for_fingerprint(pattern: str) -> str:
 
 
 def _rule_fingerprint(rule: dict) -> tuple:
-    """规则内容指纹（跨 id 变更识别同一规则）。"""
+    """规则内容指纹（跨 id 变更识别同一规则）。
+
+    **含平台维度**：同一 path/pattern 在不同平台是不同规则 —— 如 `.ssh`/`.aws`
+    目录级条目在 Linux 与 Windows 各有一条（各自的 deny_mode/desc 不同）。
+    若指纹不含 os，merge 的 `user_by_fp = {指纹: 规则}` 会让两个平台的同名条目
+    互相覆盖，其中一个平台的规则**静默丢失**（2026-09 实测 .ssh/.aws 两组冲突）。
+
+    无 os 字段的历史条目视为 linux —— 与加载过滤、runtime 覆盖的口径一致，
+    保证老配置的 enabled/deny_mode 用户设置仍能匹配到源码条目。
+    """
+    os_tag = str(rule.get("os") or "linux").lower()
     if rule.get("intent_keywords") or rule.get("dangerous_actions"):
-        return (tuple(sorted(rule.get("intent_keywords", []))),
+        return (os_tag, tuple(sorted(rule.get("intent_keywords", []))),
                 tuple(sorted(rule.get("dangerous_actions", []))))
     if rule.get("path"):
-        return (_normalize_pattern_for_fingerprint(rule["path"]),)
+        return (os_tag, _normalize_pattern_for_fingerprint(rule["path"]))
     if rule.get("pattern"):
-        return (_normalize_pattern_for_fingerprint(rule["pattern"]),)
+        return (os_tag, _normalize_pattern_for_fingerprint(rule["pattern"]))
     if rule.get("keyword"):
-        return (rule["keyword"], rule.get("lang", ""))
+        return (os_tag, rule["keyword"], rule.get("lang", ""))
     # builtin_safe_action_types / builtin_safe_skills 项用 value 字段
     if rule.get("value"):
-        return (rule["value"],)
-    return (rule.get("id", ""),)
+        return (os_tag, rule["value"])
+    return (os_tag, rule.get("id", ""))
 
 
 def _merge_rule_categories(user_cfg: dict, source_defaults: dict, layer_key: str) -> None:
@@ -640,7 +806,12 @@ def _merge_rule_categories(user_cfg: dict, source_defaults: dict, layer_key: str
             src_fps.add(fp)
             if fp in user_by_fp:
                 existing = user_by_fp[fp]
-                user_enabled = existing.get("enabled", True)
+                # 用户是否**主动**禁用过这条（见 _apply_rule_enabled）。
+                # ⚠️ 不能像以前那样无条件沿用 existing["enabled"]：源码里仍有这条规则时，
+                # 无法区分「用户主动禁用」与「历史污染/系统自动禁用」，沿用就等于一次污染
+                # 永久锁死（源码里规则一直都在，merge 一百次也救不回来，只能手动删 runtime）。
+                # 现在：有 user_disabled 标记才保持禁用，无标记的 False 自动痊愈为启用。
+                user_disabled = existing.get("user_disabled", False)
                 user_skip_l3 = existing.get("skip_l3_on_disabled")
                 user_deny_mode = existing.get("deny_mode")
                 user_source_deny = existing.get("source_deny_mode")
@@ -654,7 +825,10 @@ def _merge_rule_categories(user_cfg: dict, source_defaults: dict, layer_key: str
                         user_source_deny = legacy_baseline
                 existing.clear()
                 existing.update(src_r)
-                existing["enabled"] = user_enabled
+                # existing.update(src_r) 会抹掉 user_disabled（源码规则不带该字段），故在其后重写
+                existing["enabled"] = not user_disabled
+                if user_disabled:
+                    existing["user_disabled"] = True
                 if user_skip_l3 is not None:
                     existing["skip_l3_on_disabled"] = user_skip_l3
                 if user_deny_mode and user_source_deny and user_deny_mode != user_source_deny:
@@ -683,6 +857,21 @@ def _merge_rule_categories(user_cfg: dict, source_defaults: dict, layer_key: str
         if cat_name == "user_custom":
             continue
         if cat_name not in src_layer:
+            # 分类被源码移除（如历史上的 dangerous_patterns / lateral_movement）。
+            # ⚠️ 别把用户自己加的规则一起删了：Console 的 add-rule 端点 category 是
+            # 请求参数，API 调用方可以指定任意分类（如直接把自定义规则塞进
+            # dangerous_commands）。源码删整类时这些非 builtin 条目应迁到 user_custom
+            # 保留，否则静默丢用户的规则。
+            _kept = [
+                r for r in user_layer[cat_name].get("rules", [])
+                if not r.get("builtin", True)
+            ]
+            if _kept:
+                _uc = user_layer.setdefault("user_custom", {
+                    "category_enabled": True, "category_desc": "", "rules": [],
+                })
+                _existing = {r.get("id") for r in _uc.setdefault("rules", [])}
+                _uc["rules"].extend(r for r in _kept if r.get("id") not in _existing)
             del user_layer[cat_name]
 
 
@@ -739,10 +928,13 @@ def _merge_agent_rules(user_cfg: dict, source_defaults: dict,
                 src_fps.add(fp)
                 if fp in user_by_fp:
                     existing = user_by_fp[fp]
-                    user_enabled = existing.get("enabled", True)
+                    # 同主 merge：只认 user_disabled 标记，无标记的 False 自动痊愈
+                    user_disabled = existing.get("user_disabled", False)
                     existing.clear()
                     existing.update(src_r)
-                    existing["enabled"] = user_enabled
+                    existing["enabled"] = not user_disabled
+                    if user_disabled:
+                        existing["user_disabled"] = True
                 else:
                     new_r = dict(src_r)
                     new_r.setdefault("enabled", True)
@@ -760,10 +952,15 @@ def is_layer_enabled(layer_key: str) -> bool:
     """判断指定层级是否启用。
 
     优先级：env > runtime JSON > agent_moss_settings.json > 默认 True。
+
+    cold / builtin 模式下**规则开关只认环境变量**：runtime JSON / settings JSON 里的
+    层级开关一律忽略（用户改配置文件无法关层）。
     """
     disable_key = LAYER_DISABLE_ENV.get(layer_key)
     if disable_key and os.getenv(disable_key) == "1":
         return False
+    if is_runtime_config_disabled():
+        return True
     runtime = load_runtime_config()
     layers = runtime.get("layers", {})
     if layer_key in layers:
@@ -800,35 +997,160 @@ def filter_enabled_rules(rules: list[dict], category_enabled: bool = True) -> li
     return [r for r in rules if r.get("enabled", True)]
 
 
-def get_enabled_l1_command_patterns(runtime: dict) -> list[dict]:
+def _user_custom_rules(runtime: dict, layer: str, required_key: str) -> list[dict]:
+    """取 ``<layer>.user_custom`` 里**形态匹配**的启用规则。
+
+    为什么必须合并进生效规则集：Console「新增规则」的"所属分类"**默认就是
+    「用户自定义」**（console/static/index.html 的 input-category 首个 option，
+    且代码里 fallback 也是 user_custom），另外源码删整类时用户规则也会迁到这里
+    保留（见 ``_merge_rule_categories`` 的清理段）。而引擎此前**完全不读这个分类**
+    —— 于是在控制台新增的规则写进去之后判定毫无变化，且没有任何提示，属静默失效
+    （2026-09 招行客户反馈"当前的规则我没办法追加"即此）。
+
+    ``required_key`` 用于丢开形态不符的条目：user_custom 会混入从各类目迁移来的
+    规则（可能是 path / intent_keywords 形态），直接当命令正则用会 KeyError。
+    """
+    cat = runtime.get(layer, {}).get("user_custom", {}) or {}
+    rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
+    out = []
+    for r in rules:
+        if not r.get(required_key):
+            continue
+        # risk_level 缺失时补 high：L1 只有 high/critical（及 medium+file_access）
+        # 才短路 Deny，留空 = 规则写进去了却永远不拦（又一次静默失效）。
+        # 语义与 AGENT_MOSS_CUSTOM_RULES 通道一致（那边是 rule.get("severity","high")）。
+        if not r.get("risk_level"):
+            r = {**r, "risk_level": "high"}
+        out.append(r)
+    return out
+
+
+def _merge_user_custom(
+    primary: list[dict], runtime: dict, layers, key: str,
+) -> list[dict]:
+    """把 user_custom 的启用规则**追加**到主规则集之后（内置在前，命中即短路，
+    与 agent_ext 的追加约定一致）。
+
+    ``layers`` 可为单层名字符串或元组：敏感路径在历史上归属过 L2（重分类后归 L1），
+    老配置的 user_custom 可能留在任一层，两层都取才不会漏。
+    """
+    if isinstance(layers, str):
+        layers = (layers,)
+    extra: list[dict] = []
+    for layer in layers:
+        extra.extend(_user_custom_rules(runtime, layer, key))
+    return list(primary) + extra if extra else list(primary)
+
+
+#: 各类别条目的去重键（同键保留**先出现**的那条 → 优先级 override > extra > 内置）。
+_DEDUP_KEYS: dict[str, tuple[str, ...]] = {
+    "dangerous_commands": ("pattern",),
+    "password_modify_consent": ("pattern",),
+    "user_deletion_consent": ("pattern",),
+    "sensitive_path_access": ("path",),
+    "injection_detection": ("keyword", "lang"),
+    "intent_consistency": ("intent_keywords", "reason"),
+}
+
+
+def _dedup(rules: list[dict], category: str) -> list[dict]:
+    """按类别去重键去重，**保留先出现的**（调用方已按优先级排好序）。"""
+    keys = _DEDUP_KEYS.get(category)
+    if not keys:
+        return rules
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in rules:
+        k = tuple(str(r.get(x, "")) for x in keys)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    return out
+
+
+def _merge_rules_from_dirs(primary: list[dict], category: str) -> list[dict]:
+    """应用**规则目录**（ConfigMap）里该类别的 override.json / extra.json。
+
+    语义（2026-10 与客户确认）：
+      - ``override.json`` 出现了该类别 → **整份替换**内置（写空数组 = 明确清空该类）；
+        未出现的类别保持内置；
+      - ``extra.json`` 出现了该类别 → **追加**在（替换后的）规则之后；
+      - 同一类别内按去重键去重，**先出现者优先**（override > extra > 内置）。
+
+    与 user_custom 的区别：user_custom 是 Console 管理面（运行时逐条合并、热
+    生效），规则目录是部署面（进程启动时从挂载目录整份加载）。
+    rules_loader 不可用时静默跳过（不影响判定主流程）。
+    """
+    base = list(primary)
+    try:
+        from ..rules_loader import load_extra_rules, load_override_rules
+        override = load_override_rules().get(category)
+        if override is not None:
+            base = list(override)
+        extra = load_extra_rules().get(category) or []
+    except Exception:  # noqa: BLE001 — 规则加载失败绝不能把判定打挂
+        return base
+    return _dedup(base + list(extra), category)
+
+
+def get_enabled_l1_command_patterns(runtime: dict, os_type: str = "") -> list[dict]:
     cat = runtime.get("L1_rules", {}).get("dangerous_commands", {})
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
-    return [{"pattern": r["pattern"], "risk_level": r["risk_level"],
-             "risk_type": r["risk_type"], "reason": r["reason"]} for r in rules]
+    rules = _merge_rules_from_dirs(rules, "dangerous_commands")
+    rules = _merge_user_custom(rules, runtime, "L1_rules", "pattern")
+    if os_type:
+        rules = _rules_for_os(rules, os_type)   # 同敏感路径：防跨平台条目串台
+    # ⚠️ 一律 .get：user_custom 条目由用户填，可能缺 risk_type/reason（Console 的
+    # NewRule 这些字段可空），硬下标会 KeyError 把整次判定打成 500。
+    return [{"pattern": r["pattern"], "risk_level": r.get("risk_level", ""),
+             "risk_type": r.get("risk_type", ""), "reason": r.get("reason", "")} for r in rules]
 
 
-def get_enabled_l1_injection_keywords(runtime: dict) -> list[dict]:
+def get_enabled_l1_injection_keywords(runtime: dict, os_type: str = "") -> list[dict]:
     cat = runtime.get("L1_rules", {}).get("injection_detection", {})
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
-    return [{"keyword": r["keyword"], "risk_level": r["risk_level"],
+    rules = _merge_rules_from_dirs(rules, "injection_detection")
+    rules = _merge_user_custom(rules, runtime, "L1_rules", "keyword")
+    if os_type:
+        rules = _rules_for_os(rules, os_type)
+    return [{"keyword": r["keyword"], "risk_level": r.get("risk_level", ""),
              "lang": r.get("lang", "en")} for r in rules]
 
 
-def get_enabled_l2_sensitive_paths(runtime: dict) -> list[dict]:
-    """读取启用的敏感路径规则。
+def _sensitive_path_category(runtime: dict) -> dict:
+    """取敏感路径类别配置。
 
     优先读 L1_rules.sensitive_path_access（重分类后敏感路径归属 L1）；
     回退 L2_rules.sensitive_path_access（兼容迁移前的老配置）。
-    函数名保留 l2 前缀仅为向后兼容，实际数据源已迁至 L1。
     """
     cat = runtime.get("L1_rules", {}).get("sensitive_path_access", {})
     if not cat.get("rules"):
         # 老配置未迁移：回退 L2_rules
         cat = runtime.get("L2_rules", {}).get("sensitive_path_access", {})
+    return cat
+
+
+def get_enabled_l2_sensitive_paths(runtime: dict, os_type: str = "") -> list[dict]:
+    """读取启用的敏感路径规则（os_type 非空时按平台过滤）。
+
+    函数名保留 l2 前缀仅为向后兼容，实际数据源已迁至 L1。
+
+    **必须传 os_type**：runtime 配置含全平台条目（Console 需要展示各平台），
+    不过滤会把 Windows 的 .ssh 或 C:/Windows/... 混进 Linux 判定 —— 表现为
+    "在 Console 禁用某平台规则后该平台判定仍生效"（实际生效的是别平台的同名条目）。
+    """
+    cat = _sensitive_path_category(runtime)
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
+    # 敏感路径历史归属过 L2（重分类后归 L1），老配置的 user_custom 可能留在任一层
+    rules = _merge_rules_from_dirs(rules, "sensitive_path_access")
+    rules = _merge_user_custom(rules, runtime, ("L1_rules", "L2_rules"), "path")
+    if os_type:
+        rules = _rules_for_os(rules, os_type)
     out = []
     for r in rules:
-        item = {"path": r["path"], "risk_level": r["risk_level"], "desc": r["desc"],
+        item = {"path": r["path"], "risk_level": r.get("risk_level", ""),
+                "desc": r.get("desc", ""),
                 "deny_mode": r.get("deny_mode", _derive_deny_mode(r))}
         if r.get("credential"):
             item["credential"] = True
@@ -840,22 +1162,31 @@ def get_enabled_l2_sensitive_paths(runtime: dict) -> list[dict]:
     return out
 
 
-def get_enabled_l2_intent_patterns(runtime: dict) -> list[dict]:
+def get_enabled_l2_intent_patterns(runtime: dict, os_type: str = "") -> list[dict]:
     cat = runtime.get("L2_rules", {}).get("intent_consistency", {})
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
-    return [{"intent_keywords": r["intent_keywords"], "dangerous_actions": r["dangerous_actions"],
-             "reason": r["reason"]} for r in rules]
+    rules = _merge_rules_from_dirs(rules, "intent_consistency")
+    rules = _merge_user_custom(rules, runtime, "L2_rules", "intent_keywords")
+    if os_type:
+        rules = _rules_for_os(rules, os_type)
+    return [{"intent_keywords": r["intent_keywords"],
+             "dangerous_actions": r.get("dangerous_actions", []),
+             "reason": r.get("reason", "")} for r in rules]
 
 
 def get_enabled_l2_password_patterns(runtime: dict) -> list[str]:
     cat = runtime.get("L2_rules", {}).get("password_modify_consent", {})
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
+    rules = _merge_rules_from_dirs(rules, "password_modify_consent")
+    rules = _merge_user_custom(rules, runtime, "L2_rules", "pattern")
     return [r["pattern"] for r in rules]
 
 
 def get_enabled_l2_user_deletion_patterns(runtime: dict) -> list[str]:
     cat = runtime.get("L2_rules", {}).get("user_deletion_consent", {})
     rules = filter_enabled_rules(cat.get("rules", []), cat.get("category_enabled", True))
+    rules = _merge_rules_from_dirs(rules, "user_deletion_consent")
+    rules = _merge_user_custom(rules, runtime, "L2_rules", "pattern")
     return [r["pattern"] for r in rules]
 
 
@@ -864,19 +1195,40 @@ def is_l2_category_enabled(runtime: dict, category_key: str) -> bool:
     return cat.get("category_enabled", True)
 
 
+#: has_runtime_config 的结果缓存：与 _RUNTIME_CONFIG_CACHE 同款文件指纹键。
+#: 历史实现**每次调用都整份读 + json.loads**（runtime JSON 近百 KB，实测 ~4ms），
+#: 而单次 analyze 会调它 5~6 次（rules_loader.load_mc / skill_engine.match_skills /
+#: config 构建 / 各 *_or_default）—— 纯浪费 20ms+。文件改动后 mtime/size 变化即失效，
+#: 「热生效」语义不变。
+_HAS_RUNTIME_CONFIG_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
 def has_runtime_config() -> bool:
     """判断用户本地 runtime 配置文件是否存在且可正常读取。
 
     区分：文件不存在→从未配置，应用源码默认；文件存在但规则空→用户主动禁用，不回退。
+    结果按文件指纹缓存（见 `_HAS_RUNTIME_CONFIG_CACHE`）。
+
+    cold / builtin 模式下恒为 False —— **不 stat、不读**用户配置文件，文件存在等于不存在。
     """
-    config_path = get_runtime_config_path()
-    if not config_path.exists():
+    if is_runtime_config_disabled():
         return False
+    config_path = get_runtime_config_path()
+    try:
+        st = config_path.stat()
+    except OSError:
+        return False
+    key = (str(config_path), st.st_mtime_ns, st.st_size)
+    cached = _HAS_RUNTIME_CONFIG_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         json.loads(config_path.read_text(encoding="utf-8"))
-        return True
+        ok = True
     except (json.JSONDecodeError, OSError):
-        return False
+        ok = False
+    _HAS_RUNTIME_CONFIG_CACHE[key] = ok
+    return ok
 
 
 def get_disabled_skill_ids(runtime: dict) -> set[str]:
@@ -898,40 +1250,87 @@ def get_disabled_skill_ids(runtime: dict) -> set[str]:
 # 表示用户主动禁用，不回退。
 
 
-def get_enabled_l1_command_patterns_or_default(runtime: dict) -> list[dict]:
-    enabled = get_enabled_l1_command_patterns(runtime)
-    if enabled:
-        return enabled
-    if not has_runtime_config():
-        return _l1_command_patterns_to_rules(get_profile_or_detect())
-    return []
+def get_enabled_l1_command_patterns_or_default(
+    runtime: dict, os_type: str = "",
+) -> list[dict]:
+    """读取生效的危险命令规则：runtime 覆盖 > profile 默认（按平台隔离）。
+
+    平台隔离语义与 get_enabled_l2_sensitive_paths_or_default 一致：该平台在
+    runtime 里无条目时回退该平台 profile 默认，避免 Windows 部署沿用 Linux 规则。
+    """
+    os_type = normalize_os_type(os_type)
+    if _rules_for_os(_category_rules(runtime, "L1_rules", "dangerous_commands"), os_type):
+        return get_enabled_l1_command_patterns(runtime, os_type)
+    # 回退 profile 默认时**同样要带上**追加目录与 user_custom —— 否则"runtime 里
+    # 该平台无内置条目"的部署上，部署面/管理面的自定义规则会被这条回退分支悄悄丢掉。
+    return _merge_user_custom(
+        _merge_rules_from_dirs(
+            _l1_command_patterns_to_rules(get_profile_by_os(os_type)),
+            "dangerous_commands",
+        ),
+        runtime, "L1_rules", "pattern",
+    )
 
 
-def get_enabled_l1_injection_keywords_or_default(runtime: dict) -> list[dict]:
-    enabled = get_enabled_l1_injection_keywords(runtime)
-    if enabled:
-        return enabled
-    if not has_runtime_config():
-        return _l1_injection_keywords_to_rules(get_profile_or_detect())
-    return []
+def get_enabled_l1_injection_keywords_or_default(
+    runtime: dict, os_type: str = "",
+) -> list[dict]:
+    """读取生效的注入检测关键词：runtime 覆盖 > profile 默认（按平台隔离）。"""
+    os_type = normalize_os_type(os_type)
+    if _rules_for_os(_category_rules(runtime, "L1_rules", "injection_detection"), os_type):
+        return get_enabled_l1_injection_keywords(runtime, os_type)
+    return _merge_user_custom(
+        _merge_rules_from_dirs(
+            _l1_injection_keywords_to_rules(get_profile_by_os(os_type)),
+            "injection_detection",
+        ),
+        runtime, "L1_rules", "keyword",
+    )
 
 
-def get_enabled_l2_sensitive_paths_or_default(runtime: dict) -> list[dict]:
-    enabled = get_enabled_l2_sensitive_paths(runtime)
-    if enabled:
-        return enabled
-    if not has_runtime_config():
-        return _l2_sensitive_paths_to_rules(get_profile_or_detect())
-    return []
+def get_enabled_l2_sensitive_paths_or_default(
+    runtime: dict, os_type: str = "",
+) -> list[dict]:
+    """读取生效的敏感路径规则：runtime 覆盖 > profile 默认。
+
+    runtime 覆盖按 os_type 隔离：
+    - 该平台在 runtime 里有条目（含 enabled=false 的）→ 用 runtime 结果，
+      尊重 enabled 开关；全被禁用则返回空（用户主动禁用，不回退）
+    - 该平台在 runtime 里没有任何条目 → 回退该平台 profile 的默认规则。
+      典型场景：在 Linux 环境生成的配置里没有 Windows 条目，Windows 部署
+      必须回退到 WindowsProfile，否则一条规则都不生效。
+    """
+    os_type = normalize_os_type(os_type)
+    cat = _sensitive_path_category(runtime)
+    if _rules_for_os(cat.get("rules", []), os_type):
+        return get_enabled_l2_sensitive_paths(runtime, os_type)
+    return _merge_user_custom(
+        _merge_rules_from_dirs(
+            _l2_sensitive_paths_to_rules(get_profile_by_os(os_type)),
+            "sensitive_path_access",
+        ),
+        runtime, ("L1_rules", "L2_rules"), "path",
+    )
 
 
-def get_enabled_l2_intent_patterns_or_default(runtime: dict) -> list[dict]:
-    enabled = get_enabled_l2_intent_patterns(runtime)
-    if enabled:
-        return enabled
-    if not has_runtime_config():
-        return _l2_intent_patterns_to_rules(get_profile_or_detect())
-    return []
+def get_enabled_l2_intent_patterns_or_default(
+    runtime: dict, os_type: str = "",
+) -> list[dict]:
+    """读取生效的意图一致性规则：runtime 覆盖 > profile 默认（按平台隔离）。
+
+    意图模式含平台特有动作词（Windows 的 del/rmdir/reg delete），必须与所属
+    profile 一致，否则 Windows 上会拿 Linux 的动作词做误判。
+    """
+    os_type = normalize_os_type(os_type)
+    if _rules_for_os(_category_rules(runtime, "L2_rules", "intent_consistency"), os_type):
+        return get_enabled_l2_intent_patterns(runtime, os_type)
+    return _merge_user_custom(
+        _merge_rules_from_dirs(
+            _l2_intent_patterns_to_rules(get_profile_by_os(os_type)),
+            "intent_consistency",
+        ),
+        runtime, "L2_rules", "intent_keywords",
+    )
 
 
 def get_enabled_l2_password_patterns_or_default(runtime: dict) -> list[str]:
@@ -958,6 +1357,71 @@ def get_profile_or_detect():
     """获取当前 OS Profile（延迟导入，避免循环依赖）"""
     from ..profiles import get_profile
     return get_profile()
+
+
+def get_profile_by_os(os_type: str):
+    """按 os_type 获取对应 OS Profile（延迟导入，避免循环依赖）"""
+    from ..profiles import get_profile
+    return get_profile(os_type)
+
+
+def normalize_os_type(os_type: str = "") -> str:
+    """归一化 os_type：空值时按当前运行环境检测。
+
+    与 ``profiles.get_profile`` 的判定口径一致（非 windows 一律视为 linux），
+    避免同一进程内 "profile 选了 Windows、runtime 过滤按 linux" 的分裂。
+    """
+    if os_type:
+        return os_type.strip().lower()
+    import platform
+    return "windows" if platform.system().lower() == "windows" else "linux"
+
+
+def _accepted_os_values(os_type: str = "") -> tuple[str, ...]:
+    """该平台接受的条目 os 值（与 ``OSProfile.accepted_os`` 同一口径）。
+
+    - windows：只接受 {windows}
+    - macos：接受 {linux, macos} —— 继承 Linux 通用规则 + macOS 专属补充
+    - harmony：接受 {linux, harmony} —— Toybox 类 Unix，继承 Linux + 鸿蒙专属
+    - linux / 未知名：只接受 {linux}
+    """
+    t = normalize_os_type(os_type)
+    if t == "windows":
+        return ("windows",)
+    if t == "macos":
+        return ("linux", "macos")
+    if t == "harmony":
+        return ("linux", "harmony")
+    return ("linux",)
+
+
+def _rules_for_os(rules: list[dict], os_type: str) -> list[dict]:
+    """筛选属于指定操作系统的规则条目（按该平台的 accepted_os 语义）。
+
+    与 ``OSProfile.accepted_os`` 对齐：macOS 会拿到 Linux 通用条目 + macOS 专属
+    条目（继承语义），Windows 只拿 windows 条目，linux 只拿 linux 条目。
+
+    不带 ``os`` 字段的历史条目一律视为 linux —— 既保证老配置兼容，也保证
+    Windows 部署不会误用 Linux 条目（被过滤后调用方回退 WindowsProfile 默认）。
+
+    ``"all"`` = **全平台通用**，各平台都生效。目前用于 ``injection_detection``：
+    注入攻击与操作系统无关，同一套关键词三平台共用。此前那批关键词被标成
+    ``linux``，于是 Windows 按 os 过滤后**一条不剩**、静默回退到 ``WindowsProfile``
+    里一份只有 14 条的历史副本，而 TS 端回退时不带平台过滤（拿全 48 条）——
+    两端在 Windows 上双向分叉（`DAN mode` 与 `绕过审计` 各有一端漏报，2026-10 修）。
+    """
+    accepted = _accepted_os_values(os_type)
+    out: list[dict] = []
+    for r in rules:
+        v = str(r.get("os") or "linux").lower()
+        if v == "all" or v in accepted:
+            out.append(r)
+    return out
+
+
+def _category_rules(runtime: dict, layer: str, category: str) -> list[dict]:
+    """取 runtime 中某层某类别的规则原始列表（不看 enabled）。"""
+    return runtime.get(layer, {}).get(category, {}).get("rules", [])
 
 
 def get_disabled_l2_rules_with_skip_l3() -> dict[str, list[str]]:
@@ -1008,11 +1472,29 @@ def update_layer_enabled(layer_key: str, enabled: bool) -> dict:
     return runtime
 
 
+def _apply_rule_enabled(rule: dict, enabled: bool) -> None:
+    """设置规则的启用状态，并记录「这是用户主动改的」（user_disabled 标记）。
+
+    为什么要标记：merge 时若源码里仍有这条内置规则，**无法区分** existing 的
+    `enabled=False` 是「用户在 Console 主动禁用」还是「历史污染 / 系统自动禁用」。
+    不标记就只能无条件沿用旧值 → 一次污染永久锁死：源码里规则一直都在，merge 一百次
+    也救不回来，用户只能手动删 runtime 文件才能恢复（2026-09 用户实测反复踩到）。
+
+    打标记后：**无标记的 False 会在下次 merge 自动痊愈为启用**，有标记的才尊重用户选择。
+    """
+    rule["enabled"] = enabled
+    if enabled:
+        # 重新启用 = "用户禁用过它"这句话不再成立 → 清掉标记（只清标记，不删规则）
+        rule.pop("user_disabled", None)
+    else:
+        rule["user_disabled"] = True
+
+
 def update_rule_enabled(layer: str, category: str, rule_id: str, enabled: bool) -> dict:
     runtime = load_runtime_config()
     for r in runtime.get(layer, {}).get(category, {}).get("rules", []):
         if r.get("id") == rule_id:
-            r["enabled"] = enabled
+            _apply_rule_enabled(r, enabled)
             break
     save_runtime_config(runtime)
     return runtime
@@ -1109,8 +1591,12 @@ def add_custom_skill(skill_id: str, category: str, keywords: list[str], content:
     自定义 skill 文件写入用户目录 ~/.config/agentmoss/agent_moss_skills/。
     """
     _validate_skill_id(skill_id)
+    if is_runtime_config_disabled():
+        raise RuntimeConfigReadOnlyError(
+            f"规则来源模式为 {get_rules_mode()}（runtime 配置已禁用），不允许新增自定义 skill。"
+        )
     runtime = load_runtime_config()
-    skills_dir = RUNTIME_CONFIG_DIR / "agent_moss_skills"
+    skills_dir = _runtime_dir() / "agent_moss_skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
     (skills_dir / f"{skill_id}.md").write_text(content, encoding="utf-8")
     cat_skills = runtime.setdefault("L3_skills", {}).setdefault(category, {}).setdefault("skills", [])
@@ -1133,7 +1619,7 @@ def delete_custom_skill(skill_id: str, category: str) -> dict | None:
             break
     if target:
         cat_skills.remove(target)
-        skill_path = RUNTIME_CONFIG_DIR / "agent_moss_skills" / f"{skill_id}.md"
+        skill_path = _runtime_dir() / "agent_moss_skills" / f"{skill_id}.md"
         if skill_path.exists():
             skill_path.unlink()
         save_runtime_config(runtime)
@@ -1234,7 +1720,7 @@ def update_agent_rule_enabled(agent_id: str, category: str, rule_fp: dict,
     target_fp = _rule_fingerprint(rule_fp)
     for r in cat.get("rules", []):
         if _rule_fingerprint(r) == target_fp:
-            r["enabled"] = enabled
+            _apply_rule_enabled(r, enabled)
             break
     save_runtime_config(runtime)
     return runtime
@@ -1336,7 +1822,7 @@ def update_scenario_rule_enabled(scenario_id: str, category: str, rule_fp: dict,
     target_fp = _rule_fingerprint(rule_fp)
     for r in cat.get("rules", []):
         if _rule_fingerprint(r) == target_fp:
-            r["enabled"] = enabled
+            _apply_rule_enabled(r, enabled)
             break
     save_runtime_config(runtime)
     return runtime
@@ -1384,14 +1870,17 @@ def _ltl_rules_to_runtime() -> dict:
     ⚠️ 必须**直接读 mc_rules.json 文件**，不能走 rules_loader.load_mc()——
     load_mc() 内部又调 load_runtime_config()，会与 generate_source_defaults()
     形成互相递归（每次 1.7s+）。此处只取"出厂规则清单"，不带开关。
+
+    路径解析：2026-10 起规则目录只认 override.json / extra.json（不再支持
+    "按内置文件名覆盖"），故此处直接读包内 mc_rules.json —— 与
+    ``rules_loader.load_mc()`` 同一份数据，只是绕开它的 runtime 递归。
     """
-    import json as _json
-    from pathlib import Path as _Path
     try:
-        mc_file = _Path(__file__).parent.parent / "rules" / "mc_rules.json"
-        if not mc_file.is_file():
-            return {"category_enabled": True, "category_desc": "LTL 攻击模式规则", "rules": []}
-        mc = _json.loads(mc_file.read_text(encoding="utf-8")) or {}
+        # 用 ``load_mc_raw()``：它应用规则目录的 override/extra（ltl_rules）但**不碰 runtime**，
+        # 因此不会与 generate_source_defaults 互相递归；且与引擎 load_mc() 读**同一份**数据
+        # （历史 bug：这里读内置文件，用户覆盖了 LTL 规则时引擎与种子清单脱节）。
+        from ..rules_loader import load_mc_raw
+        mc = load_mc_raw()
     except Exception:
         return {"category_enabled": True, "category_desc": "LTL 攻击模式规则", "rules": []}
     return {

@@ -9,13 +9,46 @@
 import hashlib
 import os
 import tempfile
+import logging
 import threading
 from collections import OrderedDict
 from pathlib import Path
 
 from .config import CacheConfig, get_default_config
 
+logger = logging.getLogger(__name__)
+
 CACHE_DIR = Path(tempfile.gettempdir()) / "agent_moss_policy_cache"
+
+
+def _safe_cache_dir() -> Path:
+    """返回可安全使用的缓存目录（2026-10 安全加固）。
+
+    ``/tmp`` 下的固定目录是**可被任何本机用户预先创建/替换**的。原实现直接
+    ``mkdir(exist_ok=True)`` + ``write_text``，于是别人可以：
+      - 先把目录换成符号链接 → 我们的写入跟着落到他指定的位置；
+      - 预置同名 policy 文件 → 我们读到伪造的策略；
+      - 直接读 0644 的缓存文件 → 拿到别的会话的 policy。
+
+    这里做三件事：目录必须由当前用户拥有、不是符号链接、权限收紧到 0700。
+    不满足就**回退到数据目录下的私有目录**（仍然可用，只是换了个位置），
+    并打一条警告 —— 正常环境下路径与以前完全一致。
+    """
+    from . import security_policy as sp
+    if sp.ensure_private_dir(CACHE_DIR):
+        return CACHE_DIR
+    try:
+        from .paths import get_data_root
+        fallback = get_data_root() / "policy_cache"
+        if sp.ensure_private_dir(fallback):
+            logger.warning(
+                "缓存目录 %s 不安全（被其他用户拥有或为符号链接），已回退到 %s",
+                CACHE_DIR, fallback,
+            )
+            return fallback
+    except Exception:  # noqa: BLE001
+        pass
+    return CACHE_DIR
 
 
 class PolicyCache:
@@ -33,8 +66,8 @@ class PolicyCache:
     def _cache_file_path(self, session_id: str, prompt_session: str) -> Path:
         """生成缓存文件路径"""
         prompt_hash = hashlib.md5(prompt_session.encode()).hexdigest()[:12]
-        safe_session_id = session_id.replace("/", "_").replace("\\", "_")
-        return CACHE_DIR / safe_session_id / f"{prompt_hash}.toml"
+        safe_session_id = session_id.replace("/", "_").replace("\\", "_").replace("..", "__")
+        return _safe_cache_dir() / safe_session_id / f"{prompt_hash}.toml"
 
     def get(self, session_id: str, prompt_session: str) -> str | None:
         """
@@ -62,7 +95,8 @@ class PolicyCache:
                 return self._memory_cache[key]
 
         cache_file = self._cache_file_path(session_id, prompt_session)
-        if cache_file.exists():
+        # 拒绝读取符号链接（防"别人把缓存文件换成指向敏感文件的链接"）
+        if cache_file.exists() and not cache_file.is_symlink():
             try:
                 policy = cache_file.read_text(encoding="utf-8")
                 with self._lock:
@@ -99,8 +133,10 @@ class PolicyCache:
 
         cache_file = self._cache_file_path(session_id, prompt_session)
         try:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(policy, encoding="utf-8")
+            from . import security_policy as sp
+            if not sp.ensure_private_dir(cache_file.parent):
+                return
+            sp.write_private_text(cache_file, policy)
         except Exception:
             pass
 
@@ -134,8 +170,8 @@ class PolicyCache:
             for key in keys_to_remove:
                 del self._memory_cache[key]
 
-        safe_session_id = session_id.replace("/", "_").replace("\\", "_")
-        session_dir = CACHE_DIR / safe_session_id
+        safe_session_id = session_id.replace("/", "_").replace("\\", "_").replace("..", "__")
+        session_dir = _safe_cache_dir() / safe_session_id
         try:
             if session_dir.exists():
                 for f in session_dir.iterdir():
@@ -150,8 +186,9 @@ class PolicyCache:
             self._memory_cache.clear()
 
         try:
-            if CACHE_DIR.exists():
-                for session_dir in CACHE_DIR.iterdir():
+            _cd = _safe_cache_dir()
+            if _cd.exists():
+                for session_dir in _cd.iterdir():
                     for f in session_dir.iterdir():
                         f.unlink()
                     session_dir.rmdir()

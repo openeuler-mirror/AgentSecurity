@@ -17,9 +17,36 @@
 凭据文件不进此判定（coordinator 层 is_credential 直接 Deny）。
 """
 
+import logging
 import re
 import shlex
 from dataclasses import dataclass
+
+from ..rules_loader import load_inline
+
+logger = logging.getLogger(__name__)
+
+# ── 识别词表：单一事实源 rules/inline_rules.json ────────────────────────────
+# 词表原先硬编码在本文件。迁进 JSON 后
+# 只在导入时读一次 —— 与迁移前的模块级常量行为一致（进程内不变，改 JSON 需重启）。
+# ⚠️ 文件缺失/损坏 → 词表为空，内联脚本里的敏感路径会退回"文本字面量"放行（更松），
+#    故此处必须报错，不能安静地降级。
+_INLINE_RULES = load_inline()
+if not _INLINE_RULES:
+    logger.error(
+        "规则文件 inline_rules.json 缺失或损坏 —— 内联脚本判定词表为空，"
+        "内联脚本中的敏感路径读写将按「文本字面量」放行（比正常更松）。请检查包完整性。"
+    )
+
+#: JSON 里只存语义标志字符，这里映射成 Python re 标志（TS 侧另加 g 用于循环匹配）。
+_RE_FLAG_MAP = {"i": re.IGNORECASE, "s": re.DOTALL, "m": re.MULTILINE}
+
+
+def _compile_flags(flags: str) -> int:
+    out = 0
+    for ch in str(flags or ""):
+        out |= _RE_FLAG_MAP.get(ch, 0)
+    return out
 
 
 @dataclass
@@ -55,6 +82,9 @@ _ECHO_STRING_RE = re.compile(
 # echo / printf 命令本身（用于 is_literal_text_command 门控）
 _ECHO_CMD_RE = re.compile(r"(?:^|\s|;|&&|\|\|)(?:echo|printf)\s", re.IGNORECASE)
 
+# 单个命令段的段首是否为 echo/printf（配合 _split_shell_commands 逐段判定）
+_ECHO_SEG_RE = re.compile(r"^\s*(?:echo|printf)(?:\s|$)", re.IGNORECASE)
+
 
 def is_literal_text_command(command: str) -> bool:
     """判断命令是否为 echo/printf 等纯文本输出命令（敏感路径可能作为字符串字面量出现）。
@@ -62,8 +92,20 @@ def is_literal_text_command(command: str) -> bool:
     echo/printf 含真实文件重定向（> /path，非 /dev/null 丢弃、非 >& fd）时返回 False——
     重定向目标是真实写文件，路径不是字面量，不当文本命令（否则 echo x > '~/.bashrc'
     被当文本命令 → inline_analyzer 把引号内路径当字面量 → 漏报敏感路径写）。
+
+    同样，"管道喂写入消费者（| tee）"时也不是纯文本输出——tee 从 stdin 读内容并写文件，
+    `echo '#!/bin/sh' | tee /etc/cron.d/evil` 里 tee 的目标路径不是字面量。
+    与 _strip_literal_text_segments 的 crontab/at 旁路（2026-09-15 修复）属同一盲区类。
     """
-    if not _ECHO_CMD_RE.search(command):
+    # ⚠️ 必须**整条命令都由 echo/printf 段构成**，不能只看"任意位置出现过 echo"。
+    # 旧实现用 _ECHO_CMD_RE.search 做门控，于是 `echo hi && cat ~/.ssh/id_rsa`、
+    # `cat ~/.ssh/id_rsa && echo hi` 都算"纯文本输出"——L1 的 file_access 命中
+    # （读取 SSH 私钥）被当字面量豁免**整个丢弃**，任意读凭据命令加个 echo 就能绕过。
+    # 实测：`cat ~/.ssh/id_rsa` Deny，`echo hi && cat ~/.ssh/id_rsa` Allow。
+    # 逐段判定后，只要还挂着别的命令段就不算纯文本输出，file_access 正常拦截。
+    from .heuristic import _split_shell_commands  # 懒导入避免模块环
+    segments = _split_shell_commands(command)
+    if not segments or any(not _ECHO_SEG_RE.match(seg) for seg in segments):
         return False
     # 含真实文件重定向 → 不是纯文本输出
     from .logic_rules import _is_write_operation, _DEVNULL_REDIRECT_RE
@@ -76,60 +118,37 @@ def is_literal_text_command(command: str) -> bool:
         d = re.sub(r"'[^']*'|\"[^\"]*\"", "", d)
         if re.search(r">{1,2}\s*(?!&)\S", d):
             return False
+    # 管道喂写入消费者（tee/tac/install）→ 不是纯文本输出
+    # tee 从 stdin 读并写文件；tac 可反向写；install 可复制。这些写入目标不在
+    # echo 文本"输出"的边界内，不应被当字面量豁免。
+    if re.search(r"\|\s*\b(?:tee|tac|install)\b", command):
+        return False
     return True
 
 # 读写调用词：仅用于 python -c 等真正的内联脚本代码（不对 echo/printf 的字符串生效）。
 # 出现这些词 + 敏感路径共存 → 判为真实读写。
-#
-# 全部采用组合/函数调用形态，避免自然语言误触发：
-# - 函数调用形态：open(, read(, write(, system(, exec(, eval( 等（后跟 '('）
-# - 组合关键词：os.system, import os, shell=True 等（自带足够区分度）
-# - 不再包含裸短词（open, read, system, exec 等），因 \b 无法区分编程调用与自然语言
-_READ_WRITE_KEYWORDS = [
-    # 函数调用形态（关键词后跟 '('）
-    "open(", "read(", "write(", "fopen(", "system(", "exec(", "eval(",
-    "popen(", "load(", "dump(",
-    # 文件读写（组合形态）
-    "readline", "readlines", "writelines", "getpass",
-    "pickle.load", "yaml.load", "json.load", "json.read", "configparser",
-    "fread", "fwrite", "fgets",
-    # 子进程执行（组合形态）
-    "os.system", "os.popen", "subprocess", "os.exec", "os.spawn",
-    "import os", "import subprocess",
-    "shell=true", "check_output", "check_call", "run(",
-    # 绕过变体检测
-    "getattr(", "__builtins__", "globals(", "locals(",
-    # PHP
-    "file_get_contents", "file_put_contents", "passthru", "shell_exec", "proc_open",
-    # Perl/Ruby
-    "<stdin>", "open my",
+# **全部采用组合/函数调用形态**（open(、os.system、import os 等），不收裸短词
+# （open / read / system / exec），否则自然语言文本会误触发。词表与选型理由见
+# rules/inline_rules.json。
+_READ_WRITE_KEYWORDS: list[str] = [
+    str(k) for k in (_INLINE_RULES.get("read_write_keywords") or [])
 ]
 
-# 写入+执行绕过链：把含敏感操作的文本写入文件再执行，或管道喂给解释器
+# 写入+执行绕过链：把含敏感操作的文本写入文件再执行，或管道喂给解释器。
+# 四条正则与 flags 见 rules/inline_rules.json（TS 侧同源，另加 g 用于循环匹配）。
 _WRITE_EXEC_CHAIN_PATTERNS = [
-    # echo/cat/printf "..." > file && bash/sh/python file
-    re.compile(
-        r"(?:echo|cat|printf)\b.*?>\s*\S+.*"
-        r"(?:&&|;|\|)\s*(?:bash|sh|zsh|python\d?|perl|ruby|node|php)\s",
-        re.IGNORECASE | re.DOTALL,
-    ),
-    # ... | bash / | sh / | python（管道喂解释器执行）
-    re.compile(r"\|\s*(?:bash|sh|zsh|python\d?|perl|ruby|node|php)\b", re.IGNORECASE),
-    # eval "$(cat ...)" / eval "$(echo ...)"
-    re.compile(r"eval\s+\"\$\(", re.IGNORECASE),
-    # xargs bash / xargs sh
-    re.compile(r"\|\s*xargs\s+(?:bash|sh|zsh)", re.IGNORECASE),
+    re.compile(str(p["pattern"]), _compile_flags(str(p.get("flags", ""))))
+    for p in (_INLINE_RULES.get("write_exec_chain_patterns") or [])
+    if isinstance(p, dict) and p.get("pattern")
 ]
 
 # 重定向写入敏感路径：> / >> 后跟敏感路径 = 真实写入（不是字符串字面量）
 # 兜底默认列表（无 profile 时用）。真实数据源是 profile.sensitive_paths，
 # analyze_inline_script 传入 profile 时按 profile 动态编译正则，避免双份维护漂移。
-_SENSITIVE_PATH_FRAGMENTS_DEFAULT = [
-    "/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers", "/etc/hosts",
-    "/etc/crontab", "/etc/systemd/", "/etc/ssh/sshd_config", "/etc/pam.d/",
-    "/etc/nginx/nginx.conf", "/etc/nginx/conf.d/", "/etc/nginx/sites-enabled/",
-    "/boot/", "/proc/sys/", "/sys/", "/dev/mem", "/dev/kmsg",
-    ".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/authorized_keys",
+# 兜底清单已搬到 rules/inline_rules.json 的 redirect_sensitive_paths.python_fallback。
+_SENSITIVE_PATH_FRAGMENTS_DEFAULT: list[str] = [
+    str(p)
+    for p in ((_INLINE_RULES.get("redirect_sensitive_paths") or {}).get("python_fallback") or [])
 ]
 _REDIRECT_TO_SENSITIVE_RE = re.compile(
     r">{1,2}\s*(" + "|".join(re.escape(p) for p in _SENSITIVE_PATH_FRAGMENTS_DEFAULT) + r")",
@@ -181,13 +200,11 @@ def _has_write_exec_chain(command: str) -> bool:
     return any(p.search(command) for p in _WRITE_EXEC_CHAIN_PATTERNS)
 
 
-# 目录遍历关键词：用于检测通过动态发现文件路径绕过静态路径匹配的行为
-# 仅对 python -c 等真正的内联脚本代码生效
-_DIR_TRAVERSAL_KEYWORDS = [
-    # Python 目录遍历
-    "os.listdir", "os.walk", "os.scandir", "os.walk",
-    "glob.glob", "glob.iglob", "pathlib.", "iterdir", "rglob",
-    "scandir(", "listdir(",
+# 目录遍历关键词：用于检测通过动态发现文件路径绕过静态路径匹配的行为。
+# 仅对 python -c 等真正的内联脚本代码生效。词表见 rules/inline_rules.json
+# （原先这里 "os.walk" 写了两遍，去重后语义不变 —— 判定是 any(子串 in 代码)）。
+_DIR_TRAVERSAL_KEYWORDS: list[str] = [
+    str(k) for k in (_INLINE_RULES.get("dir_traversal_keywords") or [])
 ]
 
 
@@ -205,6 +222,48 @@ def _has_read_write_keyword(code: str) -> bool:
     """
     code_lower = code.lower()
     return any(kw in code_lower for kw in _READ_WRITE_KEYWORDS)
+
+
+#: 危险片段（补位判定的准入闸）。单一事实源 inline_rules.json（双端共用）。
+_DANGER_EVIDENCE_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in ((_INLINE_RULES.get("danger_evidence_patterns") or {}).get("patterns") or [])
+]
+
+
+def has_inline_danger_evidence(command: str, profile=None) -> bool:
+    """内联脚本补位判定的准入闸 —— 代码里必须有敏感路径或危险片段。
+
+    背景（2026-11）：补位判定（coordinator）原先只要求"是内联脚本"，而
+    ``analyze_inline_script`` 的步骤 2 只看读写调用词（``open(`` / ``system(`` …），
+    于是 ``Image.open('/tmp/x.png')``、``print(open('/tmp/x').read())`` 这类正常
+    脚本被 critical 误杀（0.15.4 起，文案却写"含敏感路径"）。
+
+    证据（任一即可）：
+    1. 敏感路径完整出现（``profile.sensitive_paths``；``~/`` 前缀按相对形式再匹配一次）。
+       注意**不用 basename**：``/sys`` 的 ``sys`` 会命中 ``os.system``。
+    2. 危险片段正则命中（``danger_evidence_patterns``：rm -rf / mkfs / dd if= / …）。
+
+    提取不到代码 → False（不补位，交回上层原逻辑）。
+    """
+    code = _extract_inline_code(command)
+    if not code:
+        return False
+    lowered = code.lower()
+    if profile is not None:
+        for sp in getattr(profile, "sensitive_paths", []):
+            p = (getattr(sp, "path", "") or "").lower()
+            if not p:
+                continue
+            if p in lowered:
+                return True
+            rel = p[2:] if p.startswith("~/") else p
+            if rel != p and rel in lowered:
+                return True
+    for rex in _DANGER_EVIDENCE_RES:
+        if rex.search(code):
+            return True
+    return False
 
 
 def analyze_inline_script(command: str, profile=None) -> InlineAnalysisResult:

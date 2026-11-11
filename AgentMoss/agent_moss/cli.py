@@ -24,18 +24,82 @@ def cmd_init(args):
         "os_type": "",
         "cwd": "/home/user/project",
     }
-    output = args.output or "input.json"
+    output = args.output or args.output_pos or "input.json"
     with open(output, "w", encoding="utf-8") as f:
         json.dump(template, f, indent=2, ensure_ascii=False)
     print(f"Template written to {output}")
 
 
-def cmd_analyze(args):
-    """Run security analysis on input JSON."""
+#: 这些后缀不存在时按「文件路径写错」处理并报错，不当成 shell 命令分析
+_FILE_LIKE_SUFFIXES = (".json", ".yaml", ".yml", ".toml")
+
+
+def _analyze_command(args, command: str) -> int:
+    """命令模式：直接分析一条 shell 命令（不读写输入/结果文件）。
+
+    输出纯文本 Deny/Allow（--json 时输出完整 JSON）；退出码 Allow=0 / Deny=1，
+    供 shell 直接 if 判断。镜像 TS cli.ts 的同名分支。
+
+    注：会以**当前工作目录**作为 cwd 参与判定（间接文件访问检测要列出目录内容），
+    所以不是"零文件 IO"——但不会创建任何文件、也不读输入文件。
+    """
     from agent_moss.engine.analyzer import analyze
     from agent_moss.profiles import get_profile
 
-    with open(args.input, "r", encoding="utf-8") as f:
+    # ⚠️ cwd 必须传（2026-10 修）：间接文件访问检测（`os.listdir('.')` + 写）要靠
+    # cwd 列出目录里的凭据文件（如 .env）才判得出。此前这里不传 → cwd="" → 该检测
+    # 整个跳过 → **同一个命令在 CLI 命令模式下 Allow、在文件模式 / HTTP / TS CLI /
+    # 客户验收脚本（judge_agentmoss.py 传 cwd）下 Deny**，属漏报。
+    # 现在与本文件模式（`data.get("cwd") or str(Path.cwd())`）口径一致。
+    result = analyze(
+        session_id="cli-command",
+        prompt_session="",
+        action_history=[],
+        a_next={"action_type": "bash", "action_detail": command},
+        reason="",
+        profile=get_profile(""),
+        cwd=str(Path.cwd()),
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(result.get("decision", "Deny"))
+
+    return 0 if result.get("decision") == "Allow" else 1
+
+
+def cmd_analyze(args):
+    """Run security analysis on an input JSON file or a raw shell command.
+
+    位置参数是已存在的文件 → 文件模式（行为与既有版本一致）；
+    否则 → 命令模式（把参数当 shell 命令直接分析，不读写任何文件）。
+    以 .json/.yaml/.yml/.toml 结尾但文件不存在 → 报错退出（避免路径写错被当成命令）。
+    """
+    from agent_moss.engine.analyzer import analyze
+    from agent_moss.profiles import get_profile
+
+    target = args.input
+
+    # ==================== 命令模式 ====================
+    if not os.path.isfile(target):
+        if os.path.exists(target):
+            print(f"错误: 不是文件: {target}", file=sys.stderr)
+            return 2
+        # 「以 .json/.yaml/... 结尾」只在不含空白时才算"疑似写错的文件路径"。
+        # ⚠️ 否则会把**合法命令**当路径：`cat /home/sandbox/config.yaml` 曾被判
+        # "文件不存在" 直接退出（2026-09 招行沙箱实测），而 `cat x.yaml` 这类
+        # 在读配置的运维里极常见。含空格 = 明显是命令，交命令模式。
+        if target.lower().endswith(_FILE_LIKE_SUFFIXES) and " " not in target.strip():
+            print(f"错误: 文件不存在: {target}", file=sys.stderr)
+            return 2
+        if not target.strip():
+            print("错误: 输入为空（请给 JSON 文件路径或 shell 命令）", file=sys.stderr)
+            return 2
+        return _analyze_command(args, target)
+
+    # ==================== 文件模式（原有行为，保持不变）====================
+    with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     action_history = data.get("action_history", [])
@@ -45,6 +109,12 @@ def cmd_analyze(args):
     os_type = data.get("os_type", "")
     profile = get_profile(os_type)
 
+    # ⚠️ agent_id / scenario_id / cwd 必须透传。
+    # 历史 bug：Python CLI 只传 5 个参数，于是**同一个输入文件两端判定不同**：
+    #   - agent_id 缺失  → agent 专属规则（xiaoo/opendesk 的 extra_command_patterns）不加载
+    #   - scenario_id 缺失 → 场景定制规则（bank 沙箱边界）不加载
+    #   - cwd 缺失（默认 ""）→ 间接文件访问检测直接跳过（logic_rules 里 `if cwd and isdir(cwd)`），
+    #     而 TS CLI 传的是 process.cwd() → 该检测在 TS 上生效、Python 上不生效
     result = analyze(
         session_id=data.get("session_id", "unknown"),
         prompt_session=data.get("prompt_session", ""),
@@ -52,6 +122,9 @@ def cmd_analyze(args):
         a_next=a_next,
         reason=data.get("reason", ""),
         profile=profile,
+        cwd=data.get("cwd") or str(Path.cwd()),
+        agent_id=data.get("agent_id", ""),
+        scenario_id=data.get("scenario_id", ""),
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -289,16 +362,50 @@ def cmd_status(args):
 
 
 def main():
+    from agent_moss.__version__ import __version__
+
+    # 规则包契约自检（schema 版本 / 完整性 / 指纹）：启动即打一行指纹，
+    # 客户报问题时凭这一行就能确认跑的是哪份规则。
+    # 显式指定 AGENT_MOSS_RULES_ROOT 且校验失败 → 抛异常退出（不带着残缺规则运行）。
+    # 注意：只写 stderr —— `analyze` 的 stdout 是给调用方/脚本解析的，不能混入别的行。
+    try:
+        from agent_moss.infra.security_policy import harden_existing_paths
+        harden_existing_paths()
+        from agent_moss.rules_contract import (
+            enforce_rules_contract, format_rules_integrity,
+        )
+        _rep = enforce_rules_contract()
+        if _rep.external:
+            print(format_rules_integrity(_rep), file=sys.stderr)
+    except RuntimeError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(2)
+
     parser = argparse.ArgumentParser(description="AgentMoss security analysis engine")
+    # `agent-moss --version` / `-V`：客户确认自己装的是哪个版本用
+    # （版本混淆在招行那边真出过：/tmp 产物的解释取决于版本，先让他能报版本号）。
+    parser.add_argument("--version", "-V", action="version", version=f"agent-moss {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     init_parser = subparsers.add_parser("init", help="Generate input.json template")
-    init_parser.add_argument("--output", "-o", help="Output file path", default="input.json")
+    init_parser.add_argument("--output", "-o", help="Output file path", default=None)
+    # 位置参数形式也接受（`agent-moss init x.json` 的写法），两种都能用
+    init_parser.add_argument("output_pos", nargs="?", default=None, help="Output file path（同 --output）")
 
-    analyze_parser = subparsers.add_parser("analyze", help="Run security analysis on input JSON")
-    analyze_parser.add_argument("input", help="Input JSON file path")
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="Run security analysis on an input JSON file or a raw shell command"
+    )
+    analyze_parser.add_argument(
+        "input",
+        help='Input JSON file path, or a shell command string (e.g. agent-moss analyze "cat ~/.ssh/id_rsa")',
+    )
     analyze_parser.add_argument("--output-dir", "-o", help="Output directory for policy/deny files")
     analyze_parser.add_argument("--no-file", action="store_true", help="Only print to stdout, don't write files")
+    analyze_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Command mode: print the full JSON result instead of plain Deny/Allow",
+    )
 
     server_parser = subparsers.add_parser("server", help="Start HTTP API server")
     server_parser.add_argument("--host", default="127.0.0.1", help="Listen host (TCP mode)")
@@ -319,6 +426,20 @@ def main():
 
     status_parser = subparsers.add_parser("status", help="Show service status, port and Console URL")
 
+    # rules 子命令（规则目录自查 / 生成模板；2026-10 客户要"够简单"）
+    rules_parser = subparsers.add_parser(
+        "rules", help="规则目录（extra.json / override.json）：自查与生成模板"
+    )
+    rules_sub = rules_parser.add_subparsers(dest="rules_command")
+    rules_status = rules_sub.add_parser("status", help="打印当前规则目录加载了什么（自查）")
+    rules_status.add_argument("--dir", "-d", default=None,
+                              help="只看这个目录（默认用 AGENT_MOSS_EXTRA_RULES_DIR 等环境变量）")
+    rules_init = rules_sub.add_parser("init", help="生成模板：extra.json + override.json.示例")
+    rules_init.add_argument("--dir", "-d", required=True, help="模板写到哪个目录")
+    rules_init.add_argument("--force", action="store_true", help="覆盖已存在的模板文件")
+    rules_init.add_argument("--with-builtin", action="store_true",
+                            help="override.json 写成内置 L1 规则全量拷贝（就地把内置某条删/改时用）")
+
     # brain 子命令（contribute = 提交本地沉淀为 MR；中心化上传接口在此预留）
     from agent_moss.brain.contributor import add_contribute_parser
     add_contribute_parser(subparsers)
@@ -335,6 +456,11 @@ def main():
         sys.exit(cmd_install(args))
     elif args.command == "status":
         sys.exit(cmd_status(args))
+    elif args.command == "rules":
+        if not getattr(args, "rules_command", None):
+            print("rules 子命令：status（自查规则目录）/ init（生成模板）")
+            sys.exit(1)
+        sys.exit(cmd_rules(args))
     elif args.command == "brain":
         if not args.brain_command:
             print("Brain 子命令：contribute（贡献本地规则/Skill 为 MR）")
@@ -344,6 +470,40 @@ def main():
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def cmd_rules(args) -> int:
+    """`agent-moss rules status|init` —— 规则目录的自查与模板生成。
+
+    为什么做成命令（而不是只写文档）：客户只跑 L1，但"一个目录两个文件名六个类别"
+    讲起来仍绕。给他们两条命令就够：**生成模板** + **改完自查**，不用记类别名。
+    """
+    from agent_moss.rules_tools import init_rules_dir, rules_status_text
+
+    if args.rules_command == "status":
+        if args.dir:
+            os.environ["AGENT_MOSS_EXTRA_RULES_DIR"] = str(args.dir)
+            from agent_moss import rules_loader
+            rules_loader.clear_rules_cache()
+        print(rules_status_text())
+        return 0
+
+    if args.rules_command == "init":
+        written = init_rules_dir(args.dir, force=args.force,
+                                with_builtin=getattr(args, "with_builtin", False))
+        for p in written:
+            print(f"已生成: {p}")
+        if not written:
+            print("（模板已存在，未覆盖；要重新生成加 --force）")
+        print()
+        print("下一步：")
+        print(f"  1) 追加规则：编辑 {Path(args.dir) / 'extra.json'}，把条目加进对应类别的数组里")
+        print(f"  2) 覆盖内置：编辑 {Path(args.dir) / 'override.json.示例'}"
+              f"（内置 L1 全量拷贝）—— 删掉/改掉不要的那条，然后改名为 override.json")
+        print(f"  3) 让 AgentMoss 读这个目录：export AGENT_MOSS_EXTRA_RULES_DIR={args.dir}（重启进程）")
+        print(f"  4) 自查：agent-moss rules status")
+        return 0
+    return 1
 
 
 def cmd_brain_contribute(args):
