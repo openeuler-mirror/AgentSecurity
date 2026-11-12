@@ -1,7 +1,7 @@
 """脚本分析引擎 — RecursiveTracker
 
 跨脚本调用链的递归追踪。独立于语言（消费 IR 的 calls[]）：
-- 深度预算（默认 10，可配置），替代旧版固定 max_depth=3。
+- 深度预算（默认 14，可配置），替代旧版固定 max_depth=3。
 - 循环检测（调用图 DFS，visited 路径集合），防 A→B→A 死循环。
 - **跨脚本参数传递**：每个子脚本用自己的调用参数(args[])做分支感知，
   不再透传入口参数（修复旧版 `bash child.sh backup` 仍误报的 bug）。
@@ -14,6 +14,7 @@
 """
 
 import logging
+import os
 from pathlib import Path
 
 from ..types import ScriptChainAnalysisResult, ScriptNode
@@ -44,7 +45,25 @@ DEFAULT_MAX_DEPTH = 14
 #: 总节点数上限（防花式链巨大化）
 DEFAULT_MAX_NODES = 64
 #: 单文件大小上限（保持 2MB）
-DEFAULT_MAX_FILE_SIZE = 2 * 1024 * 1024
+def _max_file_size_from_env() -> int:
+    """脚本内容扫描的单文件大小上限（默认 2MB）。
+
+    超过上限的脚本**不再静默放行**，而是按「无法分析 ⇒ 不可信」fail-closed
+    （见 coordinator 的 L1.2）。确有大脚本需要放行的客户可用本环境变量放宽，
+    但放宽意味着更大的未扫描面，需自行评估。
+    """
+    raw = os.getenv("AGENT_MOSS_SCRIPT_MAX_FILE_SIZE", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return 2 * 1024 * 1024
+
+
+DEFAULT_MAX_FILE_SIZE = _max_file_size_from_env()
 #: 所有文件累计大小上限
 DEFAULT_MAX_TOTAL_SIZE = 8 * 1024 * 1024
 
@@ -100,7 +119,14 @@ class RecursiveTracker:
         resolved = _resolve_path(entry_path, base_dir)
         self._result.entry_path = resolved
 
-        self._visit_script(resolved, depth=0, base_dir=str(Path(resolved).parent if Path(resolved).exists() else base_dir), args=entry_args)
+        # ⚠️ Path.exists() 在父目录不可读时会抛 PermissionError（Python 3.12），
+        # 不设防就会一路上抛 → 外层 fail-closed → 判定随文件系统状态变化。
+        # 这里只是在选 base_dir，探测失败退回传入的 base_dir 即可。
+        try:
+            _entry_exists = Path(resolved).exists()
+        except OSError:
+            _entry_exists = False
+        self._visit_script(resolved, depth=0, base_dir=str(Path(resolved).parent if _entry_exists else base_dir), args=entry_args)
 
         # 汇总
         nodes = self._result.nodes
@@ -153,7 +179,16 @@ class RecursiveTracker:
 
         content, lines, size, error = _read_script(path_str, self._max_file_size)
         if error:
-            node = ScriptNode(script_path=path_str, depth=depth, error=error, file_size=size, line_count=lines)
+            # unanalyzable 只在**「文件过大」**时置位 —— 那才是"我们主动不读"的情况，
+            # 不能当安全放行（实测：把 rm -rf / 的脚本用注释撑到 2MB 就绕过内容扫描）。
+            # ⚠️ 不能连"读取失败（权限）"一起算：内联脚本提取会把 `open('/etc/shadow')`
+            # 的**数据文件路径**当成脚本路径，读它必然 Permission denied —— 一律标
+            # unanalyzable 会把 `python3 -c "open('/etc/shadow')"` 这类用例的
+            # critical/file_access 误降成 high/script_execution（实测踩过）。
+            # 「脚本不存在/不是文件」同理不算（跑也跑不起来）。
+            _unanalyzable = error.startswith("脚本文件过大")
+            node = ScriptNode(script_path=path_str, depth=depth, error=error, file_size=size,
+                              line_count=lines, unanalyzable=_unanalyzable)
             self._result.nodes.append(node)
             self._visiting.discard(path_str)
             return

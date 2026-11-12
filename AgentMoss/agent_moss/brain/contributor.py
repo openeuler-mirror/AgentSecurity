@@ -29,6 +29,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..engine.skill_engine import default_skills_dir
+
 logger = logging.getLogger(__name__)
 
 # 默认目标仓库：AtomGit/GitCode 上的 AgentMoss 共享仓（供 owner/协作者直接 push 探测）
@@ -223,6 +225,10 @@ def _extract_repo_path(repo_url: str) -> str:
         url = url.split(":", 1)[1]
     elif url.startswith("http"):
         url = url.split("://", 1)[1]
+        # 去掉 host（https://gitcode.com/kenhkl/Repo.git → kenhkl/Repo）。
+        # 历史 bug：这里不剥 host，返回值带上 "gitcode.com/"，而调用方拿它拼
+        # 回退 MR 链接 → `https://gitcode.com/gitcode.com/kenhkl/Repo/branches`（坏链）。
+        url = url.split("/", 1)[1] if "/" in url else url
     return url.removesuffix(".git").strip("/")
 
 
@@ -333,7 +339,7 @@ def contribute(args) -> int:
 
     # 1. 收集
     store = BrainRuleStore()
-    skill_mgr = BrainSkillManager(skills_dir=Path(__file__).parent.parent / "skills")
+    skill_mgr = BrainSkillManager(skills_dir=default_skills_dir())
     try:
         rules = collect_rules(store)
         skills = collect_skills(skill_mgr)

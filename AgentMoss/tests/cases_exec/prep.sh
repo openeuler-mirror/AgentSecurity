@@ -271,63 +271,37 @@ fi
 # 在此建 cwd/.env 使该 deny 命令能被 AgentMoss 静态拦截（indirect_file_access deny_both）。
 # 仅在执行目录首次建，且不覆盖已有文件；run_all.sh --no-exec 或 --allow-dangerous 分支自行
 # 决定是否执行，这里只负责让「能拦截」前提成立。
-[ ! -e "$SCRIPT_DIR/.env" ] && echo "KEY=val" > "$SCRIPT_DIR/.env" 2>/dev/null || true
+[ ! -e "$SCRIPT_DIR/.env" ] && cp "$ASSETS_DIR/premise/dotenv" "$SCRIPT_DIR/.env" 2>/dev/null || true
 # ---- 脚本分支感知（L1.5）配套脚本 ----
 # 用例 `bash deploy.sh clean` / `python3 deploy.py clean` / `bash deploy_shift.sh backup clean`
 # 的危险命令在脚本文件内容里（clean 分支 rm -rf ~/.ssh/id_rsa），脚本必须在
 # run_all 的执行 cwd（=$SCRIPT_DIR）存在，L1.5 分支感知扫描到内容才判 Deny。
-# 内容与 tests/conftest.py 的分支脚本保持一致（仅缺文件时创建，不覆盖）。
-if [ ! -e "$SCRIPT_DIR/deploy.sh" ]; then
-cat > "$SCRIPT_DIR/deploy.sh" <<'PREP_DEPLOY_SH'
-#!/bin/bash
-case $1 in
-  clean)
-    echo 'cleaning'
-    rm -rf ~/.ssh/id_rsa
-    ;;
-  backup)
-    echo 'backing up'
-    tar -czf /tmp/backup.tar.gz ~/docs
-    ;;
-esac
-PREP_DEPLOY_SH
+# **内容单一事实源 = assets/premise/**（逐字对齐 tests/conftest.py 的分支脚本常量）：
+# 判定模式 judge_agentmoss.py 也从同一份素材补齐前提——改分支脚本内容只改 assets/premise/。
+# 仅缺文件时创建，不覆盖已有。
+if [ -d "$ASSETS_DIR/premise" ]; then
+    for _premise_f in deploy.sh deploy.py deploy_shift.sh deploy-large.sh build-large.py \
+                     deploy-xlarge.sh build-xlarge.py; do
+        [ -e "$SCRIPT_DIR/$_premise_f" ] || \
+            cp "$ASSETS_DIR/premise/$_premise_f" "$SCRIPT_DIR/$_premise_f" 2>/dev/null || true
+    done
+    # 复杂嵌套脚本子模块 build-script/（deploy-large.sh / build-large.py 嵌套调用）
+    if [ -d "$ASSETS_DIR/premise/build-script" ]; then
+        mkdir -p "$SCRIPT_DIR/build-script"
+        for _sub in prepare.sh install.sh deploy.sh cleanup.sh; do
+            [ -e "$SCRIPT_DIR/build-script/$_sub" ] || \
+                cp "$ASSETS_DIR/premise/build-script/$_sub" "$SCRIPT_DIR/build-script/$_sub" 2>/dev/null || true
+        done
+    fi
 else
-    grep -q "rm -rf ~/.ssh/id_rsa" "$SCRIPT_DIR/deploy.sh" 2>/dev/null || \
-        warn "已有 $SCRIPT_DIR/deploy.sh 非 prep 版本（backup 分支可能依赖 ~/docs 等路径，rc 非 0 会误判失败）——建议删除后重跑 prep.sh"
+    warn "缺少判定前提素材 $ASSETS_DIR/premise/ —— deploy.sh/deploy.py/deploy_shift.sh/.env 无法创建，"
+    warn "  L1.5 分支感知与 logic-10 用例将拦不住（tests 目录不完整，建议重新拷贝/重装）。"
 fi
-if [ ! -e "$SCRIPT_DIR/deploy.py" ]; then
-cat > "$SCRIPT_DIR/deploy.py" <<'PREP_DEPLOY_PY'
-#!/usr/bin/env python3
-import sys
-import os
-
-mode = sys.argv[1] if len(sys.argv) > 1 else "backup"
-
-if mode == "clean":
-    os.system("rm -rf ~/.ssh/id_rsa")
-elif mode == "backup":
-    print("backing up")
-else:
-    print("unknown mode")
-PREP_DEPLOY_PY
-else
-    grep -q "backing up" "$SCRIPT_DIR/deploy.py" 2>/dev/null || \
-        warn "已有 $SCRIPT_DIR/deploy.py 非 prep 版本（backup 分支若含 tar 且目标缺失，rc 非 0 会误判失败）——建议删除后重跑 prep.sh"
-fi
-if [ ! -e "$SCRIPT_DIR/deploy_shift.sh" ]; then
-cat > "$SCRIPT_DIR/deploy_shift.sh" <<'PREP_DEPLOY_SHIFT'
-#!/bin/bash
-shift
-case $1 in
-  clean)
-    rm -rf ~/.ssh/id_rsa
-    ;;
-  backup)
-    echo 'backing up'
-    ;;
-esac
-PREP_DEPLOY_SHIFT
-fi
+# 内容自检（保持原告警语义：文件在但不是本项目的分支脚本 → 真执行结果会与预期不符）
+[ -f "$SCRIPT_DIR/deploy.sh" ] && { grep -q "rm -rf ~/.ssh/id_rsa" "$SCRIPT_DIR/deploy.sh" 2>/dev/null || \
+    warn "已有 $SCRIPT_DIR/deploy.sh 非 prep 版本（backup 分支可能依赖 ~/docs 等路径，rc 非 0 会误判失败）——建议删除后重跑 prep.sh"; }
+[ -f "$SCRIPT_DIR/deploy.py" ] && { grep -q "backing up" "$SCRIPT_DIR/deploy.py" 2>/dev/null || \
+    warn "已有 $SCRIPT_DIR/deploy.py 非 prep 版本（backup 分支若含 tar 且目标缺失，rc 非 0 会误判失败）——建议删除后重跑 prep.sh"; }
 # 不建（写新建语义，建了会污染 read_before_write 判定）：
 #   /tmp/pkg.tar.gz   (wget -O 写，allow-78)
 #   /tmp/api-docs.md  (curl -o 写，llm-06)

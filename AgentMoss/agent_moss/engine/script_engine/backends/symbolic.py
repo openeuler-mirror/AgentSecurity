@@ -27,7 +27,6 @@ from typing import Optional
 # ==================== 预算（P5 熔断） ====================
 MAX_LINES = 500            # 单脚本最大解析有效行
 MAX_BRANCHES = 50          # 最多处理的分支数
-MAX_CONSTRAINTS = 30       # 最多累积约束（当前架构未使用，为未来预留）
 MAX_VARS = 200             # 环境变量数上限（防变量注入表膨胀）
 
 
@@ -401,12 +400,29 @@ def eval_expr(text: str, env: dict[str, SVal]) -> SVal:
 
     # 先按变量引用切分
     result: list[SVal] = []
-    parts = re.split(r"(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\{?\d+\}?)", text)
+    # 切分 token：完整的 ${...} 算一个 token（旧写法 `\$\{?\d+\}?` 会把 `${1:-x}` 切成 `${1`
+    # 加 `:-x}`，导致参数展开语法整体解析错乱）
+    parts = re.split(r"(\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$\d+)", text)
     for p in parts:
         if not p:
             continue
-        m = re.match(r"^\$\{([^}]+)\}$", p)
+        m = re.match(r"^\$\{([^}]*)\}$", p)
         if m:
+            # 参数展开 ${var:-默认值} / ${var-默认值}（2026-09 补）
+            # 历史实现把 `1:-deploy` 整个当变量名 → 查不到 → 符号值 → 无法剪枝 →
+            # fail-closed 回全文本扫描 → **安全分支被过度拦截**。而
+            # `MODE="${1:-deploy}"` 是真实脚本里极常见的写法（实测：用它时
+            # `bash x.sh deploy` 会被判 Deny，只因为脚本另一分支里有危险命令）。
+            _dm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*|\d+):?-(.*)$", m.group(1), re.DOTALL)
+            if _dm:
+                _name, _default = _dm.group(1), _dm.group(2)
+                _key = f"${_name}" if _name.isdigit() else _name
+                _bound = env.get(_key)
+                if _bound is not None and not (_bound.kind == "concrete" and not _bound.value):
+                    result.append(_bound)
+                else:
+                    result.append(eval_expr(_default, env))
+                continue
             # 数字位置参数
             if m.group(1).isdigit():
                 numeric = m.group(1)
@@ -625,6 +641,10 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
             return None  # 超预算 → 降级
 
         if isinstance(s, AssignStmt):
+            # 变量表上限：脚本可以是自动生成/拼接的，几万个变量赋值会把
+            # 环境表一路撑大（超限返回 None 回退全文匹配）。
+            if len(env) >= MAX_VARS:
+                return None
             # 赋值：右值求值写入 env
             modelable_encountered = True
             val = eval_expr(s.rhs, env)

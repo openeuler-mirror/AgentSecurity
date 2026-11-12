@@ -1,0 +1,61 @@
+{
+  "_comment": "L2.2 形式化引擎（行为图 + 性质验证）的识别名单（Python engine/formal_engine/* ↔ TS engine/formal-engine/* 单一事实源）。全部为集合成员判断，顺序无意义。",
+  "privesc": {
+    "_comment": "提权判定的「命令位置」旁证：sudo 后面跟包管理器 → 运维不是提权；跟裸 shell → 提权。",
+    "package_managers": [
+      "apt",
+      "apt-get",
+      "aptitude",
+      "yum",
+      "dnf",
+      "pacman",
+      "zypper",
+      "apk",
+      "brew"
+    ],
+    "bare_shells": [
+      "bash",
+      "sh",
+      "zsh",
+      "dash",
+      "fish",
+      "ksh",
+      "csh",
+      "tcsh",
+      "nologin"
+    ]
+  },
+  "compute_action_types": [
+    "python",
+    "node",
+    "exec",
+    "terminal",
+    "cmd"
+  ],
+  "_compute_action_types_comment": "命中的 action_type 一律视为命令执行形态（不论 detail）。",
+  "pattern_miner": {
+    "_comment": "组合链挖掘的危险阶段与敏感相邻对：命中即认为该链值得报出。",
+    "danger_stages": [
+      "PRIVESC",
+      "EXFIL",
+      "LISTEN"
+    ],
+    "sensitive_pairs": [
+      [
+        "CRED",
+        "LISTEN"
+      ],
+      [
+        "LISTEN",
+        "CRED"
+      ]
+    ]
+  },
+  "_not_moved": "decode 的 _STAGE_PRIORITY（EXFIL/PRIVESC/PERSIST/SCAN/LISTEN 的仲裁顺序）留在代码里 —— 它表达的是「多阶段同时命中时报哪个」的优先级逻辑，不是可以独立增删的规则。",
+  "output_commands": [
+    "echo",
+    "printf",
+    "print"
+  ],
+  "_output_commands_comment": "纯输出命令：解码候选里要剥掉其引号内容（grep/cat 等查询类的引号内是搜索词，有安全语义，不能剥）。"
+}

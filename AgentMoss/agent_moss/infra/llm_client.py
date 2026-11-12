@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 from .config import LLMConfig, get_default_config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -191,6 +194,30 @@ def create_client(config: LLMConfig | None = None) -> OpenAI:
     )
 
 
+def _describe_response(response) -> str:
+    """空返回时的诊断摘要（不含 prompt 全文，避免日志爆炸）。
+
+    输出模型名、finish_reason、content / reasoning_content 长度、message 字段名、
+    token 用量 —— 足以判断「模型没输出」还是「输出在别的字段里」。
+    """
+    try:
+        choice = response.choices[0]
+        msg = choice.message
+        d = msg.model_dump() if hasattr(msg, "model_dump") else {}
+        usage = getattr(response, "usage", None)
+        return (
+            f"model={getattr(response, 'model', '?')} "
+            f"finish_reason={choice.finish_reason} "
+            f"content_len={len(d.get('content') or '')} "
+            f"reasoning_len={len(d.get('reasoning_content') or '')} "
+            f"message_keys={','.join(d.keys())} "
+            f"tokens={getattr(usage, 'prompt_tokens', '?')}/"
+            f"{getattr(usage, 'completion_tokens', '?')}"
+        )
+    except Exception as e:  # noqa: BLE001 —— 诊断信息本身绝不能影响主流程
+        return f"<无法解析响应结构: {e}>"
+
+
 def call_llm(
     prompt: str,
     timeout: float = 5.0,
@@ -245,10 +272,15 @@ def call_llm(
             finish_reason = response.choices[0].finish_reason
 
             if not content:
+                detail = _describe_response(response)
                 if finish_reason == "length":
+                    logger.error(
+                        "LLM 推理耗尽 token（finish_reason=length）: %s", detail
+                    )
                     raise ValueError(
                         "LLM 推理耗尽 token（finish_reason=length），无实际输出"
                     )
+                logger.error("LLM 返回内容为空: %s", detail)
                 raise ValueError("LLM 返回内容为空")
 
             cleaned = content.strip()
@@ -291,7 +323,9 @@ def call_llm(
             completion_tokens = 0
             total_tokens = 0
             model_used = config.model
+            chunk_count = 0
             for chunk in stream:
+                chunk_count += 1
                 if chunk.choices and chunk.choices[0].delta:
                     delta_content = chunk.choices[0].delta.content
                     if delta_content:
@@ -307,10 +341,18 @@ def call_llm(
 
             content = "".join(chunks_content)
             if not content:
+                detail = (
+                    f"chunks={chunk_count} finish_reason={finish_reason} "
+                    f"tokens={prompt_tokens}/{completion_tokens}"
+                )
                 if finish_reason == "length":
+                    logger.error(
+                        "LLM 流式推理耗尽 token（finish_reason=length）: %s", detail
+                    )
                     raise ValueError(
                         "LLM 推理耗尽 token（finish_reason=length），无实际输出"
                     )
+                logger.error("LLM 流式返回内容为空: %s", detail)
                 raise ValueError("LLM 返回内容为空（流式聚合后仍空）")
 
             cleaned = content.strip()

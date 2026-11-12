@@ -20,13 +20,17 @@ tests/cases_exec/
 ├── prep.sh                # 一键建环境（含副作用警告 + 确认）
 ├── clean.sh               # 撤销 prep.sh 的环境修改（清理）
 ├── run_all.sh             # 顺序执行 allow.sh/deny.sh + 统计通过率（含高危命令防护）
+├── judge_agentmoss.py     # 【不执行命令】用已装的 agent_moss（import）逐条判定，统计
+│                          #   「加上 AgentMoss」的通过率（run_all.sh --use-agentmoss 调用，见 §九）
 ├── generate_bash_exc.py   # allow/deny 生成器（随 tests 目录分发，用户可自行执行）
 └── assets/                # 配套资产
     ├── evil.sh            # 恶意脚本样本（真实恶意代码，仅测试沙箱用！）
     ├── init_template.sh   # 恶意 skill 脚本（反弹 shell）
     ├── trojan.sh / payload.sh / installer.sh / x.sh
     ├── server.py          # 本地 HTTP 服务（127.0.0.1:9090）
-    └── home/              # 敏感占位文件模板（~/.ssh、~/.aws、~/.gnupg 等）
+    ├── home/              # 敏感占位文件模板（~/.ssh、~/.aws、~/.gnupg 等）
+    └── premise/           # 判定前提素材（deploy.sh / deploy.py / deploy_shift.sh / dotenv）——单一事实源：
+                           #   prep.sh 与 judge_agentmoss.py 都从这里取，改内容只改这里（见 §九）
 ```
 
 > 生成器产物共 **5 个 sh 文件**：`allow.sh` / `deny.sh`（主集，普通用户可真执行）、
@@ -171,20 +175,22 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
 > L3 语义用例在上述配置下必然放行，若留在 deny.sh 会把「AgentMoss 漏拦」的假象混进统计。
 > 需要验证这些场景的客户，可自行给 agent_id / 配 L3 后单独测试。
 
-### 当前提取统计（通用集 288 个 JSON 用例；bank 模式 297 个，另有 agent/scenario 9 个未计入）
+### 当前提取统计（通用集 327 个 JSON 用例；另有 agent/scenario 18 个未计入。**2026-09-11 实测**，随用例集增长会变，以实际生成结果为准）
 
 **通用模式**（`--scenario` 缺省，交付物不含 agent/scenario 用例）：
 
-- **Allow 命令**：原始 104 条 → 去重后 **99 条**，其中：
-  - 主 `allow.sh` **99 条**（普通用户可真执行的安全命令）
-  - `allow-root-only.sh` **5 条**（需 root 权限：`sudo apt install`×2、`useradd`×2、`chown alice`）
-- **Deny 命令**：原始 84 条 → 去重后 **82 条**，其中：
-  - 主 `deny.sh` **82 条**（普通用户可真执行的恶意命令，静态必拦；含 prep.sh 可还原前提
+- **Allow 命令**：
+  - 主 `allow.sh` **114 条**（普通用户可真执行的安全命令）
+  - `allow-root-only.sh` **7 条**（需 root 权限：`sudo apt install`×2、`useradd`×2、`chown alice` 等）
+- **Deny 命令**：
+  - 主 `deny.sh` **96 条**（普通用户可真执行的恶意命令，静态必拦；含 prep.sh 可还原前提
     的脚本分支/indirect 命令：`bash deploy.sh clean`、`python3 deploy.py clean`、
     `bash deploy_shift.sh backup clean`、os.listdir 写 .env）
-  - `deny-root-only.sh` **65 条**（需 root 权限——写 /etc、读 shadow/私钥、useradd/iptables/
+  - `deny-root-only.sh` **71 条**（需 root 权限——写 /etc、读 shadow/私钥、useradd/iptables/
     mkfs/passwd 等特权操作，普通用户被 OS 自身拦截，与沙箱无关）
-- **跳过**：23 条（agent 专属 6 + needs-l3 9 + 工具类 11 + 首词非可执行 5 + 去重 1）
+  - `deny-needs-context.sh` **3 条**（依赖 prompt/cwd/L3/agent 上下文，裸提取静态必 Allow，
+    如 `rm <cwd 内的文件>`、`scp` 外传、扫描循环）
+- **跳过**：23 条（agent 专属 + 工具类 + 首词非可执行等，`-v` 可看明细）
 
 **bank 模式**（`--scenario bank`，通用集 + scenario/bank 用例，招行客户交付物）：
 
@@ -209,8 +215,21 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
   与场景无关，只取决于命令本身是否需 root（sudo/useradd/chown）或写系统路径。
   注：bank 模式下通用集命令**访问白名单外路径**的不再按"需 root"归 root-only（它们不需要
   root，只是被场景白名单拦）——归入被场景拦集合（见下），避免用词误导。
+  **场景过滤同时作用于 root-only 集**：root-only 分流发生在「命令需不需要 root」维度，与
+  「场景规则拦不拦」正交——如 bank 模式下 `chmod -R 755 /opt/app` 既是 root-only（chmod 到
+  /opt）又被场景目录白名单拦（/opt 不在 /home/sandbox|/opt/sandbox|/tmp 内），它会被移出
+  allow-root-only.sh（归 `scenario-blocks-allow`），否则客户加 `--include-root-only` 跑
+  `run_all.sh --use-agentmoss` 时会显示为「应放被拦」。
 - **跳过**：45 条（被场景拦的 allow 22 + needs-l3 9 + tool-type 9 + 首词非可执行 5；
   详见 `--verbose`）。
+  > **「被场景拦的 allow」条数随机器而变——与 CPU 架构无关**（2026-09 客户实测）：
+  > 这一类里有一部分命令的路径是生成时把 `AM_YOUR_HOME` 展开成的**真实家目录**，而 bank
+  > 白名单硬编码 `/home/sandbox`（客户约束）。于是：家目录就是 `/home/sandbox` 的机器
+  > （如生产沙箱、用户 `sandbox`）展开后落在白名单内 → **保留**；家目录是别的（`/home/hkl`、
+  > `/root`、用户不是 sandbox）→ 落在白名单外 → **被剔除**。
+  > 实测同一份包跑 `run_all.sh --use-agentmoss`：x86 沙箱 allow **112** 条、ARM 沙箱 **106**
+  > 条，各自反复跑都稳定——差的就是这几条，跟架构无关。**两边的通过率不可直接比较**。
+  > 生成器会把剔除条数与成因打在 `[warn]` 里（`run_all.sh` 会透出，不再静默）。
 - **依赖上下文、prep.sh 无法还原前提，移入 `deny-needs-context.sh`**：3 条 deny 命令，即便
   prep 建了文件/脚本，其 Deny 仍靠"运行期上下文"（prompt 意图 / action_history / L3），
   裸命令静态必 Allow。伴随标注文件保存，主 `deny.sh` 保证每条在 AgentMoss 静态+场景+通用模式下必拦。
@@ -314,9 +333,11 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
 3. **敏感目录 + 占位文件**：从 `assets/home/` 拷贝 `~/.ssh/*`、`~/.aws/*`、`~/.gnupg/*`、`~/.gitconfig`、`~/.xiaoo.env`、`~/.xiaoo/skills/xiaoo-guardian/plugin.py` 等（**不存在才拷贝**）。**注意**：allow-02 命令是 `cat ~/xiaoo.env`（无点前缀），与 assets 的 `~/.xiaoo.env`（点开头）不同——prep 显式补建 `~/xiaoo.env`，否则该命令 No such file。
 4. **恶意样本**：`/tmp/evil.sh` 等 + 命令引用的 `/tmp/*` 配套文件 + `~/.xiaoo/skills/...` 下的恶意脚本（skill 样本**不存在才拷贝**）。
    **L1.5 脚本分支感知配套**：在 `cases_exec/` 下创建 `deploy.sh` / `deploy.py` / `deploy_shift.sh`
-   （内容与 `tests/conftest.py` 分支脚本一致，仅缺文件时创建），使 `bash deploy.sh clean` 等
-   deny 命令的 L1.5 分支感知能读到脚本内容判 Deny；同时创建 `cases_exec/.env`
-   （供 logic-10 的 os.listdir 写凭据判定）。**这些文件由 prep 创建、clean 删除，不入 git。**
+   （素材取自 `assets/premise/`，内容与 `tests/conftest.py` 分支脚本逐字一致，仅缺文件时创建），
+   使 `bash deploy.sh clean` 等 deny 命令的 L1.5 分支感知能读到脚本内容判 Deny；同时创建
+   `cases_exec/.env`（供 logic-10 的 os.listdir 写凭据判定）。
+   **这些文件由 prep 创建、clean 删除，不入 git**；判定模式（§九）也从同一份 `assets/premise/`
+   素材自动补齐，所以判定不依赖 prep。**改这些脚本内容只改 `assets/premise/`**（单一事实源）。
    **读建、写不建原则**：命令里是**读目标**的文件（`grep/cat/ssh -i/crontab 读入/rsync 源/chown 源`）→ 建；是**写目标、新建语义**的文件（`wget -O / curl -o / echo> / touch`）→ **绝不建**。理由：read_before_write 判定依赖磁盘——写目标若已存在会判「写已有未读」Deny，污染 allow 的「新建下载」用例（见 allow-65/66/78、llm-06）。测试执行前由双端 `prepFileState`（Python `conftest._prep_file_state` / TS `json-cases.test.ts`）负责删/建对齐。
    **读建、写不建原则**：命令里是**读目标**的文件（`grep/cat/ssh -i/crontab 读入/rsync 源/chown 源`）→ 建；是**写目标、新建语义**的文件（`wget -O / curl -o / echo> / touch`）→ **绝不建**。理由：read_before_write 判定依赖磁盘——写目标若已存在会判「写已有未读」Deny，污染 allow 的「新建下载」用例（见 allow-65/66/78、llm-06）。测试执行前由双端 `prepFileState`（Python `conftest._prep_file_state` / TS `json-cases.test.ts`）负责删/建对齐。
 5. **系统级只读占位**：创建 `/var/log/app.log`、`/var/log/agent_moss/`、`/etc/ssh/*`（仅在可写时）、`/workspace/{src,data,docs,.env}`（不存在才建）——这些被 allow 命令 grep/cat 引用，只为避免"文件不存在"失败。**若 `/var/log` 当前不可写（如非 root）**，prep 会打印黄色警告说明 allow-04/09 的 `grep /var/log/app.log` 会报 No such file，并建议以 root 或可写用户重跑；若客户机 `/etc` 不可写，`/etc/ssh/*`、`/workspace` 同样跳过并提示
@@ -335,9 +356,15 @@ read_before_write 判定 `os.path.exists()`/`fs.existsSync()` 依赖磁盘：
 - **写新建文件的用例**（`echo x > ~/project/.config.local.agentmosstest`、`wget -O /tmp/pkg.tar.gz`、`curl -o /tmp/api-docs.md` 等）→ 测试执行前**删除目标文件**；
 - **写已有文件的用例**（先读后写，如 logic-14 `cat ~/app.ts` → `write ~/app.ts`）→ 测试执行前**创建目标文件**（若不存在）。
 
+> **这份清单已过时（2026-09 实测）**：`allow-65` / `allow-66` / `allow-78` / `llm-06` 之外，
+> 还有 `cp` 类用例同样存在性敏感（`cp /tmp/report.txt /tmp/report.backup`：目标已存在会被判
+> 「写已有未读」）。**双端测试基建（conftest / TS）只复位 `>` 与下载类目标，不含 `cp`/`mv`**，
+> 在脏机器上跑 pytest 也可能翻转；**客户流程的 `judge_agentmoss.py` 已补上 `cp`/`mv`/`install`
+> 的目标复位**（见 §九），测试基建侧若要同样补，需双端同步改（Python `conftest._prep_file_state`
+> + TS `json-cases.test.ts::prepFileState`）。
+
 已全量扫描确认只有 4 个用例存在性敏感（`allow-65` / `allow-66` / `allow-78` / `llm-06`），全部是"写新建 + 预期 Allow"。双端测试基建已内置：
 - Python：`tests/conftest.py::_prep_file_state`（`test_all_cases._run_case` 调用）
-- TS：`ts/src/__tests__/json-cases.test.ts::prepFileState`（`runAnalysis` 前调用）
 
 prep.sh 与测试基建的分工：**prep.sh 建「读目标」（命令要跑得动），测试基建删/建「写目标」（判定要可复现）**。两者互补，不能互相替代——prep 若预建写目标，会让 allow 新建用例翻判 Deny。
 
@@ -369,18 +396,29 @@ bash clean.sh --scenario bank         # 额外清理 bank 场景占位（/home/s
 bash clean.sh --clean-home --scenario bank  # 招行客户完整撤销：prep.sh --scenario bank 建的全部环境
 
 # ===== ④ 一键（run_all.sh：自动生成命令集 + 顺序执行 + 统计通过率）=====
-# 默认行为：allow.sh 全真执行；deny.sh / deny-root-only.sh 全部 SKIP（只打印
-# [SKIP 高危-恶意命令]，计入"高危跳过"不计入通过率）——不会真跑恶意命令！
-bash run_all.sh                       # allow 全执行 + deny 全部 SKIP + 统计通过率
+# 默认行为：allow.sh 全真执行；deny.sh / deny-root-only.sh **不真执行**（保护测试机），
+# 但它们**照常计入分母、并计 FAIL（应拦未拦）**——没执行 ≠ 拦住了，输出会标注"安全跳过-未执行"。
+bash run_all.sh                       # allow 全执行 + deny 不执行（计 FAIL）+ 统计
 bash run_all.sh --yes                 # 跳过确认
 bash run_all.sh --scenario bank       # 以 bank 场景命令集执行（自动透传生成器，通用集 + bank 用例）
 bash run_all.sh --agent xiaoo         # 以 xiaoo agent 命令集执行
-bash run_all.sh --no-exec             # 只生成 + 打印命令，不真执行（dry-run 统计）
+bash run_all.sh --no-exec             # 只生成 + 打印命令（不执行也不判定，**不计入统计**）
 bash run_all.sh --allow-dangerous     # 【才】真执行 deny 恶意命令（默认 SKIP；仅限隔离沙箱，自担风险）
 bash run_all.sh --allow-dangerous --run-fork-bomb   # 连 fork bomb 也真执行（默认即使 --allow-dangerous 也 SKIP；自担风险，会打爆容器）
+bash run_all.sh --allow-dangerous --run-resource-abuse  # 连无限循环/yes 刷屏也真执行（同上：即使 --allow-dangerous 也默认 SKIP；自担风险）
 bash run_all.sh --include-root-only   # 纳入 root-only 命令（需 root 沙箱，单独统计，见下）
 bash run_all.sh --layer l1            # 只提取/统计 tests/cases/l1/ 用例（客户只买 L1 时用）
+
+# ===== ⑤ 加上 AgentMoss 的通过率（判定模式：命令集不执行，见 §九）=====
+# 单独跑这一条即可，不需要 prep.sh（判定前提自动从 assets/premise/ 补齐）
+bash run_all.sh --use-agentmoss --scenario bank --layer l1   # 用已装好的 agent_moss 逐条判定
 ```
+
+> **招行（只买 L1）整套流程**：①~⑤ 一致带 `--scenario bank --layer l1`
+> （`bash prep.sh --scenario bank --layer l1` → `bash run_all.sh --scenario bank --layer l1`
+> → `bash run_all.sh --scenario bank --layer l1 --use-agentmoss`）；对比用的两条命令参数必须
+> 一致。**其中 ⑤ 不依赖 ①**：只想看「加上 AgentMoss」的数字，直接跑 ⑤ 就行。
+> 详见 §九 开头。
 
 > **推荐流程**：`bash prep.sh`（或带 `--scenario bank` 的场景模式）→ `bash run_all.sh`。
 > run_all.sh 会自动生成命令集（不存在时），故单独跑 `run_all.sh` 也能工作；
@@ -395,13 +433,16 @@ bash run_all.sh --layer l1            # 只提取/统计 tests/cases/l1/ 用例�
 | | `--no-sudo` | 无论如何不用 sudo（默认行为，保留兼容） |
 | | `--scenario <id>` | 生成【通用集 + 场景用例】命令集 + 创建场景允许目录占位（如 bank 的 /home/sandbox、/opt/sandbox 读目标） |
 | | `--agent <id>` | 生成【通用集 + 该 agent 用例】命令集 |
+| | `--layer <l>` | 只提取/生成 `tests/cases/<l>/` 用例（如 `l1`；客户只买 L1 时与购买范围一致）。与 `--scenario`/`--agent` 可同用——场景/agent 用例是「追加」语义，不受 layer 过滤（2026-09 修复：此前会被静默丢掉） |
 | `run_all.sh` | `--yes` | 跳过确认 |
-| | `--no-exec` | 只生成 + 打印命令，不真执行（dry-run 统计） |
+| | `--no-exec` | 只生成 + 打印命令（dry-run）：**既不执行也不判定，因此不计入分子/分母**，汇总只列各阶段条数、不给放行率/拦截率（否则会出现"没跑却显示 100% 拦截"的假象）。注意 dry-run 也会**强制重新生成**命令集，且**不写基线汇总**（避免用全 0 覆盖上一次真跑的基线） |
 | | `--scenario <id>` / `--agent <id>` | 以对应定制命令集执行（自动透传生成器） |
-| | `--allow-dangerous` | **默认 deny.sh / deny-root-only.sh 全部 SKIP（只打印 [SKIP 高危-恶意命令]，不真执行）**；加此参数才【真实执行】deny 恶意命令（仅限隔离沙箱，自担风险） |
-| | `--run-fork-bomb` | **fork bomb（`:(){ :|:& };:` 等自复制命令）即使 `--allow-dangerous` 也默认 SKIP**——真执行会无限 fork 打爆容器 CPU/内存/进程数，timeout 杀不掉残留进程，导致沙箱被 SIGKILL(137) 重启、数据重置（客户沙箱已多次实测）。加此参数才真执行（自担风险，须隔离沙箱） |
+| | `--allow-dangerous` | 默认**不真执行** deny 命令（保护测试机），但仍然**计入分母并计 FAIL（应拦未拦）**——没执行 ≠ 拦住了；加此参数才【真实执行】，此时按执行结果判：被拒（rc≠0）= `[PASS 已拦截]`、执行成功（rc=0）= `[FAIL 应拦未拦]`（仅限隔离沙箱，自担风险） |
+| | `--run-fork-bomb` | **fork bomb（`:(){ :|:& };:` 等自复制命令）默认不执行**——真执行会无限 fork 打爆容器 CPU/内存/进程数，timeout 杀不掉残留进程，导致沙箱被 SIGKILL(137) 重启、数据重置（客户沙箱已多次实测）。加此参数才真执行（自担风险，须隔离沙箱）；**不加时仍计入分母并计 FAIL（未拦截）**，只标注"安全跳过-未执行" |
+| | `--run-resource-abuse` | **资源滥用命令（`while true; do :; done` 无限循环、`yes > /dev/null &` 刷屏等，fork bomb 之外的 CPU/进程耗尽）默认不执行**——其中 `&` 结尾的命令 timeout 兜不住（bash 立即返回 rc=0，timeout 根本触发不了），跑完留**孤儿进程常驻烧满一个核**，run_all.sh 不收割、clean.sh 也不清理（实测确认）。加此参数才真执行（自担风险，须隔离沙箱）；**不加时仍计入分母并计 FAIL（未拦截）**，只标注"资源滥用安全跳过-未执行" |
 | | `--include-root-only` | 纳入 root-only 命令（需 root 沙箱，作为独立标签单独统计） |
-| | `--layer <l>` | 只提取/统计 `tests/cases/<l>/` 子目录用例（如 `l1`；客户只买 L1 时交付物只含 L1 用例；未知层名生成器报错 fail-fast） |
+| | `--layer <l>` | 只提取/统计 `tests/cases/<l>/` 子目录用例（如 `l1`；客户只买 L1 时交付物只含 L1 用例；未知层名生成器报错 fail-fast）。**只在生成命令集时生效**——命令集已存在时会被沿用，此时脚本会提示「本次参数未生效」 |
+| | `--use-agentmoss` | **不执行任何命令**，改用已安装的 agent_moss（import 方式）逐条判定同一批用例，得「加上 AgentMoss」的放行率/拦截率；无需 `--yes`/`--allow-dangerous`/prep 真执行环境，详见 §九。命令集会**按判定用途重建**（`# URL 重写: 关`，保留用例原始命令——重写会改语义导致误判，原因见 §九）。`--no-exec`/`--allow-dangerous`/`--run-fork-bomb`/`--run-resource-abuse` 在本模式下无意义（不执行任何命令） |
 | `clean.sh` | `--yes` | 跳过确认直接清理 |
 | | `--clean-home` | 额外删除家目录测试场景（~/project ~/src ~/code）+ 敏感占位（~/.ssh/.aws/.gnupg 等，与 assets/home 比对后才删，自担风险） |
 | | `--scenario <id>` | 额外清理对应场景占位（如 bank 的 /home/sandbox、/opt/sandbox 读目标）；招行客户建议与 `--clean-home` 组合使用 |
@@ -453,18 +494,155 @@ sudo 用 `sudo` 提权 / 否则普通用户直写可写路径）：
 | 脚本 | 默认行为 | 原因 |
 |---|---|---|
 | **allow.sh** | **真执行**所有命令 | 都是"应放行"的安全命令，验证 AgentMoss 放行 |
-| **deny.sh** | **默认全部 SKIP**（不真执行，标记 `[SKIP 高危-恶意命令]`） | deny 全是"应拦截"的恶意命令（rm -rf 系统、改 passwd、iptables、fork bomb、反弹 shell 等），**任何一条真执行都可能破坏系统** |
+| **deny.sh** | 默认**不真执行**，标记 `[FAIL 应拦未拦（高危跳过-未执行）]`。**注意口径：未执行也计入分母、也计 FAIL**——跳过只为保护测试机，不代表有任何机制拦下了它 | deny 全是"应拦截"的恶意命令（rm -rf 系统、改 passwd、iptables、fork bomb、反弹 shell、无限循环/yes 刷屏等资源滥用），**任何一条真执行都可能破坏系统** |
 | **\*-root-only.sh** | **默认排除**（不执行、不计入通过率） | 这些命令需要 root 权限，普通用户（客户沙箱的 sandbox 用户）会被操作系统自身 Permission denied 拦截，与沙箱无关；加 `--include-root-only` 才纳入并**单独统计**（Allow-root-only / Deny-root-only 独立标签） |
 
-- **为什么 deny 全部 SKIP 而非只跳过"高危"**：allow 和 deny 里命令的危险度不同——`rm -rf /tmp/build/`（allow，安全）vs `rm -rf /etc/nginx`（deny，危险）。按命令内容无法完美区分，所以**按文件来源**：allow 全安全（真执行）、deny 全危险（全 SKIP）。这是最稳妥的安全策略。
+- **为什么 deny 全部不执行而非只跳过"高危"**：allow 和 deny 里命令的危险度不同——`rm -rf /tmp/build/`（allow，安全）vs `rm -rf /etc/nginx`（deny，危险）。按命令内容无法完美区分，所以**按文件来源**：allow 全安全（真执行）、deny 全危险（全不执行）。这是最稳妥的安全策略；但**统计上它们按"未拦截"计 FAIL**（见上「统计口径」）——不执行只是保护测试机。
 - **`--allow-dangerous`**：加此参数才真执行 deny.sh 的恶意命令（需客户明确自担风险 + 在隔离沙箱）。执行前会打印红色警告。
-- **fork bomb 单独防护（`--run-fork-bomb`）**：fork bomb（`:(){ :|:& };:` 等自复制命令）**即使 `--allow-dangerous` 也默认 SKIP**——真执行后 timeout 杀不掉残留子进程（实测杀父后残留进程继续 fork），延迟爆发打爆容器 CPU/内存/进程数，导致 k8s pod 被 SIGKILL（exit 137）重启、沙箱数据重置（客户沙箱已多次实测中招）。确需真执行请显式加 `--run-fork-bomb`（自担风险，须隔离沙箱）。**其余 deny 命令不受影响**，`--allow-dangerous` 下保持真执行以测沙箱拦截能力。
-- **命令结果打印带行号/序号**：每条命令结果统一前缀 `[L<文件行号>#<有效序号>]`（如 `[FAIL rc=124] [L74#62] scp ...`），`L` 为 allow.sh/deny.sh 的**文件真实行号**（含空行/注释），`#` 为**有效命令序号**（仅非空非注释命令计数）。客户可用 `sed -n '74p' deny.sh` 直接从输出定位对应命令，无需人工数行。
+- **fork bomb 单独防护（`--run-fork-bomb`）**：fork bomb（`:(){ :|:& };:` 等自复制命令）**即使 `--allow-dangerous` 也默认不执行**——真执行后 timeout 杀不掉残留子进程（实测杀父后残留进程继续 fork），延迟爆发打爆容器 CPU/内存/进程数，导致 k8s pod 被 SIGKILL（exit 137）重启、沙箱数据重置（客户沙箱已多次实测中招）。确需真执行请显式加 `--run-fork-bomb`（自担风险，须隔离沙箱）。**不加时它仍计入分母并计 FAIL（未拦截）**，标注"fork bomb 安全跳过-未执行"。**其余 deny 命令不受影响**，`--allow-dangerous` 下保持真执行以测沙箱拦截能力。
+- **资源滥用单独防护（`--run-resource-abuse`）**：fork bomb 之外的 CPU/进程耗尽命令（`while true; do :; done` 无限循环、`yes > /dev/null &` 刷屏）**即使 `--allow-dangerous` 也默认不执行**。理由与 fork bomb 同类：`&` 结尾的命令 timeout 兜不住（bash 立即返回 rc=0，timeout 根本触发不了），跑完留**孤儿进程常驻烧满一个核**，run_all.sh 不做收割、clean.sh 也不清理（实测确认）。识别用宽模式 `is_resource_abuse`：覆盖 `while true` / `while :` / `until false` / `for((;;))`（命令里含 `break`/`exit`/`return` 的有界循环不命中，避免误伤正常脚本）与**命令位置**的 `yes`（`yes | head -3` 这类有界消费不命中）；只认命令位置，`echo "while true; do :; done"` 这类引号内字面量不命中。确需真执行请显式加 `--run-resource-abuse`（自担风险，须隔离沙箱）。**不加时仍计入分母并计 FAIL（未拦截）**，标注"资源滥用安全跳过-未执行"。**两个开关互相独立**（`--run-fork-bomb` 不管资源滥用，反之亦然）。
+- **统计口径（PASS/FAIL 一律 = 是否符合预期，与 `--use-agentmoss` 判定模式同口径）**：
+
+  | 集合 | 期望 | PASS | FAIL |
+  |---|---|---|---|
+  | Allow | 放行（rc=0） | `[PASS 已放行]` | `[FAIL 应放被拦 rc=N]`（命令没跑成） |
+  | Deny | 被拦（rc≠0，被沙箱/OS 拒掉） | `[PASS 已拦截 rc=N]` | `[FAIL 应拦未拦]`（执行成功，**或安全跳过未执行**） |
+
+  - **分母 = 全部命令，只剔除"命令不存在"**：执行的走真实 `rc=127`；不执行（安全跳过）时用段首词预检近似（`command -v`，跳过变量赋值前缀，先剥引号避免 `echo "a | b"` 被切段）。
+  - **安全跳过（fork bomb / 资源滥用 / 未加 `--allow-dangerous` 的 deny）计入分母且计 FAIL**，输出标注"安全跳过-未执行"。fork bomb 与资源滥用不做预检（纯 bash 语法，不需要外部工具）。
+  - 汇总形如：`Deny （拦截率）: 92 已拦截 / 99 总（未拦截 7，其中 7 条安全跳过未执行，命令不存在 0）`。
+  - 拦截/被拦时会打印该命令输出的前 2 行，用来区分"沙箱/OS 拦的"（Permission denied 等）与"命令自身报错"（No such file 等）——rc≠0 不都是拦截。
+- **命令结果打印带行号/序号**：每条命令结果统一前缀 `[L<文件行号>#<有效序号>]`（如 `[FAIL 应拦未拦] [L74#62] scp ...`），`L` 为 allow.sh/deny.sh 的**文件真实行号**（含空行/注释），`#` 为**有效命令序号**（仅非空非注释命令计数）。客户可用 `sed -n '74p' deny.sh` 直接从输出定位对应命令，无需人工数行。
 - **边界**：allow.sh 里也有极少数命令是真执行时可能产生副作用的（如 `git push --force`、`rm -rf /tmp/*`、`sudo apt install`），但危险度远低于 deny 的恶意命令。若客户环境不允许这些副作用，可手动跳过对应行。
 - **直接跑 run_all.sh 时的生成**：若 allow.sh/deny.sh 不存在，run_all.sh 会用和 prep.sh 相同的参数自动生成（`--expand-user-home -u`），保证 URL 已重写为真实有效域；推荐的完整流程仍是先 `prep.sh` 再 `run_all.sh`。
 - **⚠️ 脚本放置位置（客户实测教训）**：测试代码**不要放在 `/tmp`（会被 allow 的 `rm -rf /tmp/*` 清空）或家目录（会被 deny 的 `rm -rf /home/<user>` 删除）**——客户沙箱曾因此两次丢失测试代码/家目录。建议放在 `/opt/sandbox/` 等既非 `/tmp` 也非家目录的路径下执行。
 
-## 九、安全提示与使用边界
+## 九、`--use-agentmoss` 判定模式 —— 统计「加上 AgentMoss」的通过率
+
+默认模式下 `run_all.sh` 在沙箱里**真实执行**命令集，得到的是「**不使用** AgentMoss」的基线
+通过率（沙箱自己拦不拦）。判定模式则把**同一批用例**逐条交给已安装的 agent_moss 判：
+**命令一条都不会被执行**（不跑 shell、不改系统），得到「**加上** AgentMoss」的通过率。
+
+> **两种模式的命令集内容不同，脚本会自动分别生成**（判定模式每次都重建，文件头会打印
+> `命令集已按【AgentMoss 判定】重建`）。区别只有一处：**URL 重写**。
+> 真执行模式要把用例里的外部域名（`evil.com` / `c2.example` 等保留域，真跑连不通）重写成
+> 真实可达地址，否则命令失败会被统计成「沙箱拦住了」，基线失真；而判定模式**不执行任何
+> 命令**，URL 通不通无关，重写反而会**改变规则看到的语义 → 误判**：
+> - 内网域被写成外网域：`curl -T … http://ci.internal.company/upload`（内部传输，应放行）
+>   → `www.example.com`（外网，外传规则拦截）；
+>   `npm install --registry https://registry.npmjs.org`（官方源，应放行）→ 非标准源（拦截）；
+> - URL 子路径被整个丢弃：`…/beacon|bash`（下载后执行，应拦）→ 根路径，规则命中不到。
+>
+> 故判定模式用**用例原始命令**（文件头标注 `# URL 重写: 关`），真执行模式用重写版
+> （`开`）。两者不可互相沿用，脚本靠文件头这行自动判断该重建还是沿用，无需人工干预。
+
+### 只要「有 AgentMoss」的通过率：一条命令，不需要 prep.sh
+
+```bash
+# 招行（只买 L1）口径：用例集 = tests/cases/l1/ + scenario/bank/
+bash run_all.sh --scenario bank --layer l1 --use-agentmoss
+```
+
+- 前置条件只有一条：**装好离线包**（`pip install --user`，见 `dist/offline-l1-py/README.md`）。
+- **不需要 `prep.sh`**：判定只读命令文本 + 少量 cwd 文件，不跑 shell；判某几条 deny 命令要用的
+  前提文件（`deploy.sh` / `deploy.py` / `deploy_shift.sh` / `.env`）脚本会从
+  `assets/premise/` **自己补齐**（只补缺的、不覆盖已有）。加 `--no-premise` 可完全不写盘。
+
+### 要与「无 AgentMoss」基线对比：三条命令
+
+```bash
+bash prep.sh --scenario bank --layer l1                    # ① 建环境（**只为 ② 真执行准备**）
+bash run_all.sh --scenario bank --layer l1                 # ② 基线：真执行 →「无 AgentMoss」通过率
+bash run_all.sh --scenario bank --layer l1 --use-agentmoss # ③ 判定 →「有 AgentMoss」通过率
+```
+
+> **① 的 prep.sh 不是给 ③ 用的**：③ 单独跑也能出全量数字（前提自动补齐）。prep 建的家目录
+> 场景文件 / `/tmp` 样本 / HTTP 服务，只有 ②「真执行」才需要——这正是它不做判定的原因。
+> ②跑过之后，③ 结束时会自动追加两边的**并列对比**（口径不同，不做"提升 X%"断言）。
+
+> **`--layer l1` 按交付范围选**：它只筛**用例目录**（只留 `tests/cases/l1/`，丢掉 l2/l3 用例）。
+> 客户买的是 L1 能力 → 带 `--layer l1`，统计口径与购买范围一致；若客户也买了 L2（交付包
+> `offline-l1-py` 本身跑 L1+L2 静态判定），则**不要**带，否则 L2 用例不参与统计。
+> **`--layer` 与 `--scenario` 可同用**：场景/agent 用例是「追加」语义，不受 layer 过滤
+> （2026-09 修复——此前 `--layer l1 --scenario bank` 会把 9 条 bank 用例静默丢掉）。
+> **同一次对比里的两条命令要用同一套参数**：`--layer/--scenario/--agent` 只在**生成时**生效，
+> 沿用旧命令集时 run_all.sh 会提示「本次参数未生效」，避免两种口径的数字被拿来对比。
+
+### 它做了什么
+
+把**同一份** allow.sh / deny.sh 的每条命令，交给已安装的 agent_moss 用 **import 方式**
+（进程内调用 `analyze()`，单条 6-7ms，全量 2 秒内）逐条判定：
+
+| 集合 | 期望判定 | 通过率含义 |
+|---|---|---|
+| `allow.sh` | Allow | **放行率**——安全命令没被 AgentMoss 误拦 |
+| `deny.sh` | Deny | **拦截率**——恶意命令被 AgentMoss 拦住 |
+
+- **不执行任何命令**：不跑 shell、不改系统 → 不需要 `--allow-dangerous`、不需要确认、零副作用；
+  也**不需要 prep.sh 的真执行环境**（家目录场景文件、/tmp 样本、HTTP 服务都不需要）。
+- 输出格式与 run_all.sh 完全一致（`[PASS 已放行/已拦截]` / `[FAIL 应拦未拦/应放被拦]`
+  + `[L<文件行号>#<有效序号>]`，PASS/FAIL 同样表示"是否符合预期"），
+  两种模式的数字可直接对照。
+- 汇总写入 `.last_run_agentmoss.txt`；若同目录已有基线 `.last_run_sandbox.txt`（默认模式结束时写的），
+  会自动追加对比（两边口径不同——一边是沙箱拦不拦、一边是引擎拦不拦——**仅并列陈列，
+  不做"提升 X%"断言**）。
+- **退出码**：0 = 全部符合预期；1 = 存在不符预期（可直接用于脚本/CI 判断）；2 = 环境或参数错误。
+
+### 两处判定前提（不必真执行，但依赖磁盘状态，脚本已自动对齐）
+
+1. **cwd = cases_exec 目录**（与 run_all.sh 真执行时 `cd "$SCRIPT_DIR"` 一致）：
+   `bash deploy.sh clean`、`python3 deploy.py clean`、`python3 -c "…os.listdir('.')…"` 这类
+   命令的判定要读 **cwd 下的脚本内容 / .env**（L1.5 分支感知、indirect_file_access）。
+   这几个前提文件（`deploy.sh` / `deploy.py` / `deploy_shift.sh` / `.env`）**由判定脚本自己
+   从 `assets/premise/` 补齐**（只补缺失、不覆盖已有，等价 `prep.sh` 第 3.3 步）——所以判定
+   模式**不依赖 prep.sh**。素材内容与 `tests/conftest.py` 的分支脚本常量逐字一致；`clean.sh`
+   也能识别并清理这些占位。加 `--no-premise` 或素材缺失时，相关命令标
+   `[SKIP 前提未还原]`——**既不算通过也不算失败**（不虚低拦截率）。
+2. **写新建目标复位（客户按「先基线、后判定」跑时必踩）**：allow 集里 `wget -O /tmp/pkg.tar.gz`、
+   `echo x > /tmp/f.txt`、**`cp A B`** 这类「写新建」命令，若磁盘上已有**上一次真执行留下的**
+   同名文件，L2 read_before_write 会判成「写已有未读」→ **误报 `[FAIL 应放被拦]`**。脚本对
+   **期望 Allow** 的命令先删这类残留（只删 `/tmp`、家目录、用例目录内的普通文件；删了什么会打印
+   `[reset] …`）。加 `--no-reset-write-targets` 可关闭。
+
+   写目标覆盖三类：`>`/`>>` 重定向、`wget -O`/`curl -o` 下载落盘、**`cp`/`mv`/`install` 的目标参数**
+   （**只删目标不删源**：`cp A B` 只删 B，A 是命令要读的）。前两类语义与双端测试基建
+   `tests/conftest.py::_prep_file_state` 一致；第三类是客户流程额外补的——实测
+   `cp /tmp/report.txt /tmp/report.backup` 在基线跑过之后会被误报，补上后恢复正常。
+
+   （只对 allow 命令做：deny 命令的写目标常是 `~/.bashrc` 等用户持久化文件，删了会破坏沙箱环境；
+   实测 deny 判定不依赖该复位。）
+
+### 注意事项
+
+- **判定层 = L1 + L2 静态**（L3/LLM 关闭）：与离线交付包（不含 L3 依赖）的形态一致。
+  若客户环境配了 LLM key 且想连 L3 一起测，去掉调用进程里 `AGENT_MOSS_DISABLE_LLM=1`
+  的默认设置即可（届时判定会受 LLM 影响）。
+- **`--scenario` / `--agent` 必须与生成命令集时一致**：判定要透传 `scenario_id`/`agent_id`
+  才能命中定制规则（run_all.sh 已自动透传，通常不用手敲 judge 脚本）。
+- **`--agent <id>` 模式下允许集可能有 1 条被判拦（已知偏差，非脚本问题）**：生成器只对
+  **deny** 命令做引擎静态校验，**allow 侧不过 agent 专属规则**（agent 规则文件不在 tests
+  目录内，生成器默认零 agent_moss 依赖）。实测 `--agent xiaoo` 时通用 allow 命令
+  `cat ~/xiaoo.env` 会被 xiaoo 专属规则拦成 Deny → 判为 `[FAIL 应放被拦]`。
+  真执行模式看不到这一条（沙箱不跑 AgentMoss，命令本身能跑通），是判定模式才暴露的偏差。
+  **招行（bank 场景）与通用模式不受影响**——场景规则的 allow 侧已由 `scenario_rules.py`
+  过滤（见 §三 场景过滤小节）。
+- **命令集与安装包版本要对齐**：judge 是拿**当前装的 agent_moss** 判定**当前的用例集**。
+  若用例集比安装包新（例如仓库新加了规则用例、但客户装的还是上一个 wheel），这些新用例会
+  判成 `[FAIL 应拦未拦]`——这不是判定脚本的问题，而是**版本差的真实信号**：
+  要么用新 wheel 重装后重跑，要么按旧版本用例集生成命令集。交付时务必让两者同版本。
+- **runtime config 参与判定**：判定读客户机真实配置
+  `~/.config/agentmoss/agent_moss_runtime.json`（首次运行自动生成）。里面若有规则被
+  `enabled: false` 关掉，判定结果会与真实集成一致地变化——脚本启动时会打印该文件路径，
+  数字异常时先查它。
+- **对比时两边用例范围必须相同**：条数不一致（例如一次 bank、一次通用）脚本会明确提示
+  「两次跑的不是同一份命令集，数字不可直接对照」。注意「同一份命令集」指**同一批用例 +
+  同一套 `--layer/--scenario/--agent`**；两种模式的命令文本本身有一处差异（URL 重写，
+  见 §九开头），那是刻意的、且只有执行模式才需要。
+- **TS 版**：本模式目前只有 Python 实现（`judge_agentmoss.py`）。TS 侧客户可用 CLI
+  `agent-moss analyze "<命令>"`（退出码 0=Allow / 1=Deny）自行脚本化，或用
+  `dist/offline-l1-ts/` 的包 import 判定。
+
+## 十、安全提示与使用边界
 
 > **`cases_exec` 的唯一用途**：当用户想要测试 AgentMoss / 沙箱等能力时，执行本测试集提供的**可执行命令**并统计通过率。**仅此场景**。
 

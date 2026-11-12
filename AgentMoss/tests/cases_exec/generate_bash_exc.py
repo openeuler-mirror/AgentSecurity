@@ -80,6 +80,12 @@ URL 重写（-u / --rewrite-urls）
     <output-dir>/deny-root-only.sh   # Deny 但需 root 权限（普通用户被 OS 拦截，不计入主集统计）
     文件头部注释含「共 N 条（去重后 M 条）」计数，与老文件格式一致。
     root-only 文件另附「需要 root 权限」说明块，解释为何不计入主集通过率。
+
+    头部另有 `# URL 重写: 开/关` 一行，标明本命令集是给**哪种用途**生成的：
+      开 = 加了 -u（真执行用，外部域名已重写为真实可连通地址）
+      关 = 未加 -u（AgentMoss 判定用，保留用例原始命令）
+    run_all.sh 靠这行判断目录里现存的命令集能否直接沿用——两种用途的命令**内容不同**
+    （重写会改变域名内外属性、丢弃 URL 子路径），沿用错了会误判，详见其生成段注释。
 """
 import argparse
 import glob
@@ -140,6 +146,67 @@ def rewrite_urls(cmd: str, base_url: str) -> str:
 def normalize(s: str) -> str:
     s = s.strip()
     return _WS_RE.sub(" ", s)
+
+
+def _warn_scenario_blocked(blocked: list, scenario_id: str, user_home: str | None) -> None:
+    """提示「因场景规则被剔除的 allow 命令」——必须说出来，否则会变成查无实据的怪现象。
+
+    命令集是**按本机环境**生成的（`--expand-user-home` 把 AM_YOUR_HOME 展开成真实家目录），
+    被剔除的条数因此随机器而变：实测同一份用例集，家目录 /home/sandbox 的机器 allow 112 条、
+    其他家目录 106 条。客户只会看到「同一个包，x86 跑 112、ARM 跑 106，还每次都一样」，
+    跟架构毫无关系却找不到原因（2026-09 客户实测踩到）。
+
+    最典型的成因：场景白名单硬编码了 /home/sandbox（bank 客户约束），而用例里「读写自己的
+    工程目录」那几条用的是 AM_YOUR_HOME 占位符——展开成真实家目录后落在白名单外，在场景下
+    必被拦，于是被剔除（不剔除的话客户跑 allow.sh 会判成「应放被拦」，虚低放行率且误导）。
+    """
+    dirs = ""
+    allowed_dirs: tuple = ()
+    try:
+        from scenario_rules import scenario_allowed_dirs  # 随 tests 分发
+        allowed_dirs = tuple(str(d) for d in scenario_allowed_dirs(scenario_id))
+        dirs = "、".join(allowed_dirs)
+    except ImportError:
+        pass
+
+    def _home_whitelisted() -> bool:
+        if not user_home:
+            return False
+        for d in allowed_dirs:
+            d = d.rstrip("/")
+            if user_home == d or user_home.startswith(d + "/"):
+                return True
+        return False
+
+    # 分两类说清楚，别混在一起——两类成因完全不同，混着报会把客户带偏：
+    #   家目录相关：换台家目录在白名单内的机器这几条**会保留**（条数随环境变，本次的重点）
+    #   其他：被场景规则拦掉，但与「家目录不在白名单」无关
+    #
+    # 家目录本身就在白名单内时，第一类不成立 —— 这些条目被拦是别的原因（实测：
+    # `/bin/ls /home/sandbox` 里的**命令绝对路径** `/bin/ls` 被当成访问白名单外路径）。
+    # 继续按「家目录不在白名单」报，会让客户照着去改家目录，白折腾。
+    home_rel = [] if _home_whitelisted() else [c for c in blocked if user_home and user_home in c]
+    others = [c for c in blocked if c not in home_rel]
+
+    print(f"[warn] {len(blocked)} 条 allow 命令会被 {scenario_id} 场景规则拦截，已从 allow "
+          f"命令集剔除（allow.sh / allow-root-only.sh；不计入放行率，避免客户跑成「应放被拦」）")
+    if home_rel:
+        print(f"[warn]   其中 {len(home_rel)} 条与**本机家目录**有关：家目录 {user_home} 不在 "
+              f"{scenario_id} 白名单（{dirs or '见场景规则'}）内——用例里用 AM_YOUR_HOME 写的"
+              f"「自己的工程目录」类命令，展开后落在白名单外，场景下必被拦")
+        print(f"[warn]   → 命令集条数**随家目录而变**：家目录在白名单内的机器（如生产沙箱）"
+              f"这 {len(home_rel)} 条会保留，两边通过率**不可直接比较**")
+        for c in home_rel[:3]:
+            print(f"[warn]     · {c[:80]}")
+        if len(home_rel) > 3:
+            print(f"[warn]     · …另有 {len(home_rel) - 3} 条")
+    if others:
+        print(f"[warn]   其余 {len(others)} 条被 {scenario_id} 场景规则拦截（与家目录无关）：")
+        for c in others[:3]:
+            print(f"[warn]     · {c[:80]}")
+        if len(others) > 3:
+            print(f"[warn]     · …另有 {len(others) - 3} 条")
+    print(f"[warn]   完整清单见 -v 输出的「跳过」列表")
 
 
 # 工具类 action_type：不产生 shell 命令，直接跳过
@@ -217,6 +284,11 @@ def _structurally_needs_context(d: dict, cmd: str) -> bool:
     reason = str(inp.get("reason", "") or "")
 
     # 静态可拦模式在先：任何命中都不转出（保底，防过宽误伤）
+    # 注：curl 上传变体（-T / --upload-file）单步无静态规则必拦——它的杀伤力来自
+    # L2 combo 组合链（如先 `| crontab` 装后门再 curl 外传），裸命令在判定模式
+    # 下必 Allow（无 history）。这类要留给下方 combo 检测移入 deny-needs-context.sh，
+    # 不能算 static_blockable，否则会被误留在主 deny.sh 导致判定模式 1 条 FAIL。
+    _curl_upload_variant = bool(re.search(r"\bcurl\b[^;&|\n]*(?:-T|--upload-file)\s", cmd))
     static_blockable = (
         any(sp in cmd for sp in (
             "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/passwd", "/etc/hosts",
@@ -225,9 +297,9 @@ def _structurally_needs_context(d: dict, cmd: str) -> bool:
             ".gnupg", "/etc/ssh/sshd_config", "chmod ", "chown ", "mkfs", "iptables",
             "masscan", "nmap ", "crontab", "passwd", "userdel", "groupdel", "dd if=",
             "rm -rf", "docker.sock", "base64 -d", "Fork", ":(){", "rebound", "/dev/tcp",
-            "wget ", "curl ", "kill -9", "systemctl",
+            "kill -9", "systemctl",
         ))
-        or ("curl" in cmd or "wget" in cmd)
+        or (("curl " in cmd or "wget " in cmd or "curl" in cmd or "wget" in cmd) and not _curl_upload_variant)
         or ("POST" in cmd)
     )
     if static_blockable:
@@ -249,8 +321,11 @@ def _structurally_needs_context(d: dict, cmd: str) -> bool:
     # 3) 组合攻击链（L2 combo）：单步无害的网络扫描循环，判 Deny 靠 action_history
     #    补全杀伤链 → 裸命令必 Allow。识别：for/seq 循环 + nc/-z 扫描 +
     #    "seq"、"nc -z" 等仅在历史组合下有意义的形态。
+    #    curl 上传变体（-T/--upload-file）同上：单步无害（如上传构建产物），
+    #    组合链中才构成"持久化后门→外传"杀伤链 → 裸命令必 Allow。
     if ("seq" in cmd and "nc " in cmd and "for " in cmd) or \
-       (re.search(r"\bnc\s+-z\b", cmd) and re.search(r"\bfor\b|\bseq\b", cmd)):
+       (re.search(r"\bnc\s+-z\b", cmd) and re.search(r"\bfor\b|\bseq\b", cmd)) or \
+       re.search(r"\bcurl\b[^;&|\n]*(?:-T|--upload-file)\s", cmd):
         return True
 
     return False
@@ -528,6 +603,7 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
     layer = (layer or "").strip().lower()
     scenario_root = Path(cases_dir) / "scenario"
     agent_root = Path(cases_dir) / "agent"
+    os_root = Path(cases_dir) / "os"
     if layer and layer not in ("l1", "l2", "l3"):
         print(f"错误：未知 --layer {layer!r}（支持 l1 / l2 / l3；留空表示全部基础层）",
               file=sys.stderr)
@@ -536,22 +612,34 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
     for p in json_files:
         in_agent = p.is_relative_to(agent_root)
         in_scenario = p.is_relative_to(scenario_root)
+        in_os = p.is_relative_to(os_root)
+        # 平台专属用例（os/windows|macos/*.json）**一律排除**，不进客户交付集：
+        # 客户沙箱是麒麟（Linux），这些用例只在对应平台的规则集下才有意义——
+        # Windows 的 type C:\\...\\SAM 在 Linux 规则下不命中，提出去必然「应拦未拦」，
+        # 等于交付一套跑不过的测试集。（将来若要交付 Windows 版测试集，再按
+        # --scenario 的透传模式加 --os windows 参数。）
+        if in_os:
+            continue
         if in_agent and not agent_id:
             continue  # 未指定 --agent → 排除 agent 子目录
         if in_scenario and not scenario_id:
             continue  # 未指定 --scenario → 排除 scenario 子目录
         if in_scenario and scenario_id and not p.is_relative_to(scenario_root / scenario_id):
             continue  # --scenario bank → 只追加 scenario/bank/，排除其他 scenario/<id>
-        # --layer l1/l2/l3 → 只保留对应基础层子目录（l1/、l2/、l3/ 之外的归类为其他）
+        # --layer l1/l2/l3 → 只保留对应基础层子目录。**场景/agent 是「追加」语义，
+        # 不受 layer 过滤**（与头部说明、末尾 warn 一致）：曾把 `scenario/bank/*.json`
+        # 当「非基础层归属」一并丢掉——`--layer l1 --scenario bank` 实测只留 266 个 l1
+        # 用例、9 个 bank 用例静默消失（客户按 L1 交付时看不到场景定制用例）。
         if layer:
             try:
                 p_sub = p.parent.relative_to(cases_dir).parts[0]
             except (ValueError, IndexError):
                 p_sub = ""
-            if p_sub not in ("l1", "l2", "l3"):
-                continue  # 排除 agent/scenario 之外的子目录归属，layer 严格分隔
-            if p_sub != layer:
-                continue
+            if p_sub in ("l1", "l2", "l3"):
+                if p_sub != layer:
+                    continue  # 其他基础层（未购买）→ 排除
+            elif not (in_agent or in_scenario):
+                continue  # 既非基础层也非 agent/scenario 追加目录（未知归属）→ 保守排除
         keep.append(p)
     json_files = keep
     if not json_files:
@@ -678,17 +766,31 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
     # 场景规则拦成 FAIL，虚低 allow 通过率且误导（这类命令场景下本不该放行）。
     # 判定用 scenario_rules.scenario_blocks_allow（自包含模块，零第三方依赖，
     # 逻辑对齐引擎——见模块头注释与 cases_exec/README.md 场景特例节）。
-    if scenario_id and allowed:
+    if scenario_id and (allowed or allowed_root):
         try:
             from scenario_rules import scenario_blocks_allow  # 随 tests 分发
         except ImportError:
             scenario_blocks_allow = None
         if scenario_blocks_allow is not None:
-            _blocked = [c for c in allowed if scenario_blocks_allow(c, scenario_id)]
-            if _blocked:
-                for c in _blocked:
+            # 主 allow 集与 allow-root-only 集**都要**过场景规则：root-only 分流发生在
+            # 「命令需不需要 root」这个维度，与「场景规则拦不拦」正交——例如 bank 模式下
+            # `chmod -R 755 /opt/app` 既是 root-only（chmod 目标在 /opt），又被场景目录
+            # 白名单拦（/opt 不在 /home/sandbox|/opt/sandbox|/tmp 内）。只过滤主集，这类
+            # 命令会留在 allow-root-only.sh 里；客户加 --include-root-only 跑
+            # `run_all.sh --use-agentmoss` 时就会显示成「应放被拦」（实测 2 条）。
+            _scenario_blocked: list = []
+
+            def _drop_scenario_blocked(bucket):
+                blocked = [c for c in bucket if scenario_blocks_allow(c, scenario_id)]
+                for c in blocked:
                     skipped.append((c[:60], f"scenario-blocks-allow: {scenario_id}", "bash"))
-                allowed = [c for c in allowed if c not in _blocked]
+                _scenario_blocked.extend(blocked)
+                return [c for c in bucket if c not in blocked]
+
+            allowed = _drop_scenario_blocked(allowed)
+            allowed_root = _drop_scenario_blocked(allowed_root)
+            if _scenario_blocked:
+                _warn_scenario_blocked(_scenario_blocked, scenario_id, user_home)
         # 模块缺失（正常不会）：保守保留全部 allow
 
     allow_uniq = dedupe(allowed)
@@ -699,6 +801,18 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
     # 写文件
     def write_sh(path: Path, label: str, items: list, raw_count: int,
                  root_only: bool = False):
+        # 头部标注「URL 重写: 开/关」——命令集有两种用途，**命令内容不同**，run_all.sh
+        # 靠这行判断目录里现存的命令集能不能直接沿用（判断模式拿到重写集 → 误判）：
+        #   开（默认，-u）：真执行用。外部域名重写成真实可连通地址，否则 curl/wget 真跑
+        #     时解析不了域名，基线通过率失真。
+        #   关：AgentMoss 判定用（run_all.sh --use-agentmoss）。判定**不执行任何命令**，
+        #     URL 通不通无关；而重写会改变规则看到的语义——①把内网域写成外网域
+        #     （ci.internal.company → www.example.com）②丢弃 URL 子路径
+        #     （…/beacon|bash → 根路径），两者都会让规则误判，故必须用原始命令。
+        if rewrite_urls_base:
+            url_note = f"# URL 重写: 开 → {rewrite_urls_base}（外部域名已重写，可真执行）\n"
+        else:
+            url_note = "# URL 重写: 关（保留用例原始命令，供 AgentMoss 判定）\n"
         if label in ("Deny", "Deny-root-only"):
             # Deny 用例含高危恶意命令（rm -rf /、改 passwd、fork bomb、反弹 shell 等），
             # 头部加强烈警告 + 使用边界声明，提醒仅在隔离沙箱执行。
@@ -707,7 +821,8 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
                 "# ============================================================================\n"
                 "# ！高 危 警 告 ！\n"
                 "# 本文件包含危险恶意命令，真实执行会破坏系统（rm -rf /、改 /etc/passwd、\n"
-                "# iptables 修改防火墙、fork bomb、反弹 shell、mkfs 格式化磁盘等）。\n"
+                "# iptables 修改防火墙、fork bomb、无限循环/yes 刷屏等资源滥用、反弹 shell、\n"
+                "# mkfs 格式化磁盘等）。\n"
                 "# 请务必在「隔离的测试沙箱 / 专用测试 VM」中执行，切勿在生产环境运行！\n"
                 "#\n"
                 "# 使 用 边 界 与 责 任 声 明：\n"
@@ -717,13 +832,15 @@ def extract_commands(cases_dir: Path, out_dir: Path, verbose: bool = False,
                 "# 因在本测试集范围外使用、或未充分评估后果而导致的任何损失，本项目不承担责任。\n"
                 "# ============================================================================\n"
                 f"# Deny 用例可执行命令（仅参考，勿执行！）共 {raw_count} 条（去重后 {len(items)} 条）\n"
-                "\n"
+                + url_note
+                + "\n"
             )
         else:
             header = (
                 "#!/bin/bash\n"
                 f"# {label} 用例可执行命令（仅参考，勿执行！）共 {raw_count} 条（去重后 {len(items)} 条）\n"
-                "\n"
+                + url_note
+                + "\n"
             )
         if root_only:
             # root-only 文件（allow 与 deny 通用说明）：命令本身需要 root 权限才能成功

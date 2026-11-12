@@ -1,7 +1,7 @@
 """Pydantic models for AgentMoss API requests and responses."""
 
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..__version__ import __version__
 
@@ -10,6 +10,9 @@ class ActionItem(BaseModel):
     """Single action description."""
     action_type: str = Field(..., description="Action type, e.g. bash, file_read, file_write")
     action_detail: str = Field(..., description="Action detail / command content")
+    #: 动作真实发生时间（调用方上报）。可选 —— 供 P4「提权→外传」时间窗口
+    #: 判定；缺省时该性质退回不设窗口的旧行为。
+    called_at: str = Field(default="", description="Action timestamp (optional)")
 
     class Config:
         extra = "allow"
@@ -43,7 +46,57 @@ class AnalyzeRequest(BaseModel):
     os_type: str = Field(default="", description="OS type: 'linux', 'windows', or empty for auto-detect")
     cwd: str = Field(default="", description="Current working directory for context-aware path detection")
     agent_id: str = Field(default="", description="Caller agent identifier, e.g. 'xiaoo' / 'opencode' / 'opendesk'. Empty = generic mode (no agent-specific rules).")
+    instance_id: str = Field(default="", description="Agent installation/instance identifier. Used only for display-layer redaction: nodes from the same instance are returned unredacted. Does not affect detection.")
     metadata: Optional[dict] = Field(default=None, description="Extended metadata (sandbox_id, trace_id, etc.)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _adapt_observable_format(cls, data):
+        """**校验前**把「AgentOS 可观测服务」的原始 syscall 格式转成标准格式。
+
+        为什么必须在校验前做（2026-10 修的坑）：原始格式用 `current_action` / `tool`
+        / `command` / `prompt` 这些键，而本模型把 `a_next`（含 action_type/action_detail）
+        声明为必填 —— 真正的原始 payload 会在校验处直接 **422**，永远到不了路由里的
+        `is_raw_format` 分支。也就是说 `adapters/observable.py` 与文档描述的
+        「可观测服务直接接入」一直是**不可达的死代码**。
+
+        放在模型层而不是路由里：① 任何构造 AnalyzeRequest 的地方（含未来新增入口）
+        都自动获得同样的适配；② 适配后仍走**严格的字段校验**（原始格式的 action_history
+        项只有 tool/command，不先适配就会 422）。
+        双端对称：TS 在 `routes.ts` 解析 zon schema 之前调用同一个语义的适配器。
+
+        防"变成静默放行"：适配后若拿不到任何动作（a_next 为空且没有 current_action），
+        直接抛错 → 422。否则畸形请求会被当成"未知动作"分析并大概率 Allow（fail-open）。
+        """
+        if not isinstance(data, dict):
+            return data
+        try:
+            from ..adapters.observable import ObservableAdapter, is_raw_format
+        except Exception:  # noqa: BLE001 — 适配层不可用时保持原样，交给常规校验
+            return data
+        if not is_raw_format(data):
+            return data
+        adapted = ObservableAdapter().adapt(data)
+        a_next = adapted.get("a_next") or {}
+        action_type = str(a_next.get("action_type") or "").strip().lower()
+        action_detail = str(a_next.get("action_detail") or "").strip()
+        if not action_detail and action_type in ("", "unknown"):
+            raise ValueError(
+                "无法识别本次动作：既没有 a_next（标准格式），也没有 current_action"
+                "（可观测服务原始格式）"
+            )
+        # 历史项统一成 ActionItem 形态：适配器用的是 name 键（兼容旧入口），
+        # 而 ActionItem 要求 action_type —— 不补齐仍会在 action_history 项上 422。
+        history = []
+        for h in adapted.get("action_history", []) or []:
+            hist_type = str(h.get("action_type") or h.get("name") or "")
+            item = {"action_type": hist_type, "action_detail": h.get("action_detail", "")}
+            if "output" in h:
+                item["output"] = h.get("output", "")
+            history.append(item)
+
+        # 原始 payload 里的 agent_id / session_id 由适配器兜底（见 ObservableAdapter.adapt）
+        return {**data, **adapted, "action_history": history}
 
 
 class ReviewRequest(BaseModel):
@@ -90,6 +143,9 @@ class AnalyzeResponse(BaseModel):
     # 组合攻击链反例路径：每步 [session_id, seq, stage, timestamp]，含真实发生时间
     violation_chain: list[list] = Field(default_factory=list,
                                         description="Combo-chain counterexample path with timestamps")
+    # 结构化攻击链图（前端可视化）：{"nodes": [...], "edges": [...]}
+    violation_graph: dict | None = Field(default=None,
+                                         description="Structured attack-chain graph for visualization")
 
 
 class HealthResponse(BaseModel):

@@ -5,26 +5,9 @@
 """
 
 import re
+from functools import cached_property
 
 from .base import OSProfile, CommandPattern, SensitivePath, IntentDeviationPattern
-
-_DEFAULT_INJECTION_KEYWORDS: list[dict] = [
-    # 复用与 Linux 相同的注入检测关键词（与语言无关的注入攻击）
-    {"keyword": "ignore previous instructions", "risk_level": "critical", "lang": "en"},
-    {"keyword": "forget everything", "risk_level": "high", "lang": "en"},
-    {"keyword": "忽略之前的指令", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "you are now", "risk_level": "high", "lang": "en"},
-    {"keyword": "system prompt", "risk_level": "high", "lang": "en"},
-    {"keyword": "reveal your instructions", "risk_level": "high", "lang": "en"},
-    {"keyword": "admin override", "risk_level": "critical", "lang": "en"},
-    {"keyword": "<script>", "risk_level": "high", "lang": "en"},
-    {"keyword": "developer mode", "risk_level": "critical", "lang": "en"},
-    {"keyword": "jailbreak", "risk_level": "critical", "lang": "en"},
-    {"keyword": "bypass audit", "risk_level": "critical", "lang": "en"},
-    {"keyword": "disable guard", "risk_level": "critical", "lang": "en"},
-    {"keyword": "绕过审计", "risk_level": "critical", "lang": "zh"},
-    {"keyword": "禁用安全检查", "risk_level": "critical", "lang": "zh"},
-]
 
 
 class WindowsProfile(OSProfile):
@@ -32,225 +15,104 @@ class WindowsProfile(OSProfile):
 
     os_type_value = "windows"
 
+    # 只加载 os=windows 的规则条目（Linux/macOS 条目一律不参与 Windows 判定）
+    accepted_os = ("windows",)
+
+    # 平台命令集（write_command_res / read_only_commands / fully_safe_commands /
+    # readonly_sensitive_commands / safe_action_types /
+    # readonly_sensitive_action_types / write_keywords / read_keywords）已迁到
+    # rules/platform_traits.json，由 OSProfile 基类统一读取 —— 本类不再覆盖。
+    # 注意：Windows 之所以必须独立一份，是因为命令体系与 Unix 不同
+    # （del/copy/icacls/reg 而非 rm/cp；type/findstr 而非 cat/head）。
+
     @property
     def os_type(self) -> str:
         return self.os_type_value
 
     # ─── 层1：危险命令模式 ───
 
-    @property
+    @cached_property
     def dangerous_commands(self) -> list[CommandPattern]:
+        """危险命令正则模式列表（归一化自 rules/l1_rules.json 的 Windows 段）。
+
+        与 LinuxProfile 共用同一份 JSON 单一事实源，靠 os 字段区分平台：
+        带 "os": "windows" 的条目仅 Windows Profile 加载；不带 os 字段的历史
+        条目视为 linux，Windows 不加载（避免 Linux 的 rm 规则误伤 Windows 命令）。
+        """
+        from ..rules_loader import load_l1
+        cmds = load_l1().get("dangerous_commands", [])
         return [
-            # 递归删除
             CommandPattern(
-                pattern=r"(?:del|rmdir|rd)\s+[\\/][a-zA-Z]:",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到递归删除关键路径 (del/rmdir C:\\)",
-            ),
-            CommandPattern(
-                pattern=r"del\s+[\\/][a-zA-Z]:",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到删除卷根目录文件 (del C:\\)",
-            ),
-            # 全权限设置
-            CommandPattern(
-                pattern=r"icacls\s+\*?\s*[\\/]?[a-zA-Z]:.*Everyone:F",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到授予 Everyone 完全控制权限",
-            ),
-            # 用户管理
-            CommandPattern(
-                pattern=r"net\s+user\s+[/]?add",
-                risk_level="high",
-                risk_type="privilege_escalation",
-                reason="检测到添加系统用户 (net user /add)",
-            ),
-            CommandPattern(
-                pattern=r"net\s+localgroup\s+[/]?add",
-                risk_level="high",
-                risk_type="privilege_escalation",
-                reason="检测到添加用户到本地组 (net localgroup /add)",
-            ),
-            # 注册表操作
-            CommandPattern(
-                pattern=r"reg\s+delete\s+HK",
-                risk_level="high",
-                risk_type="file_access",
-                reason="检测到删除注册表项 (reg delete)",
-            ),
-            # 磁盘格式化
-            CommandPattern(
-                pattern=r"format\s+[a-zA-Z]:",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到格式化磁盘操作",
-            ),
-            # PowerShell 编码执行
-            CommandPattern(
-                pattern=r"powershell\s+.*-EncodedCommand\b",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到 PowerShell 编码命令执行，可能隐藏恶意操作",
-            ),
-            CommandPattern(
-                pattern=r"powershell\s+.*-Command\s+\S",
-                risk_level="high",
-                risk_type="script_execution",
-                reason="检测到 PowerShell 命令执行",
-            ),
-            # 远程下载执行
-            CommandPattern(
-                pattern=r"(?:Invoke-WebRequest|Invoke-RestMethod|curl|wget)\s+.*?\.(?:ps1|exe|bat)\b",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到远程下载可执行脚本 (powershell curl)",
-            ),
-            # WMI 进程创建
-            CommandPattern(
-                pattern=r"wmic\s+process\s+call\s+create",
-                risk_level="high",
-                risk_type="script_execution",
-                reason="检测到 WMI 远程进程创建",
-            ),
-            # SAM 文件访问
-            CommandPattern(
-                pattern=r"config\\SAM",
-                risk_level="critical",
-                risk_type="file_access",
-                reason="检测到访问 Windows SAM 安全账户管理器",
-            ),
-            CommandPattern(
-                pattern=r"ntds\.dit",
-                risk_level="critical",
-                risk_type="file_access",
-                reason="检测到访问 Active Directory 数据库 (ntds.dit)",
-            ),
-            # 关闭防御
-            CommandPattern(
-                pattern=r"Set-MpPreference\s+.*DisableRealtimeMonitoring\s+\$true",
-                risk_level="critical",
-                risk_type="script_execution",
-                reason="检测到尝试关闭 Windows Defender 实时监控",
-            ),
-            CommandPattern(
-                pattern=r"netsh\s+advfirewall\s+set\s+allprofiles\s+state\s+off",
-                risk_level="high",
-                risk_type="script_execution",
-                reason="检测到尝试关闭 Windows 防火墙",
-            ),
-            # 计划任务
-            CommandPattern(
-                pattern=r"schtasks\s+[/]?create",
-                risk_level="high",
-                risk_type="persistence",
-                reason="检测到创建计划任务（持久化）",
-            ),
+                pattern=c["pattern"],
+                risk_level=c["risk_level"],
+                risk_type=c["risk_type"],
+                reason=c["reason"],
+                # 原始平台归属（不是加载它的 Profile）——MacOSProfile 继承
+                # Linux 规则时，Linux 条目仍标 linux，供 runtime 种子去重
+                os=str(c.get("os") or "linux").lower(),
+            )
+            for c in cmds
+            if str(c.get("os") or "linux").lower() in self.accepted_os
         ]
 
-    # ─── 安全命令白名单（两级） ───
-
-    @property
-    def fully_safe_commands(self) -> list[str]:
-        """完全安全的命令：跳过 L2 + L3"""
-        return [
-            r"^dir(?:\s|$)",
-            r"^where\s+",
-            r"^echo\s+",
-            r"^cd(?:\s|$)",
-            r"^tree(?:\s|$)",
-            r"^help(?:\s|$)",
-            r"^cls(?:\s|$)",
-            r"^ver(?:\s|$)",
-        ]
-
-    @property
-    def readonly_sensitive_commands(self) -> list[str]:
-        """安全但可能访问敏感路径的命令：跳过 L3，保留 L2"""
-        return [
-            r"^type\s+",
-            r"^findstr\s+",
-        ]
-
-    @property
-    def safe_commands(self) -> list[str]:
-        """向后兼容：合并为完整安全列表"""
-        return self.fully_safe_commands + self.readonly_sensitive_commands
-
-    @property
-    def safe_action_types(self) -> frozenset[str]:
-        """完全安全操作类型：跳过 L2 + L3"""
-        return frozenset({
-            "ask_user_question", "glob", "list_dir", "ls", "count_text_length",
-            "filemgr-globfiles",
-        })
-
-    @property
-    def readonly_sensitive_action_types(self) -> frozenset[str]:
-        """安全但可能访问敏感路径的操作类型：跳过 L3，保留 L2"""
-        return frozenset({
-            "read", "file_read", "read_file", "head", "tail", "grep",
-            "filemgr-readfile", "filemgr-grepfiles",
-        })
-
-    @property
-    def injection_keywords(self) -> list[dict]:
-        return _DEFAULT_INJECTION_KEYWORDS
+    # injection_keywords 各平台实现相同，已收拢到 OSProfile 基类（读
+    # rules/l1_rules.json 的注入段 + 按 os 过滤）。本类此前自带一份 14 条的
+    # 硬编码副本，与 JSON 的 48 条形成双向分叉，2026-10 删除。
 
     # ─── 层2：敏感路径 ───
 
-    @property
+    @cached_property
     def sensitive_paths(self) -> list[SensitivePath]:
+        """敏感路径列表（归一化自 rules/l1_rules.json 的敏感路径段，os=windows）。
+
+        与 LinuxProfile 共用同一份 JSON 单一事实源，靠 os 字段区分平台：
+        - 带 "os": "windows" 的条目 → 仅 Windows Profile 加载
+        - 不带 os 字段的历史条目 → 视为 linux，Windows 不加载
+
+        每条的 deny_mode 在 JSON 中显式声明（deny_both 表示读也拦）——
+        系统凭据库（SAM/SECURITY/NTDS）与用户私钥必须读也拦，否则
+        `type ...\\SAM` 这类只读窃取动作会直接放行。
+        """
+        from ..rules_loader import load_l1
+        sps = load_l1().get("sensitive_path_access", [])
         return [
-            SensitivePath(path="C:\\Windows\\System32\\config\\SAM", risk_level="critical", desc="Windows SAM 安全账户管理器"),
-            SensitivePath(path="C:\\Windows\\System32\\config\\SECURITY", risk_level="critical", desc="Windows 安全配置"),
-            SensitivePath(path="C:\\Windows\\System32\\config\\SYSTEM", risk_level="high", desc="Windows 系统配置"),
-            SensitivePath(path="C:\\Windows\\System32\\LSA", risk_level="high", desc="LSA 认证配置"),
-            SensitivePath(path="C:\\Windows\\NTDS", risk_level="critical", desc="Active Directory 数据库"),
-            SensitivePath(path="C:\\Windows\\repair", risk_level="high", desc="系统修复备份（含 SAM 备份）"),
-            SensitivePath(path="C:\\Windows\\System32\\GroupPolicy", risk_level="high", desc="组策略"),
-            SensitivePath(path="AppData\\Roaming\\.ssh\\", risk_level="critical", desc="SSH 密钥 (Windows)"),
-            SensitivePath(path="\\.ssh\\id_rsa", risk_level="critical", desc="SSH 私钥 (Windows)"),
-            SensitivePath(path="\\.ssh\\authorized_keys", risk_level="high", desc="SSH 授权密钥 (Windows)"),
-            SensitivePath(path="C:\\ProgramData\\", risk_level="medium", desc="程序数据目录（共享配置）"),
-            SensitivePath(path="HKLM\\SOFTWARE\\Microsoft\\", risk_level="high", desc="注册表 HKLM 软件配置"),
-            SensitivePath(path="HKLM\\SYSTEM\\CurrentControlSet\\", risk_level="critical", desc="注册表系统关键配置"),
-            SensitivePath(path="HKCU\\SOFTWARE\\Microsoft\\", risk_level="medium", desc="注册表 HKCU 软件配置"),
+            SensitivePath(
+                path=sp["path"],
+                risk_level=sp["risk_level"],
+                desc=sp["desc"],
+                deny_mode=sp.get("deny_mode", ""),
+                # ⚠️ credential / read_only 必须从 deny_mode 派生（TS 侧
+                # _loadSensitivePathScope 一直这么干）。历史 bug：这里不派生，
+                # 于是 sp.credential **恒为 False** —— _check_indirect_file_access
+                # 的 found_credential 分支成死代码，cwd 里只有凭据文件时 Python
+                # 判不出来（TS 能），两端分叉。
+                credential=sp.get("deny_mode", "") == "deny_both",
+                read_only=sp.get("deny_mode", "") == "deny_read",
+                dir_del_only=sp.get("dir_del_only", False),
+                os=str(sp.get("os") or "linux").lower(),
+            )
+            for sp in sps
+            if str(sp.get("os") or "linux").lower() in self.accepted_os
         ]
 
-    @property
-    def write_keywords(self) -> list[str]:
-        return [
-            "write", "写入", "save", "保存", "modify", "修改",
-            "update", "更新", "delete", "删除", "remove", "移除",
-            "create", "创建", "append", "追加", "overwrite", "覆盖",
-            "replace", "替换", "set", "设置", "reg", "注册表",
-        ]
-
-    @property
-    def read_keywords(self) -> list[str]:
-        return [
-            "read", "读取", "type", "findstr", "dir",
-            "view", "查看", "open", "打开", "load", "加载",
-            "search", "搜索", "find", "查找", "get", "获取",
-        ]
-
-    @property
+    @cached_property
     def intent_deviation_patterns(self) -> list[IntentDeviationPattern]:
+        """意图偏离关键词对（归一化自 rules/l2_rules.json，os=windows）。
+
+        与 Linux 共用同一份 JSON 单一事实源；Windows 的动作词（del/rmdir/
+        reg delete）与 Linux（rm/rmdir）不同，故按 os 字段区分平台。
+        """
+        from ..rules_loader import load_l2
+        pats = load_l2().get("intent_consistency", [])
         return [
             IntentDeviationPattern(
-                intent_keywords=["读取", "查看", "分析", "read", "analyze", "view", "list", "列出"],
-                # 英文词由 _match_dangerous_action 用词边界+排参数前缀匹配
-                dangerous_actions=["删除", "remove", "delete", "del", "rmdir", "格式化", "format"],
-                reason="原始意图为读取/分析，但执行了删除操作",
-            ),
-            IntentDeviationPattern(
-                intent_keywords=["查询", "搜索", "search", "query", "find"],
-                dangerous_actions=["修改", "write", "写入", "set", "alter", "reg delete"],
-                reason="原始意图为查询/搜索，但执行了修改操作",
-            ),
+                intent_keywords=p["intent_keywords"],
+                dangerous_actions=p["dangerous_actions"],
+                reason=p["reason"],
+                os=str(p.get("os") or "linux").lower(),
+            )
+            for p in pats
+            if str(p.get("os") or "linux").lower() in self.accepted_os
         ]
 
     # ─── 路径提取 ───

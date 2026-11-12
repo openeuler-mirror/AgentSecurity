@@ -308,7 +308,51 @@ def parse_if(content: str, args: list[str] | None) -> str | None:
     return f"{prefix}\n{chosen}\n{suffix}"
 
 
+# ==================== 非执行行剔除（shebang / 整行注释） ====================
+
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+
+
+def strip_non_executable_lines(content: str) -> str:
+    """剔除**不会执行**的行：首行 shebang 与整行注释，供 L1/L2/L3 扫描。
+
+    为什么（2026-09-30 实测）：脚本内容会被套用 L1 规则（含银行场景的目录白名单），
+    而 shebang 里的 `/bin/bash`、`/usr/bin/env` 以及注释里提到的路径都会被当成
+    "真实文件访问" → 命中场景白名单规则 → **整脚本 Deny**。表现是「任何带 shebang
+    的脚本，被 `bash x.sh` 调用就拦」—— 而客户沙箱里几乎每个运维脚本都带 shebang。
+    注释同理：`# 见 /etc/passwd` 不是访问，不该拦。
+
+    两个保守约束（都是防"剔出新漏报"）：
+    1. 只剔**整行**注释（行首空白后可跟 `#`），不动行尾注释 —— 尾注释与代码同行，
+       代码部分必须保留；
+    2. **heredoc 体内不剔**：`cat <<EOF` 与 `EOF` 之间是数据（会被写进文件/传给命令），
+       里面的 `# ...` 是内容不是注释，剔掉会漏掉其中的路径。
+    3. shebang 只认**首行**，避免误伤 heredoc 或字符串里的 `#!`。
+    """
+    if not content:
+        return content
+    out: list[str] = []
+    heredoc_end: str | None = None
+    for i, line in enumerate(content.split("\n")):
+        if heredoc_end is not None:
+            if line.strip() == heredoc_end:
+                heredoc_end = None
+            out.append(line)
+            continue
+        m = _HEREDOC_RE.search(line)
+        if m:
+            heredoc_end = m.group(1)
+        stripped = line.lstrip()
+        if i == 0 and stripped.startswith("#!"):
+            continue
+        if stripped.startswith("#"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 # ==================== 循环体（保守可达） ====================
+
 
 
 def _mark_loops_reachable(content: str) -> str:
@@ -409,6 +453,10 @@ class ShellBackend(LanguageBackend):
                 resolved = True
                 candidate = sym_out
                 bound = candidate  # bind 已在 symbolic 内完成
+
+        # 剔除不会执行的行（shebang / 整行注释）—— 见函数 docstring：
+        # 否则 shebang 里的 /bin/bash 会被当"访问白名单外路径"，整脚本被误拦。
+        bound = strip_non_executable_lines(bound)
 
         # 循环体保守标记（保留，不剔除）
         loop_marked = _mark_loops_reachable(bound)

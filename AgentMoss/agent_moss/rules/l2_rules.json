@@ -1,245 +1,288 @@
 {
- "intent_consistency": [
-  {
-   "intent_keywords": [
-    "读取",
-    "查看",
-    "分析",
-    "read",
-    "analyze",
-    "view",
-    "list",
-    "列出"
-   ],
-   "dangerous_actions": [
-    "删除",
-    "remove",
-    "delete",
-    "rm",
-    "格式化",
-    "format"
-   ],
-   "reason": "原始意图为读取/分析，但执行了删除操作"
-  },
-  {
-   "intent_keywords": [
-    "查询",
-    "搜索",
-    "search",
-    "query",
-    "find"
-   ],
-   "dangerous_actions": [
-    "修改",
-    "update",
-    "write",
-    "写入",
-    "alter"
-   ],
-   "reason": "原始意图为查询/搜索，但执行了修改操作"
+  "intent_consistency": [
+    {
+      "intent_keywords": [
+        "读取",
+        "查看",
+        "分析",
+        "read",
+        "analyze",
+        "view",
+        "list",
+        "列出"
+      ],
+      "dangerous_actions": [
+        "删除",
+        "remove",
+        "delete",
+        "rm",
+        "格式化",
+        "format"
+      ],
+      "reason": "原始意图为读取/分析，但执行了删除操作"
+    },
+    {
+      "intent_keywords": [
+        "查询",
+        "搜索",
+        "search",
+        "query",
+        "find"
+      ],
+      "dangerous_actions": [
+        "修改",
+        "update",
+        "write",
+        "写入",
+        "alter"
+      ],
+      "reason": "原始意图为查询/搜索，但执行了修改操作"
+    },
+    {
+      "intent_keywords": [
+        "读取",
+        "查看",
+        "分析",
+        "read",
+        "analyze",
+        "view",
+        "list",
+        "列出"
+      ],
+      "dangerous_actions": [
+        "删除",
+        "remove",
+        "delete",
+        "del",
+        "rmdir",
+        "格式化",
+        "format"
+      ],
+      "reason": "原始意图为读取/分析，但执行了删除操作",
+      "os": "windows"
+    },
+    {
+      "intent_keywords": [
+        "查询",
+        "搜索",
+        "search",
+        "query",
+        "find"
+      ],
+      "dangerous_actions": [
+        "修改",
+        "write",
+        "写入",
+        "set",
+        "alter",
+        "reg delete"
+      ],
+      "reason": "原始意图为查询/搜索，但执行了修改操作",
+      "os": "windows"
+    }
+  ],
+  "password_modify_consent": [
+    {
+      "pattern": "\\|\\s*passwd\\b"
+    },
+    {
+      "pattern": "\\bpasswd\\s+--stdin\\b"
+    },
+    {
+      "pattern": "\\bchpasswd\\b"
+    },
+    {
+      "pattern": "\\bchgpasswd\\b"
+    },
+    {
+      "pattern": "\\b(newusers|lnewusers)\\b"
+    },
+    {
+      "pattern": "\\bpasswd\\s+-[a-zA-Z]*d\\b"
+    },
+    {
+      "pattern": "\\bpasswd\\s+-[a-zA-Z]*l\\b"
+    }
+  ],
+  "user_deletion_consent": [
+    {
+      "pattern": "\\buserdel\\s"
+    },
+    {
+      "pattern": "\\bdeluser\\s"
+    },
+    {
+      "pattern": "\\bluserdel\\s"
+    },
+    {
+      "pattern": "\\bgroupdel\\s"
+    },
+    {
+      "pattern": "\\blgroupdel\\s"
+    }
+  ],
+  "combo_chains": {
+    "_comment": "L2 组合攻击链检测：单步操作可能无害，但按 kill chain 顺序组合即为后渗透攻击（参考 ChainWatch 六阶段 kill chain / 玄武实验室 Hermes 案例）。阶段 pattern 匹配 action_detail（含 tool call 参数），链定义要求至少 min_stages 个阶段按顺序出现才命中，防单步误报。A 会话内杀伤链 / D 提权-利用组合 / E 持久化-外联组合在 L2 实现（基于 action_history 子序列匹配）；B 跨会话组合链 / C 敏感数据传播链 / F 跨设备组合依赖行为图与数据流，由 formal_engine 实现。",
+    "stages": {
+      "PRIVESC": [
+        "\\b(?:pkexec|doas)\\b",
+        "\\bsudo\\s+-u\\s+root\\b",
+        "\\bsudo\\b[^;&|\\n]*(?:/bin/sh|/bin/bash|\\bchmod\\b|\\bsetcap\\b|\\bvisudo\\b|\\bpasswd\\s+root|\\buseradd\\b)",
+        "\\bchmod\\s+u\\+s\\b|\\bsetcap\\b|\\bsetuid\\b",
+        "\\bsu\\s+-?l?\\s+root\\b"
+      ],
+      "SCAN": [
+        "\\bnc\\s+-z\\b",
+        "\\bnmap\\b(?!\\s+--help\\b)",
+        "\\bmasscan\\b",
+        "\\bhping3\\b",
+        "\\bzenmap\\b",
+        "\\bseq\\b.*\\bnc\\b"
+      ],
+      "LISTEN": [
+        "\\bsocket\\s*\\([^)]*\\)\\s*[^;&|\\n]*(?:bind\\s*\\([^)]*\\)\\s*[^;&|\\n]*listen\\s*\\(|listen\\s*\\([^)]*\\)\\s*[^;&|\\n]*bind\\s*\\()",
+        "\\bflask\\b|\\bfastapi\\b",
+        "httpserver|http\\.server",
+        "\\bnc\\s+-l",
+        "\\bsocat\\b",
+        "nohup\\s+.*\\bpython",
+        "create\\s+.*listener",
+        "listen\\("
+      ],
+      "EXEC": [
+        "\\bpython3?\\s+-c\\s+['\\\"](?!.*(?:requests|urllib(?:\\.request)?|aiohttp|httpx)\\.(?:post|put|request|send)\\s*\\()(?![^'\\\"]*\\b(?:print|pprint|echo)\\s*\\()",
+        "\\b(?:bash|sh)\\s+-[ce]\\b",
+        "(?:^|[;&|\\s])(?!grep\\b|cat\\b|sed\\b|awk\\b|find\\b|less\\b|more\\b|head\\b|tail\\b)\\b(?:os\\.system\\b|subprocess\\b|shell\\s*=\\s*True\\b)",
+        "\\b(?:bash|sh)\\s+-[ce]\\b",
+        "\\beval\\s*[\\(\\s]|\\bexec\\s*\\(|/exec\\b",
+        "\\bperl\\s+-e\\b|\\bnode\\s+-e\\b|\\bphp\\s+-r\\b",
+        "\\./[\\w.-]+\\.(?:sh|py|pl)\\b"
+      ],
+      "EXFIL": [
+        "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|[^\\s]*\\.db|secret[^\\s]*)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
+        "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
+        "\\b(?:curl|wget)\\b[^;&|\\n]*\\s(?:-T|--upload-file)\\s+[^;&|\\n]*https?://(?!localhost|127\\.0\\.0\\.1)",
+        "[^;&|\\n]*\\|\\s*nc\\s+[^;&|\\n]*\\d{1,5}\\b",
+        "\\b(?:scp|sftp|rsync)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|id_dsa|credentials|\\S*secret\\S*|\\.ssh/)[^;&|\\n]*\\S+@\\S+:",
+        "\\bpython3?\\s+-c\\s+['\"][^'\"]*(?:requests|urllib(?:\\.request)?|aiohttp)\\.(?:post|put|request|send)\\s*\\([^'\"]*['\"]https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)"
+      ],
+      "CRED": [
+        "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*[~]?/\\.ssh(?:/[\\w.-]+)?\\b",
+        "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*(?:id_rsa|id_dsa|id_ecdsa|\\.aws/credentials|credentials\\.json|\\.netrc)",
+        "(?:cat|head|tail|less|more|sed|awk|strings|base64)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|/etc/master\\.passwd)",
+        "(?:cat|head|tail|less|more|grep)\\s+[^;&|\\n]*known_hosts",
+        "\\bpython3?\\s+-c\\s+['\\\"][\\s\\S]{0,200}?(?:base64\\.b64encode|open\\s*\\(|Path\\(|io\\.open\\s*\\(|read_text\\s*\\(|read\\s*\\()[\\s\\S]{0,200}?(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
+        "(?:grep|find|cat)\\s+[^;&|\\n]*\\b(?:password|secret|passwd|shadow|credential|api[_-]?key)\\b[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
+        "(?:cp|mv|dd|curl)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
+        "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd|cp|mv|grep|xxd|od)\\s+[^;&|\\n]*(?:\\.config/agentmoss/auth_token|\\.agentmoss/stateful_chains|agent_moss_policy_cache|agent_moss/rules|agent_moss/skills|agent_moss/agents/|agent_moss/scenarios/)"
+      ],
+      "PERSIST": [
+        "(?:echo|printf|cat)\\b[^;\\n]*\\|[^;\\n]*(?:crontab|at\\b)\\s*-",
+        "\\bsystemctl\\s+enable\\s+",
+        "(?:echo|printf)\\b[^;\\n]*(?:/dev/tcp/|nc\\s+-l|ncat|reverse|backdoor|bash\\s+-i)[^;\\n]*(?:>>|>)\\s*(?:~?/\\.bashrc|~?/\\.profile|/etc/rc\\.local|/etc/crontab)",
+        "\\bat\\s+now\\b|\\bchkconfig\\s+\\S+\\s+on\\b",
+        "\\bcrontab\\s+-e\\b"
+      ]
+    },
+    "chains": [
+      {
+        "id": "listener-exec-scan",
+        "stages": [
+          "LISTEN",
+          "EXEC",
+          "SCAN"
+        ],
+        "min_stages": 3,
+        "risk_level": "high",
+        "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 网络侦察"
+      },
+      {
+        "id": "listener-exec-cred",
+        "stages": [
+          "LISTEN",
+          "EXEC",
+          "CRED"
+        ],
+        "min_stages": 3,
+        "risk_level": "critical",
+        "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 访问凭据文件"
+      },
+      {
+        "id": "listener-exec-exfil",
+        "stages": [
+          "LISTEN",
+          "EXEC",
+          "EXFIL"
+        ],
+        "min_stages": 3,
+        "risk_level": "critical",
+        "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 数据外传"
+      },
+      {
+        "id": "listener-exec-persist",
+        "stages": [
+          "LISTEN",
+          "EXEC",
+          "PERSIST"
+        ],
+        "min_stages": 3,
+        "risk_level": "high",
+        "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 持久化后门"
+      },
+      {
+        "id": "exec-scan-cred",
+        "stages": [
+          "EXEC",
+          "SCAN",
+          "CRED"
+        ],
+        "min_stages": 3,
+        "risk_level": "high",
+        "reason": "组合攻击链：获取命令执行能力 → 网络侦察 → 访问凭据文件"
+      },
+      {
+        "id": "exec-privesc-cred",
+        "stages": [
+          "EXEC",
+          "PRIVESC",
+          "CRED"
+        ],
+        "min_stages": 3,
+        "risk_level": "high",
+        "reason": "组合攻击链：获取命令执行能力 → 提权 → 访问凭据文件"
+      },
+      {
+        "id": "privesc-cred-exfil",
+        "stages": [
+          "PRIVESC",
+          "CRED",
+          "EXFIL"
+        ],
+        "min_stages": 3,
+        "risk_level": "critical",
+        "reason": "组合攻击链：提权 → 访问凭据文件 → 数据外传"
+      },
+      {
+        "id": "persist-exfil",
+        "stages": [
+          "PERSIST",
+          "EXFIL"
+        ],
+        "min_stages": 2,
+        "risk_level": "high",
+        "reason": "组合攻击链：持久化后门 → 数据外传（C2 信标）"
+      },
+      {
+        "id": "exec-persist-exfil",
+        "stages": [
+          "EXEC",
+          "PERSIST",
+          "EXFIL"
+        ],
+        "min_stages": 3,
+        "risk_level": "critical",
+        "reason": "组合攻击链：获取命令执行能力 → 持久化后门 → 数据外传"
+      }
+    ]
   }
- ],
- "password_modify_consent": [
-  {
-   "pattern": "\\|\\s*passwd\\b"
-  },
-  {
-   "pattern": "\\bpasswd\\s+--stdin\\b"
-  },
-  {
-   "pattern": "\\bchpasswd\\b"
-  },
-  {
-   "pattern": "\\bchgpasswd\\b"
-  },
-  {
-   "pattern": "\\b(newusers|lnewusers)\\b"
-  },
-  {
-   "pattern": "\\bpasswd\\s+-[a-zA-Z]*d\\b"
-  },
-  {
-   "pattern": "\\bpasswd\\s+-[a-zA-Z]*l\\b"
-  }
- ],
- "user_deletion_consent": [
-  {
-   "pattern": "\\buserdel\\s"
-  },
-  {
-   "pattern": "\\bdeluser\\s"
-  },
-  {
-   "pattern": "\\bluserdel\\s"
-  },
-  {
-   "pattern": "\\bgroupdel\\s"
-  },
-  {
-   "pattern": "\\blgroupdel\\s"
-  }
- ],
- "combo_chains": {
-  "_comment": "L2 组合攻击链检测：单步操作可能无害，但按 kill chain 顺序组合即为后渗透攻击（参考 ChainWatch 六阶段 kill chain / 玄武实验室 Hermes 案例）。阶段 pattern 匹配 action_detail（含 tool call 参数），链定义要求至少 min_stages 个阶段按顺序出现才命中，防单步误报。A 会话内杀伤链 / D 提权-利用组合 / E 持久化-外联组合在 L2 实现（基于 action_history 子序列匹配）；B 跨会话组合链 / C 敏感数据传播链 / F 跨设备组合依赖行为图与数据流，由 formal_engine 实现。",
-  "stages": {
-   "PRIVESC": [
-    "\\b(?:pkexec|doas)\\b",
-    "\\bsudo\\s+-u\\s+root\\b",
-    "\\bsudo\\b[^;&|\\n]*(?:/bin/sh|/bin/bash|\\bchmod\\b|\\bsetcap\\b|\\bvisudo\\b|\\bpasswd\\s+root|\\buseradd\\b)",
-    "\\bchmod\\s+u\\+s\\b|\\bsetcap\\b|\\bsetuid\\b",
-    "\\bsu\\s+-?l?\\s+root\\b"
-   ],
-   "SCAN": [
-    "\\bnc\\s+-z\\b",
-    "\\bnmap\\b(?!\\s+--help\\b)",
-    "\\bmasscan\\b",
-    "\\bhping3\\b",
-    "\\bzenmap\\b",
-    "\\bseq\\b.*\\bnc\\b"
-   ],
-   "LISTEN": [
-    "\\bsocket\\s*\\([^)]*\\)\\s*[^;&|\\n]*(?:bind\\s*\\([^)]*\\)\\s*[^;&|\\n]*listen\\s*\\(|listen\\s*\\([^)]*\\)\\s*[^;&|\\n]*bind\\s*\\()",
-    "\\bflask\\b|\\bfastapi\\b",
-    "httpserver|http\\.server",
-    "\\bnc\\s+-l",
-    "\\bsocat\\b",
-    "nohup\\s+.*\\bpython",
-    "create\\s+.*listener",
-    "listen\\("
-   ],
-   "EXEC": [
-    "\\bpython3?\\s+-c\\s+['\\\"](?!.*(?:requests|urllib(?:\\.request)?|aiohttp|httpx)\\.(?:post|put|request|send)\\s*\\()(?![^'\\\"]*\\b(?:print|pprint|echo)\\s*\\()",
-    "\\b(?:bash|sh)\\s+-[ce]\\b",
-    "(?:^|[;&|\\s])(?!grep\\b|cat\\b|sed\\b|awk\\b|find\\b|less\\b|more\\b|head\\b|tail\\b)\\b(?:os\\.system\\b|subprocess\\b|shell\\s*=\\s*True\\b)",
-    "\\b(?:bash|sh)\\s+-[ce]\\b",
-    "\\beval\\s*[\\(\\s]|\\bexec\\s*\\(|/exec\\b",
-    "\\bperl\\s+-e\\b|\\bnode\\s+-e\\b|\\bphp\\s+-r\\b",
-    "\\./[\\w.-]+\\.(?:sh|py|pl)\\b"
-   ],
-   "EXFIL": [
-    "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|[^\\s]*\\.db|secret[^\\s]*)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
-    "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
-    "\\b(?:curl|wget)\\b[^;&|\\n]*\\s(?:-T|--upload-file)\\s+[^;&|\\n]*https?://(?!localhost|127\\.0\\.0\\.1)",
-    "[^;&|\\n]*\\|\\s*nc\\s+[^;&|\\n]*\\d{1,5}\\b",
-    "\\b(?:scp|sftp|rsync)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|id_dsa|credentials|\\S*secret\\S*|\\.ssh/)[^;&|\\n]*\\S+@\\S+:",
-    "\\bpython3?\\s+-c\\s+['\"][^'\"]*(?:requests|urllib(?:\\.request)?|aiohttp)\\.(?:post|put|request|send)\\s*\\([^'\"]*['\"]https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)"
-   ],
-   "CRED": [
-    "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*[~]?/\\.ssh(?:/[\\w.-]+)?\\b",
-    "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*(?:id_rsa|id_dsa|id_ecdsa|\\.aws/credentials|credentials\\.json|\\.netrc)",
-    "(?:cat|head|tail|less|more|sed|awk|strings|base64)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|/etc/master\\.passwd)",
-    "(?:cat|head|tail|less|more|grep)\\s+[^;&|\\n]*known_hosts",
-    "\\bpython3?\\s+-c\\s+['\\\"][\\s\\S]{0,200}?(?:base64\\.b64encode|open\\s*\\(|Path\\(|io\\.open\\s*\\(|read_text\\s*\\(|read\\s*\\()[\\s\\S]{0,200}?(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
-    "(?:grep|find|cat)\\s+[^;&|\\n]*\\b(?:password|secret|passwd|shadow|credential|api[_-]?key)\\b[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)",
-    "(?:cp|mv|dd|curl)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|\\.ssh)"
-   ],
-   "PERSIST": [
-    "(?:echo|printf|cat)\\b[^;\\n]*\\|[^;\\n]*(?:crontab|at\\b)\\s*-",
-    "\\bsystemctl\\s+enable\\s+",
-    "(?:echo|printf)\\b[^;\\n]*(?:/dev/tcp/|nc\\s+-l|ncat|reverse|backdoor|bash\\s+-i)[^;\\n]*(?:>>|>)\\s*(?:~?/\\.bashrc|~?/\\.profile|/etc/rc\\.local|/etc/crontab)",
-    "\\bat\\s+now\\b|\\bchkconfig\\s+\\S+\\s+on\\b",
-    "\\bcrontab\\s+-e\\b"
-   ]
-  },
-  "chains": [
-   {
-    "id": "listener-exec-scan",
-    "stages": [
-     "LISTEN",
-     "EXEC",
-     "SCAN"
-    ],
-    "min_stages": 3,
-    "risk_level": "high",
-    "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 网络侦察"
-   },
-   {
-    "id": "listener-exec-cred",
-    "stages": [
-     "LISTEN",
-     "EXEC",
-     "CRED"
-    ],
-    "min_stages": 3,
-    "risk_level": "critical",
-    "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 访问凭据文件"
-   },
-   {
-    "id": "listener-exec-exfil",
-    "stages": [
-     "LISTEN",
-     "EXEC",
-     "EXFIL"
-    ],
-    "min_stages": 3,
-    "risk_level": "critical",
-    "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 数据外传"
-   },
-   {
-    "id": "listener-exec-persist",
-    "stages": [
-     "LISTEN",
-     "EXEC",
-     "PERSIST"
-    ],
-    "min_stages": 3,
-    "risk_level": "high",
-    "reason": "组合攻击链：建立监听服务 → 获取命令执行能力 → 持久化后门"
-   },
-   {
-    "id": "exec-scan-cred",
-    "stages": [
-     "EXEC",
-     "SCAN",
-     "CRED"
-    ],
-    "min_stages": 3,
-    "risk_level": "high",
-    "reason": "组合攻击链：获取命令执行能力 → 网络侦察 → 访问凭据文件"
-   },
-   {
-    "id": "exec-privesc-cred",
-    "stages": [
-     "EXEC",
-     "PRIVESC",
-     "CRED"
-    ],
-    "min_stages": 3,
-    "risk_level": "high",
-    "reason": "组合攻击链：获取命令执行能力 → 提权 → 访问凭据文件"
-   },
-   {
-    "id": "privesc-cred-exfil",
-    "stages": [
-     "PRIVESC",
-     "CRED",
-     "EXFIL"
-    ],
-    "min_stages": 3,
-    "risk_level": "critical",
-    "reason": "组合攻击链：提权 → 访问凭据文件 → 数据外传"
-   },
-   {
-    "id": "persist-exfil",
-    "stages": [
-     "PERSIST",
-     "EXFIL"
-    ],
-    "min_stages": 2,
-    "risk_level": "high",
-    "reason": "组合攻击链：持久化后门 → 数据外传（C2 信标）"
-   },
-   {
-    "id": "exec-persist-exfil",
-    "stages": [
-     "EXEC",
-     "PERSIST",
-     "EXFIL"
-    ],
-    "min_stages": 3,
-    "risk_level": "critical",
-    "reason": "组合攻击链：获取命令执行能力 → 持久化后门 → 数据外传"
-   }
-  ]
- }
 }

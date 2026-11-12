@@ -20,12 +20,16 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Iterable
 
+from ...rules_loader import load_formal_rules
 from .builder import _mark_stage
 
+_FORMAL_RULES = load_formal_rules()
+_PM_RULES = _FORMAL_RULES.get("pattern_miner") or {}
+
 # 危险 stage：含这些的频繁组合才标记为候选攻击模式
-DANGER_STAGES = {"PRIVESC", "EXFIL", "LISTEN"}
+DANGER_STAGES = frozenset(_PM_RULES.get("danger_stages") or ())
 # 敏感双段：即便无危险 stage，CRED 紧邻 LISTEN 也算
-_SENSITIVE_PAIRS = {("CRED", "LISTEN"), ("LISTEN", "CRED")}
+_SENSITIVE_PAIRS = frozenset(tuple(p) for p in (_PM_RULES.get("sensitive_pairs") or ()))
 
 
 def project_stages(action_history: list[dict[str, Any]]) -> list[str]:

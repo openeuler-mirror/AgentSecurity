@@ -34,9 +34,9 @@ from ..profiles import get_profile
 from .heuristic import (
     HeuristicDetector, is_safe_bash_command,
     is_fully_safe_bash_command, is_readonly_sensitive_bash_command,
-    is_inline_script_command,
+    is_inline_script_command, build_path_context,
 )
-from .inline_analyzer import analyze_inline_script, is_literal_text_command
+from .inline_analyzer import analyze_inline_script, has_inline_danger_evidence, is_literal_text_command
 from .llm_analyzer import LLMAnalyzer
 from .logic_rules import LogicRulesChecker
 from .script_content_analyzer import (
@@ -44,30 +44,21 @@ from .script_content_analyzer import (
     scan_script_chain_with_l2,
     ScriptChainAnalysisResult,
 )
-from .skill_engine import SkillEngine
+from .skill_engine import SkillEngine, default_skills_dir
 from .types import HeuristicResult, SecurityJudgment
 
 logger = logging.getLogger(__name__)
 
-# 完全安全工具：跳过 Layer 2 + Layer 3（不具备读取文件内容的能力）
-FULLY_SAFE_TOOLS = frozenset({
-    "ask_user_question", "glob", "list_dir", "ls", "count_text_length",
-    "filemgr-globfiles",
-})
+# 完全安全工具 / 只读敏感工具两套 action_type 白名单已迁到
+# `rules/platform_traits.json`（safe_action_types / readonly_sensitive_action_types），
+# 由 profile 按平台解析（Python `OSProfile.safe_action_types`）。这里不再留副本 ——
+# 原来这里的常量与 platform_traits 的 linux 组逐字相同，调用点还 `or` 了两份，
+# 属于"改一处另一处不动"的漂移隐患。
 
 # 内置安全 Skill 白名单（通用 baseline）：空集。
 # 各宿主 agent 的专属内置安全 Skill 通过 agent_ext.builtin_safe_skills 注入，
 # 例如 xiaoO 的 xiaoo-guardian 由 agent_moss/agents/xiaoo/rules.json 提供。
 TRUSTED_SKILLS = frozenset()
-
-# 安全但可能访问敏感路径：跳过 Layer 3，保留 Layer 2 敏感路径检测
-READONLY_SENSITIVE_TOOLS = frozenset({
-    "read", "file_read", "read_file", "head", "tail", "grep",
-    "filemgr-readfile", "filemgr-grepfiles",
-})
-
-# 向后兼容
-READONLY_SAFE_TOOLS = FULLY_SAFE_TOOLS | READONLY_SENSITIVE_TOOLS
 
 
 class AgentMossBot:
@@ -117,6 +108,8 @@ class AgentMossBot:
         llm_log_path: str | None = None,
         prompt_history: list[dict[str, object]] | None = None,
         session_history: list[dict[str, object]] | None = None,
+        agent_id: str = "",
+        instance_id: str = "",
     ) -> SecurityJudgment:
         """
         执行三层防御安全判断。
@@ -149,6 +142,15 @@ class AgentMossBot:
                 source="disabled",
             )
 
+        # 层级开关**每次判定现读 runtime JSON**，不用 config 里可能已过期的
+        # security_cfg.* 快照 —— 否则手工编辑 runtime JSON 的 layers 要重启才生效
+        # （Console 改会主动失效 config 缓存，手工改不会）。is_layer_enabled 同时
+        # 覆盖 env > runtime > settings JSON 的优先级，语义不变。
+        from ..infra.runtime_config import is_layer_enabled
+        heuristic_enabled = is_layer_enabled("L1_heuristic")
+        logic_rules_enabled = is_layer_enabled("L2_logic_rules")
+        llm_analysis_enabled = is_layer_enabled("L3_llm_analysis")
+
         violated_layers: list[str] = []
 
         # ========== Brain 维护（节流，仅启用时） ==========
@@ -168,7 +170,7 @@ class AgentMossBot:
         skip_inline_file_access = False
 
         # ========== 层1: 特征匹配静态检测 ==========
-        if security_cfg.heuristic_enabled:
+        if heuristic_enabled:
             heuristic_result = self._heuristic_detector.detect(a_next, reason, prompt_session)
             logger.debug(
                 "特征匹配检测结果: hit=%s, risk_level=%s, reason=%s",
@@ -193,6 +195,8 @@ class AgentMossBot:
                     heuristic_result.risk_level in ("high", "critical")
                     or (heuristic_result.risk_level == "medium"
                         and heuristic_result.risk_type == "file_access")
+                    or (heuristic_result.risk_level == "medium"
+                        and heuristic_result.risk_type == "resource_exhaustion")
                 ) and not skip_inline_file_access
                 if should_deny_l1:
                     violated_layers.append("L1.1")
@@ -221,7 +225,12 @@ class AgentMossBot:
         # 也减少 L3 的 token 消耗（L1 可拦截的场景不再走 LLM）。
         script_chain_result: ScriptChainAnalysisResult | None = None
         _l15_action_type = a_next.get("action_type", "").lower()
-        _l15_action_detail = a_next.get("action_detail", "").lower()
+        # ⚠️ action_detail 必须原样透传，**不能 .lower()**：脚本路径要按原文去文件系统
+        # 解析，Linux 文件名大小写敏感。历史 bug：这里小写后 `bash Deploy.sh` 变成
+        # `bash deploy.sh` → tracker 找不到文件 → 整个脚本内容不被扫描 → Deny 变 Allow
+        # （实测 `bash Deploy.sh` 且 Deploy.sh 内含 `rm -rf /`：Python 放行、TS 拦截）。
+        # Deploy.sh / Setup.sh / Install.sh 这类带大写的脚本名极常见，等于 L1.2 整层失效。
+        _l15_action_detail = a_next.get("action_detail", "")
         if _l15_action_type == "bash":
             # 复用 HeuristicDetector 的 CommandPatternScanner（OS Profile 驱动）
             _scanner = self._heuristic_detector._command_scanner
@@ -229,7 +238,32 @@ class AgentMossBot:
                 _l15_action_type, _l15_action_detail, command_scanner=_scanner,
                 cwd=cwd,
             )
+            # ⚠️ 「脚本存在但内容读不了」（超过大小上限 / 权限）**不能当安全放行**：
+            # 否则把恶意脚本用注释撑到 2MB 就能让整个内容扫描静默跳过（实测
+            # `bash huge2mb.sh`（末尾 rm -rf /）→ Deny 变 Allow）。这与「脚本不存在」
+            # 本质不同：后者跑也跑不起来。客户可用 AGENT_MOSS_SCRIPT_MAX_FILE_SIZE 放宽。
             if script_chain_result and script_chain_result.nodes:
+                for node in script_chain_result.nodes:
+                    if getattr(node, "unanalyzable", False):
+                        violated_layers.append("L1.2")
+                        logger.info(
+                            "脚本内容无法分析（按不可信处理）: path=%s, err=%s",
+                            node.script_path, node.error,
+                        )
+                        return SecurityJudgment(
+                            allowed=False,
+                            reason=(
+                                f"脚本存在但内容无法静态分析（{node.error}）"
+                                f"—— 无法确认其安全性，按不可信处理。文件: {node.script_path}。"
+                                f"如确属正常大脚本，可设 AGENT_MOSS_SCRIPT_MAX_FILE_SIZE 放宽上限。"
+                            ),
+                            risk_level="high",
+                            risk_type="script_execution",
+                            confidence=80,
+                            source="heuristic_script_scan",
+                            action_desc=a_next.get("action_detail", ""),
+                            violated_layers=violated_layers,
+                        )
                 for node in script_chain_result.nodes:
                     if node.l1_hit and node.l1_risk_level in ("high", "critical"):
                         violated_layers.append("L1.2")
@@ -289,8 +323,7 @@ class AgentMossBot:
 
         is_agent_safe_action = any(_hit(t) for t in safe_action_types)
         is_fully_safe_tool = (
-            action_type in FULLY_SAFE_TOOLS
-            or action_type in self._profile.safe_action_types
+            action_type in self._profile.safe_action_types
             or is_agent_safe_action
         )
         # 内置安全 Skill 直接放行
@@ -346,7 +379,7 @@ class AgentMossBot:
 
         # --- 轻量放行：跳过 L3，保留 L2 ---
         skip_llm = False
-        if (action_type in READONLY_SENSITIVE_TOOLS or action_type in self._profile.readonly_sensitive_action_types) and no_high_risk:
+        if action_type in self._profile.readonly_sensitive_action_types and no_high_risk:
             skip_llm = True
         elif (
             action_type in ("bash", "executebash", "terminal-executebash")
@@ -361,7 +394,7 @@ class AgentMossBot:
             )
 
         # ========== 层2: 逻辑规则检测 ==========
-        if security_cfg.logic_rules_enabled:
+        if logic_rules_enabled:
             logic_result = self._logic_rules_checker.check(
                 prompt_session, action_history, a_next, reason, cwd=cwd,
                 prompt_history=prompt_history,
@@ -442,6 +475,51 @@ class AgentMossBot:
                         action_desc=a_next.get("action_detail", ""),
                         violated_layers=violated_layers,
                     )
+            else:
+                # ===== 内联脚本补位判定（NEW-FN，2026-09）=====
+                # 动机：内联脚本把危险动作藏在字符串里（os.system('rm -rf $HOME')），
+                # L1 的 rm 危险正则只认 `/` 开头绝对路径、HomeDeletionChecker 只认
+                # 「命令段首词是 rm」，两者都不命中；而 inline_analyzer 的静态语义判定
+                # 能够识别（实测 actionable=True 且判 Deny）。此前 inline 判定被绑在
+                # `effective_result is not None`（L1/L2 file_access 命中）块内，导致
+                # 这类命令三层都没人管 → 漏报。
+                # 补位条件（严格）：仅当 L1/L2 完全未命中 **且** 命令是内联脚本/文本输出
+                # 才调用；且只采纳 `actionable and not allowed` 的结论：
+                #   - 字面量（python -c "print('/etc/shadow')"、echo "rm -rf /"）→ inline 判 Allow → 不拦
+                #   - 正常内联脚本（print/json/console.log）→ inline 判 Allow → 不拦
+                # 实测（2026-09-11）对 8 个正常脚本 + 4 个字面量零误伤。
+                #
+                # ⚠️ 2026-11 修正：真内联脚本（python -c 等）必须**先有危险证据**
+                # （敏感路径 / rm -rf / mkfs / dd if= 等）才进本判定。此前只要求
+                # "是内联脚本"，而 analyze_inline_script 的步骤 2 只看读写调用词
+                # （open( / system( …），于是 `Image.open('/tmp/x.png')`、
+                # `print(open('/tmp/x').read())` 这类正常脚本被 critical 误杀
+                # （0.15.4 起）。无证据时不判定，交回后续 L2.2 / L3 语义分析
+                # （数据外传等仍由 L3 兜住）。
+                # echo/printf 保持无条件调用：步骤 2 已跳过它们，只用于提前 Allow 跳过 L3。
+                if is_literal_text_cmd or (
+                    is_inline_script_cmd
+                    and has_inline_danger_evidence(
+                        a_next.get("action_detail", ""), self._profile
+                    )
+                ):
+                    inline_judgment = analyze_inline_script(
+                        a_next.get("action_detail", ""), profile=self._profile
+                    )
+                    if inline_judgment.actionable and not inline_judgment.allowed:
+                        logger.info(
+                            "内联脚本补位判定拦截: reason=%s", inline_judgment.reason,
+                        )
+                        return SecurityJudgment(
+                            allowed=False,
+                            reason=inline_judgment.reason,
+                            risk_level=inline_judgment.risk_level,
+                            risk_type=inline_judgment.risk_type,
+                            confidence=90,
+                            source="logic_rule",
+                            action_desc=a_next.get("action_detail", ""),
+                            violated_layers=violated_layers + ["L2.1"],
+                        )
         else:
             from .types import LogicRuleResult
             logic_result = LogicRuleResult(hit=False)
@@ -452,21 +530,29 @@ class AgentMossBot:
         # 构建（向后兼容）；多 session 由调用方 session_history（含未来 agentgate
         # 非侵入式采集）提供，缺省时仅用当前 session → 行为与现状一致、零回归。
         # 门控：仅 L2 总开关（形式化属 L2，不设独立开关）
-        if security_cfg.logic_rules_enabled:
+        if logic_rules_enabled:
             formal_sessions = []
             if session_history:
                 for s in session_history:
                     formal_sessions.append({
                         "session_id": str(s.get("session_id", "s")),
+                        # 来源 agent/实例：仅记录在链路径里供告警/取证与展示脱敏，
+                        # 不参与链匹配
+                        "agent_id": str(s.get("agent_id") or ""),
+                        "instance_id": str(s.get("instance_id") or ""),
                         "action_history": s.get("action_history", []) or [],
                     })
             formal_sessions.append({
                 "session_id": "current",
+                "agent_id": agent_id or "",
+                "instance_id": instance_id,
                 "action_history": action_history,
             })
+            a_next_with_iid = dict(a_next)
+            a_next_with_iid["instance_id"] = instance_id
             formal_result = self._formal_engine.verify(
                 sessions=formal_sessions,
-                a_next=a_next,
+                a_next=a_next_with_iid,
             )
             if not formal_result.verified:
                 v = formal_result.first_violation
@@ -498,11 +584,16 @@ class AgentMossBot:
                         source="formal_engine",
                         action_desc=a_next.get("action_detail", ""),
                         violated_layers=violated_layers,
+                        violation_graph=getattr(v, "graph", None) if v else None,
+                        violation_chain=[
+                            list(x) if isinstance(x, (tuple, list)) else x
+                            for x in (v.path if v else [])
+                        ],
                     )
 
         # ========== L2.3: 脚本内容 L2 扫描（对预处理后脚本内容做 L2 规则检测） ==========
         # 对脚本调用链中每个节点的预处理内容，复用 L2 的敏感路径/危险模式/意图偏离检测。
-        if script_chain_result and script_chain_result.nodes and security_cfg.logic_rules_enabled:
+        if script_chain_result and script_chain_result.nodes and logic_rules_enabled:
             scan_script_chain_with_l2(
                 script_chain_result, self._logic_rules_checker, prompt_session
             )
@@ -551,7 +642,7 @@ class AgentMossBot:
                 violated_layers=violated_layers,
             )
 
-        llm_analysis_enabled = security_cfg.llm_analysis_enabled and is_llm_enabled()
+        llm_analysis_enabled = llm_analysis_enabled and is_llm_enabled()
 
         # 收集 L2 禁用且 skip_l3_on_disabled 的规则关键内容，命中时作为硬约束
         # 传给 L3：对这些路径/关键词必须放行，但 L3 仍分析命令其他部分的安全风险。
@@ -584,6 +675,9 @@ class AgentMossBot:
 
         if llm_analysis_enabled:
             try:
+                # 路径事实上下文：词法解析结果 + 符号链接未验证标注（2026-09，
+                # 修正 L3 对 ~/a/../b 形态「解析依赖存在性」的错误推理——见 allow-116）
+                path_context = build_path_context(action_detail)
                 llm_judgment = self._llm_analyzer.analyze(
                     prompt_session=prompt_session,
                     action_history=action_history,
@@ -597,6 +691,7 @@ class AgentMossBot:
                     script_chain_result=script_chain_result,
                     llm_log_path=llm_log_path,
                     prompt_history=prompt_history,
+                    path_context=path_context,
                 )
             except Exception as e:
                 logger.warning("LLM 分析异常: %s", e)
@@ -698,7 +793,7 @@ class AgentMossBot:
         from ..brain.rule_store import BrainRuleStore
         from ..brain.skill_manager import BrainSkillManager
 
-        _skills_dir = self._skills_dir or (Path(__file__).parent.parent / "skills")
+        _skills_dir = self._skills_dir or default_skills_dir()
         self._brain_rule_store = BrainRuleStore()
         self._brain_skill_manager = BrainSkillManager(
             skills_dir=_skills_dir, skill_engine=self._skill_engine
@@ -720,13 +815,13 @@ class AgentMossBot:
         try:
             from ..infra.runtime_config import (
                 get_enabled_l1_command_patterns_or_default,
-                has_runtime_config,
                 load_runtime_config,
             )
-            if has_runtime_config():
-                runtime = load_runtime_config()
-                enabled = get_enabled_l1_command_patterns_or_default(runtime)
-                if enabled:
+            # 不传 os_type：按当前运行环境取（Brain 的内置规则去重集，
+            # 与被检测环境一致即可）。runtime 覆盖按平台隔离在函数内部完成。
+            runtime = load_runtime_config()
+            enabled = get_enabled_l1_command_patterns_or_default(runtime)
+            if enabled:
                     for p in enabled:
                         if isinstance(p, dict):
                             builtin_patterns.append(p.get("pattern", ""))
@@ -849,6 +944,7 @@ def judge_security(
     llm_log_path: str | None = None,
     prompt_history: list[dict[str, object]] | None = None,
     session_history: list[dict[str, object]] | None = None,
+    instance_id: str = "",
 ) -> SecurityJudgment:
     """
     便捷函数：执行 AgentMoss 安全判断。
@@ -899,4 +995,4 @@ def judge_security(
         skills_dir=config.security.skills_dir,
         agent_ext=ext,
     )
-    return agent.judge(prompt_session, action_history, a_next, reason, config, llm_config=llm_config, cwd=cwd, llm_log_path=llm_log_path, prompt_history=prompt_history, session_history=session_history)
+    return agent.judge(prompt_session, action_history, a_next, reason, config, llm_config=llm_config, cwd=cwd, llm_log_path=llm_log_path, prompt_history=prompt_history, session_history=session_history, agent_id=agent_id, instance_id=instance_id)

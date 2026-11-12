@@ -27,7 +27,119 @@ if TYPE_CHECKING:
     from ..profiles.base import OSProfile
     from ..agents.base import AgentExtensions
 
+from ..rules_loader import (
+    load_heuristic_rules, load_inline, load_logic_rules, load_platform_traits,
+)
 from .types import LogicRuleResult
+
+# ── 间接文件访问检测的词表：单一事实源 rules/logic_rules.json ────────────────
+# 四组词原先内联在 _check_indirect_file_access 函数体里（TS 侧同样内联）。搬到
+# 模块级后再进 JSON，是因为它们直接决定「拦不拦」——属于规则，不是算法。
+_LOGIC_RULES = load_logic_rules()
+_IFA = (_LOGIC_RULES.get("indirect_file_access") or {}) if _LOGIC_RULES else {}
+_IFA_READ_KEYWORDS: tuple[str, ...] = tuple(_IFA.get("read_keywords") or ())
+_IFA_WRITE_KEYWORDS: tuple[str, ...] = tuple(_IFA.get("write_keywords") or ())
+_IFA_EXEC_KEYWORDS: tuple[str, ...] = tuple(_IFA.get("exec_keywords") or ())
+_IFA_OPEN_KEYWORDS: tuple[str, ...] = tuple(_IFA.get("open_keywords") or ())
+
+#: 工具名排除前缀：与 heuristic 的敏感路径排除名单是同一份，不另存。
+_EXCLUDED_PREFIXES: tuple[str, ...] = tuple(
+    load_heuristic_rules().get("sensitive_excluded_prefixes") or ()
+)
+#: 写判定豁免的非写工具前缀（**故意**比上面少一个 `skill-`，别合并）。
+_NON_WRITE_TOOL_PREFIXES: tuple[str, ...] = tuple(
+    _LOGIC_RULES.get("non_write_tool_prefixes") or ()
+)
+#: 写/删命令集合（逐段首词判定）。
+_WRITE_CMDS: frozenset[str] = frozenset(_LOGIC_RULES.get("write_commands") or ())
+#: 首个位置参数是源文件的命令（源在敏感目录 → 视为读取）。
+_SOURCE_ARG_CMDS: frozenset[str] = frozenset(_LOGIC_RULES.get("source_arg_commands") or ())
+#: 临时目录（批量删除豁免）。与 heuristic 的 L1 判定共用 heuristic_rules.json 那一份；
+#: 本模块按 startswith 用，故拼上尾随斜杠。
+_TEMP_DIRS: tuple[str, ...] = tuple(
+    d + "/" for d in (load_heuristic_rules().get("temp_dirs") or ())
+)
+#: 伪文件系统前缀：写这些路径是内核控制面动作，不存在「先读内容再覆写」的语义。
+_PSEUDO_FS_PREFIXES: tuple[str, ...] = ("/sys/", "/proc/", "/dev/", "/run/")
+
+# ==================== 引号感知命令段切分（NEW-FN-M，单一事实源）====================
+#: 切分器会把分隔符本身作为独立段返回，这些是分隔符段
+_SEPARATOR_SEGMENTS = frozenset({"&&", "||", ";", "\n", "|", "&"})
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    """引号感知的命令段切分：按 &&/||/;/换行/单|/单& 切段，滤掉分隔符段。
+
+    供 L2 各「逐段判定」复用（提权/写判定/路径提取/横向移动/删除判定）。
+    旧实现用裸 re.split(r"&&|\\|\\||;|\\n")——不引号感知、缺单管道：
+    - `cat f |tee g` 的 tee 写段在 read_before_write 里永远看不到（NEW-FN-M，M01/M02）；
+    - `echo x | sudo tee /etc/passwd` 的 sudo 段在提权判定里不可见（同族）；
+    - `echo "a; rm b"` 引号内的 ; 被切段（NEW-FP-I 已在别层感知，这里对齐）。
+
+    heuristic.py 的 `_split_shell_commands` 委托本函数（heuristic 已 import
+    logic_rules，反向导入会循环），保持单一事实源。
+
+    ⚠️ 不要写名为 `_split_command_segments` / `_split_shell_commands` 的函数：
+    heuristic.py 有同名实现（后者现委托本函数），同名冲突会静默改掉对方的分段行为
+    （历史事故：`df -h && rm -rf /` 被拼成 `df -hrm -rf /`，危险模式漏检）。
+    """
+    segments: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == ';' or ch == '\n':
+            segments.append("".join(cur))
+            segments.append(ch)
+            cur = []
+            i += 1
+            continue
+        if ch == '&':
+            if i + 1 < n and command[i + 1] == '&':
+                segments.append("".join(cur))
+                segments.append("&&")
+                cur = []
+                i += 2
+            else:
+                segments.append("".join(cur))
+                segments.append("&")
+                cur = []
+                i += 1
+            continue
+        if ch == '|':
+            if i + 1 < n and command[i + 1] == '|':
+                segments.append("".join(cur))
+                segments.append("||")
+                cur = []
+                i += 2
+            else:
+                segments.append("".join(cur))
+                segments.append("|")
+                cur = []
+                i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        segments.append("".join(cur))
+    return [
+        s for s in (seg.strip() for seg in segments)
+        if s and s not in _SEPARATOR_SEGMENTS
+    ]
+
 
 # ==================== 提权命令段判定（NEW-FP-J）====================
 # 提权关键词改为「命令位置」判定：只有段首词是提权命令才认为存在提权意图。
@@ -36,7 +148,7 @@ from .types import LogicRuleResult
 # 引号感知分段：echo "a; sudo rm" 的 ; 在引号内不分段，整段首词 echo 不触发。
 def _contains_privilege_escalation(action_detail: str) -> bool:
     ad = action_detail.lower()
-    for seg in re.split(r"&&|\|\||;|\n", ad):
+    for seg in _split_shell_segments(ad):
         seg = seg.strip()
         if not seg:
             continue
@@ -64,6 +176,78 @@ PASSWORD_MODIFY_PATTERNS: list[str] = _load_l2_patterns("password_modify_consent
 
 # 用户/组删除命令模式（归一化自 rules/l2_rules.json）
 USER_DELETION_PATTERNS: list[str] = _load_l2_patterns("user_deletion_consent")
+
+#: 授权提问的**相关性**判定：``ask_user_question`` 的提问正文是否与本类操作相关。
+#:
+#: 只在提问正文命中了密码/账户类关键词时，这条提问才有资格作为授权来源。
+CONSENT_TOPIC_PATTERN = re.compile(
+    r"密码|口令|passwd|password|凭据|凭证|用户|账户|账号|userdel|deluser|groupdel",
+    re.IGNORECASE,
+)
+
+#: 用户回答的**否定词**。命中即视为拒绝 —— 优先于肯定词判定（「不，别删」含否定）。
+CONSENT_NEGATIVE_PATTERN = re.compile(
+    r"(?:"
+    r"否|不|别|取消|拒绝|停止|终止|算了|算了|"
+    r"\bno\b|\bnope\b|\bcancel\b|\babort\b|\bstop\b|\bdeny\b|\breject\b|"
+    r"\bdecline\b|\bdon'?t\b|\bdo\s+not\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: 用户回答的**肯定词**。否定词优先；两者都不命中 → 意图无法判定 → 不算授权。
+CONSENT_AFFIRMATIVE_PATTERN = re.compile(
+    r"(?:"
+    r"是|好|可以|行|嗯|对|确认|同意|继续|执行|删除|删掉|移除|修改|重置|改密|"
+    r"\byes\b|\by\b|\byep\b|\byeah\b|\bok\b|\bokay\b|\bconfirm(?:ed)?\b|"
+    r"\bproceed\b|\bcontinue\b|\bsure\b|\bapprove\b|\baccept\b|\bagree\b|"
+    r"\bdo\s+it\b|\bgo\s+ahead\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: **索取型**提问：agent 向用户**索取凭据/内容**（而不是征求同意）。
+#:
+#: 「请输入新的登录密码」这类提问，用户的回答就是密码本身（`mypassword`），
+#: 不可能出现「是/好/确认」——用户提供了内容即视为配合改密。区别于确认型提问
+#: （「确认删除用户 ops 吗？」），后者必须拿到肯定回答。
+CONSENT_INPUT_REQUEST_PATTERN = re.compile(
+    r"(?:请|输入|提供|填写|给出|告诉我).{0,8}(?:新的?)?(?:密码|口令|passwd|password)",
+    re.IGNORECASE,
+)
+
+#: 授权提问必须落在**最近 N 条动作**内。
+#:
+#: 防「预支授权」：一小时前问过「要重启服务吗」用户答「是」，不能拿来删今天的用户。
+#: 正常流程是「问 → 答 → 立刻执行」，中间隔着大量无关动作说明这条提问与本次操作无关。
+#: 取最近一条 ``ask_user_question`` 判定，更早的一律不认（不做「往前翻找任意一条」）。
+CONSENT_MAX_DISTANCE = 5
+
+#: 授权时效（秒）。仅当提问与本次动作**都**带 ``called_at`` 时生效；缺任一侧则跳过
+#: 时间窗，由 ``CONSENT_MAX_DISTANCE`` 兜底。可用环境变量覆盖。
+CONSENT_TTL_SECONDS = 300
+
+#: 「shell 工具」的动作类型集合。
+#:
+#: 与 L2 其他规则（read_before_write / 写意图判定）保持同一口径：OpenDesk 注册的
+#: ``executeBash``（以及旧版 ``terminal-executeBash``）同样是 shell 工具。授权类规则
+#: 只认裸 ``bash`` 时，经 AgentGate 透传的工具名会让整条规则**命中不了** ——
+#: 不是「判未授权」，而是「规则根本没跑」（OpenDesk 链路实测缺陷）。
+BASH_LIKE_ACTION_TYPES = ("bash", "executebash", "terminal-executebash")
+
+#: 「向用户提问」的动作类型：标准名 + OpenDesk 注册名。
+#:
+#: OpenDesk 的 AskUserTool 注册名是 ``askUser``（消息里也可能带 ``interaction-`` 前缀）。
+#: AgentGate 未做工具名归一化时，历史里的提问会以 ``askuser`` 出现 —— 只认
+#: ``ask_user_question`` 会把真实授权判成「没问过」，用户答「是」也照样拦。
+ASK_USER_ACTION_TYPES = ("ask_user_question", "askuser")
+
+
+def _is_ask_user_action(action_type: str) -> bool:
+    """动作类型是否为「向用户提问」。兼容裸名与 ``<ns>-askUser`` 命名空间前缀。"""
+    if action_type in ASK_USER_ACTION_TYPES:
+        return True
+    return action_type.endswith("-askuser")
 
 # ==================== 组合攻击链检测（combo_chain）====================
 # 单步操作（创建 Flask 服务 / 端口扫描 / 读 known_hosts）各自无害，但按 kill chain
@@ -98,53 +282,31 @@ def _init_combo_chains() -> None:
 
 _init_combo_chains()
 
-# ==================== 只读命令集合（用于重定向写判定与敏感路径读写区分）====================
-# 这些命令本身只读，即使带 > 重定向也不应判为写文件意图。
-# 1) 传统文本查看/过滤命令
-# 2) 只读系统信息查询命令（lsblk/blockdev/smartctl/udevadm/dmidecode 等，常配 2>/dev/null 查设备信息）
-READ_ONLY_COMMANDS: set[str] = {
-    # 传统文本查看/过滤
-    "cat", "head", "tail", "less", "more", "grep", "find", "awk", "sed",
-    "sort", "uniq", "wc", "cut", "strings", "od", "xxd", "hexdump", "tr",
-    "file", "stat", "du", "df", "ls", "dir", "tree", "nl", "tac", "rev",
-    # NEW-FP-I: echo/printf 是文本输出命令，参数是字面量非写目标。加入此集让
-    # read_before_write 的 echo 段走只读命令分支（只提取重定向目标，不提取参数路径），
-    # 避免 echo "cat /etc/shadow" > /tmp/x.sh 的引号内 /etc/shadow 被当写目标误报。
-    # echo "x" > /tmp/x.sh 的重定向目标 /tmp/x.sh 仍被提取（真实写不漏报）。
-    "echo", "printf",
-    # 只读系统/设备信息查询
-    "lsblk", "blockdev", "smartctl", "udevadm", "dmidecode", "lscpu", "lspci",
-    "lsusb", "lsmem", "lsns", "lsof", "hwinfo", "inxi", "fdisk", "parted",
-    "dmesg", "journalctl", "systemctl", "hostnamectl", "localectl", "timedatectl",
-    "ps", "top", "free", "vmstat", "iostat", "mpstat", "pidof", "pgrep",
-    "ip", "ifconfig", "route", "ss", "netstat", "arp", "ethtool", "nmcli",
-    "uname", "arch", "nproc", "getconf", "getent", "id", "whoami", "who",
-    "w", "last", "uptime", "lsmod", "modinfo", "sysctl",
-}
+# ==================== 只读命令集合 ====================
+# 2026-10 删除：这里曾有一份 `READ_ONLY_COMMANDS` 模块级常量，是 `profiles/*.py`
+# `read_only_commands` 的**历史重复副本**（profile 化改造后已无人引用，只剩注释里
+# 提到名字）。只读命中的实际来源是 `OSProfile.read_only_commands`，现读
+# `rules/platform_traits.json` 的 `read_only_commands`（单一事实源）。
+# 留下这些注释是因为下方多处注释仍以 "READ_ONLY_COMMANDS" 指代这个概念。
 
 # 重定向到 /dev/null 的丢弃写法（2>/dev/null、&>/dev/null、>/dev/null）——这是丢弃输出的标准
 # shell 实践，不是写文件意图，不应计入"写操作"判定。
 _DEVNULL_REDIRECT_RE = re.compile(r"(?:2|&|1)?\s*>\s*/dev/null\b")
 
+# sed 原地写统一判定（NEW-FN-P，单一事实源）：-i 及其组合位（-in/-ri）、--in-place，
+# 允许中间隔其他 flag（sed -n -i）。rbw 写段判定/写操作判定/路径提取三处共用。
+SED_INPLACE_RE = re.compile(r"\bsed\s+(?:-\S+\s+)*(?:-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b")
+
 # ==================== 写/删命令模式（用于写操作判定）====================
 # WRITE_KEYWORDS 走子串匹配，无法可靠识别 rm/cp/dd 等命令（"rm" 会误命中 arm/form），
 # 故单独用词边界正则识别这些命令出现即视为写/删意图。覆盖：删除、复制写入、重定向写入、
 # 块设备写入、文件系统格式化等。
+#
+# 数据源 = `rules/platform_traits.json` 的 `linux.write_command_res`（逐字相同）。
+# 原先这里另抄了一份完全一样的 14 条正则；TS 侧 2026-10 已删掉自己那份，这次把
+# Python 的剩余副本也去掉。`profile` 缺省时才用这份 linux 兜底（生产调用点都传 profile）。
 _WRITE_COMMAND_RES = [
-    re.compile(r"\brm\b"),          # 删除文件
-    re.compile(r"\bunlink\b"),      # 删除文件
-    re.compile(r"\brmdir\b"),       # 删除目录
-    re.compile(r"\bshred\b"),       # 安全擦除
-    re.compile(r"\bcp\b"),          # 复制（会写目标）
-    re.compile(r"\bmv\b"),          # 移动（覆盖目标）
-    re.compile(r"\binstall\b"),     # 复制并设置属性
-    re.compile(r"\btee\b"),         # 从 stdin 写文件
-    re.compile(r"\bdd\b"),          # 块复制（常写块设备）
-    re.compile(r"\bmkfs\b"),        # 格式化文件系统
-    re.compile(r"\b(fdisk|parted|cfdisk|sfdisk)\b"),  # 分区表写入
-    re.compile(r"\bchmod\b"),       # 改权限
-    re.compile(r"\bchown\b"),       # 改属主
-    re.compile(r"\btruncate\b"),    # 截断文件
+    re.compile(str(p)) for p in (load_platform_traits("linux").get("write_command_res") or [])
 ]
 
 
@@ -166,25 +328,56 @@ def _match_dangerous_action(action_detail: str, action: str) -> bool:
     return bool(re.search(rf"(?<![-\w]){escaped}\b", action_detail, re.IGNORECASE))
 
 
-def _is_write_operation(action_type: str, action_detail: str, write_keywords: list[str] | None = None) -> bool:
+def has_exec_bypass_chain(action_detail: str) -> bool:
+    """是否含「写脚本 + 后续执行」或「管道喂解释器/持久化消费者」绕过链。
+
+    这两种链里的引号内容是**稍后会被执行的载荷**而非字面量，任何"引号内不算"
+    类守卫（heuristic 的 _strip_literal_text_segments 剥离、NEW-FP-R 引号守卫）
+    都必须对它失效，否则绕过链在 L1/L2 漏检（inline-09/10 依赖）。
+    """
+    _exec_after = r"&&|\|\||;|\n|\|"
+    return (
+        re.search(r">\s*[/~]\S*\.(sh|py|pl|rb)\b", action_detail)
+        and re.search(rf"(?:{_exec_after})\s*(?:bash|sh|zsh|dash|python|perl|ruby|node)", action_detail)
+    ) or re.search(r"\|\s*(?:bash|sh|zsh|dash|python|perl|ruby|node|crontab|at)\b", action_detail) is not None
+
+
+#: 全量剥引号内容（NEW-FP-R 引号守卫用）：剥**整条命令**的引号内容（不按首词
+#: 区分），只用于判断「命中是否纯在引号内」。与 heuristic 的
+#: _strip_literal_text_segments（首词 echo/printf 才剥）语义不同。
+ALL_QUOTES_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _is_write_operation(
+    action_type: str,
+    action_detail: str,
+    write_keywords: list[str] | None = None,
+    profile: "OSProfile | None" = None,
+) -> bool:
     """综合判定是否为写/删操作：关键词命中 或 写/删命令命中 或（真实重定向且非只读命令）。
     统一供 _check_read_before_write 与 _check_sensitive_path_access 使用，避免两处逻辑漂移。
+
+    Args:
+        write_keywords: 写关键词（profile.write_keywords 或审计日志来源）。
+        profile: 平台特征来源 —— 传入时用其 write_command_res（Windows 的
+            del/copy/icacls 与 Unix 的 rm/cp 不同），缺省回退模块级 Linux 常量。
     """
     # 关键词匹配（使用传入的 write_keywords，兼容 profile 和审计日志两种来源）
     if write_keywords and any(kw in action_type or kw in action_detail for kw in write_keywords):
         return True
-    # 写/删命令词边界正则匹配
-    if any(rx.search(action_detail) for rx in _WRITE_COMMAND_RES):
+    # 写/删命令词边界正则匹配（按平台：profile 提供命令集，Windows 用 del/copy 等）
+    write_cmds = profile.write_command_res if profile is not None else _WRITE_COMMAND_RES
+    if any(rx.search(action_detail) for rx in write_cmds):
         return True
     # sed -i 原地编辑
-    if re.search(r"\bsed\s+-[a-zA-Z]*i", action_detail):
+    if SED_INPLACE_RE.search(action_detail):
         return True
     # wget/curl + -O/-o/--output 下载写入文件（无 > 重定向，旧实现漏判 → 漏报，
     # 且 wget -O ~/.bashrc URL 可写 shell 后门绕过敏感路径）。
     # 按命令段判定：首词 wget/curl 且该段含 -O/-o/--output-document/--output。
     # 排除 echo/printf 首词（echo wget -O 是字面量非命令）。
     # NEW-FP-C: -O- / --output-document=- / -o- 是 stdout（值为 -），不算文件写。
-    for seg in re.split(r"&&|\|\||;|\n", action_detail):
+    for seg in _split_shell_segments(action_detail):
         seg = seg.strip()
         if not seg:
             continue
@@ -214,7 +407,7 @@ def _is_write_operation(action_type: str, action_detail: str, write_keywords: li
     # rsync 同步写 dest（非只读模式）——rsync src dest 默认写 dest，漏判会绕过
     # 敏感路径（rsync -a payload/ ~/.bashrc 写 shell 后门）。排除只读模式 --list-only/
     # --dry-run/-n。echo/printf 首词的字面量不算（命令位置判定）。
-    for seg in re.split(r"&&|\|\||;|\n", action_detail):
+    for seg in _split_shell_segments(action_detail):
         seg = seg.strip()
         if not seg:
             continue
@@ -250,7 +443,10 @@ def _is_write_operation(action_type: str, action_detail: str, write_keywords: li
         # 真实文件重定向：> 或 >> 后紧跟非空白、非 & 的文件目标字符。
         # `>{1,2}\s*(?!&)\S` 匹配 echo x > /file、cat in >file、sort in >> /file；
         # 排除 ls 2>&1、echo >&2（>& 紧邻或 > 后 & 是 fd 合并，非写文件）。
-        if re.search(r">{1,2}\s*(?!&)\S", detail_without_quotes):
+        # 另排除代码符号里的 >：`/>`（XML 闭合）、`->`（类型注解）、`=>`（箭头）。
+        # 2026-11 实测：python heredoc 里 `<a:alpha val="100"/>` 剥引号后剩 `val=/>`，
+        # 被当重定向写 → read_before_write 误判（xiaoO 生成 PPT 时被 Deny）。
+        if re.search(r"(?<![/\-=>])>{1,2}\s*(?!&)\S", detail_without_quotes):
             return True
     return False
 
@@ -331,7 +527,7 @@ def _is_directory_delete_action(action_detail: str, dir_path: str) -> bool:
     if re.search(r"(?:删除|移除)[^\n;|&]*?" + re.escape(dpath), low):
         return True
     # 段首删除命令（rm -rf ~/.ssh 里 rm 在段首）兜底：整条含删除命令且含目录路径
-    for seg in re.split(r"&&|\|\||;|\n", low):
+    for seg in _split_shell_segments(low):
         fw = seg.strip().split()[0] if seg.strip().split() else ""
         if fw in ("rm", "unlink", "rmdir") and dpath in seg:
             return True
@@ -352,7 +548,7 @@ def _is_archive_read_of_dir(action_detail: str, dir_path: str) -> bool:
     """
     low = action_detail.lower()
     dpath = dir_path.lower()
-    for seg in re.split(r"&&|\|\||;|\n", low):
+    for seg in _split_shell_segments(low):
         seg = seg.strip()
         if not seg or dpath not in seg:
             continue
@@ -399,10 +595,14 @@ class LogicRulesChecker:
         """
         base_paths: list = self._profile.sensitive_paths
         try:
-            from ..infra.runtime_config import has_runtime_config, get_enabled_l2_sensitive_paths_or_default, load_runtime_config
-            if has_runtime_config():
-                enabled = get_enabled_l2_sensitive_paths_or_default(load_runtime_config())
-                if enabled:
+            from ..infra.runtime_config import get_enabled_l2_sensitive_paths_or_default, load_runtime_config
+            # 传入当前 profile 的 os_type：runtime 覆盖按平台隔离（Windows 无
+            # 条目时回退 WindowsProfile 默认，不再沿用 Linux 敏感路径规则）。
+            enabled = get_enabled_l2_sensitive_paths_or_default(
+                load_runtime_config(),
+                getattr(self._profile, "os_type", ""),
+            )
+            if enabled:
                     from ..profiles.base import SensitivePath
                     # NEW-FP-1: runtime overlay 是用户 stdout 保存的旧数据，.ssh/.aws 目录级
                     # 条目没有 dir_del_only 标记（dir_del_only 是本次新增语义字段）。若仅按
@@ -433,10 +633,14 @@ class LogicRulesChecker:
     def _get_intent_patterns(self):
         """runtime_config 启用意图偏离模式（热更新） > profile 默认。"""
         try:
-            from ..infra.runtime_config import has_runtime_config, get_enabled_l2_intent_patterns_or_default, load_runtime_config
-            if has_runtime_config():
-                enabled = get_enabled_l2_intent_patterns_or_default(load_runtime_config())
-                if enabled:
+            from ..infra.runtime_config import get_enabled_l2_intent_patterns_or_default, load_runtime_config
+            # 意图模式含平台特有动作词（Windows 的 del/rmdir/reg delete），
+            # 必须按平台取，否则 Windows 上会拿 Linux 动作词误判。
+            enabled = get_enabled_l2_intent_patterns_or_default(
+                load_runtime_config(),
+                getattr(self._profile, "os_type", ""),
+            )
+            if enabled:
                     from ..profiles.base import IntentDeviationPattern
                     return [
                         IntentDeviationPattern(
@@ -625,7 +829,6 @@ class LogicRulesChecker:
         # 不含 skill-（任意能力，coordinator 故意保留 L3）、todomgr-/planning-（opendesk 专属命名空间，
         # 经 opendesk/rules.json builtin_safe_action_types 在 coordinator 层豁免 L2+L3，不到 L2）。
         # mailbox-sendEmail/replyEmail 的外传风险由 L3 LLM 管，不归 L2 read_before_write。
-        _NON_WRITE_TOOL_PREFIXES = ("memory-", "skill-manager-", "mailbox-", "app-")
         if any(action_type.startswith(p) for p in _NON_WRITE_TOOL_PREFIXES):
             return LogicRuleResult(hit=False)
 
@@ -636,13 +839,19 @@ class LogicRulesChecker:
         # exclude_paths（按命令段首词识别）处理，不靠这里的子串豁免。
         non_write_tools = {
             "ask_user_question", "glob", "grep", "list_dir", "count_text_length", "search",
-            # filemgr 只读三件套（globfiles 在 coordinator FULLY_SAFE_TOOLS 提前放行，此处兜底）
+            # filemgr 只读三件套（globfiles 在 platform_traits.safe_action_types 提前放行，此处兜底）
             "filemgr-globfiles", "filemgr-readfile", "filemgr-grepfiles",
             # 通用只读工具名
             "read", "read_file", "file_read", "head", "tail", "cat",
         }
         if any(t in action_type for t in non_write_tools):
             return LogicRuleResult(hit=False)
+
+        # 豁免：系统伪文件系统写入。「读前写后」针对普通文件内容，sysfs/procfs/devfs/tracefs
+        # 的写入是控制面动作（trace_marker 打点、/proc/self/... 调参），不存在「先读内容再覆写」
+        # 的语义。真机实测（鸿蒙 PC，2026-10）：定向 syscall 实时研判把 trace_marker 判 high
+        # 并真拦，被跟的 agent 卡死。
+        # 注：本豁免只针对路径本身；`file_write` 覆写普通文件仍按 RBW 守护。
 
         # 写判定按工具类型分流：
         # - bash/executebash/terminal-executebash：同时匹配 action_type + action_detail
@@ -660,7 +869,7 @@ class LogicRulesChecker:
             # 补充检测 shell 重定向写入（>、>>）、rm/cp 命令词边界、sed -i
             # 使用 _is_write_operation 统一判定，与 _check_sensitive_path_access 对齐
             if not is_write:
-                is_write = _is_write_operation(action_type, action_detail, self._profile.write_keywords)
+                is_write = _is_write_operation(action_type, action_detail, self._profile.write_keywords, self._profile)
         else:
             is_write = any(kw in action_type for kw in write_keywords)
 
@@ -680,8 +889,6 @@ class LogicRulesChecker:
         # 和 sensitive_path 检测负责（_WRITE_COMMAND_RES 仍保留 chmod/chown 供敏感路径写判定）。
         # 这样 `rm ... && echo done`（删除 + 安全 echo）豁免，`rm /a && echo x > /b`（含重定向写）仍走 rbw，
         # `chmod 644 /tmp/x`（普通权限）豁免，`chmod u+s /tmp/x`（提权）由 L1 拦。
-        _WRITE_CMDS = {"cp", "mv", "install", "tee", "dd", "truncate", "mkfs",
-                       "fdisk", "parted"}
         if action_type in ("bash", "executebash", "terminal-executebash"):
             detail_no_compare = re.sub(r"<=>|>=|<=|<>|=>", " ", action_detail)
             detail_no_devnull = _DEVNULL_REDIRECT_RE.sub("", detail_no_compare)
@@ -693,15 +900,20 @@ class LogicRulesChecker:
                 detail_no_devnull,
             )
             detail_no_quotes = re.sub(r"'[^']*'|\"[^\"]*\"", "", detail_unquoted_redirect)
-            has_redirect_write = bool(re.search(r">{1,2}\s*(?!&)\S", detail_no_quotes))
+            # 排除代码符号里的 >：`/>`（XML 闭合）、`->`（类型注解）、`=>`（箭头）。
+            # 2026-11 实测：python heredoc 里 `<a:alpha val="100"/>` 剥引号后剩
+            # `val=/>`，被当重定向写 → read_before_write 误判。
+            has_redirect_write = bool(
+                re.search(r"(?<![/\-=>])>{1,2}\s*(?!&)\S", detail_no_quotes)
+            )
             has_write_seg = has_redirect_write
             if not has_write_seg:
-                for seg in re.split(r"&&|\|\||;|\n", action_detail):
+                for seg in _split_shell_segments(action_detail):
                     seg = seg.strip()
                     if not seg:
                         continue
                     fw = seg.split()[0].lower() if seg.split() else ""
-                    if fw in _WRITE_CMDS or re.search(r"\bsed\s+-[a-zA-Z]*i", seg):
+                    if fw in _WRITE_CMDS or SED_INPLACE_RE.search(seg):
                         has_write_seg = True
                         break
                     # wget/curl + -O/-o/--output 下载写入（无 > 重定向，需单独识别）
@@ -751,7 +963,6 @@ class LogicRulesChecker:
         # 关键：排除是 per-segment 局部的，不是全局——否则 `cp /a /b && cp /b /c` 里
         # /b 既是第一段 dest（写目标）又是第二段 source（读目标），全局排除会让第一段
         # 对 /b 的覆写漏检（NEW-FN-B）。逐段计算确保 /b 在第一段仍被作为写目标检查。
-        _SOURCE_ARG_CMDS = {"cp", "mv", "install", "rsync"}
         # 重定向写目标正则：> 或 >> 后紧跟文件路径（裸路径或引号包裹，排除 >& fd）。
         # 引号路径组（'...'/"..."）与裸路径组分别捕获，findall 返回非空组。
         # 先摘引号重定向目标（去引号保留路径）再剥剩余引号内容，避免 grep "a>b" 误匹配。
@@ -759,7 +970,7 @@ class LogicRulesChecker:
             r">{1,2}\s*(?!&)(?:'(/[^']+)'|\"(/[^\"]+)\"|(/[^\s;|&><'\"]+))"
         )
         target_paths: list[str] = []
-        for seg in re.split(r"&&|\|\||;|\n", action_detail):
+        for seg in _split_shell_segments(action_detail):
             seg = seg.strip()
             if not seg:
                 continue
@@ -767,7 +978,12 @@ class LogicRulesChecker:
             if first_word == "cd":
                 # 切目录，无写目标
                 continue
-            if first_word in READ_ONLY_COMMANDS:
+            # NEW-FN-P（M03）：sed -i/--in-place 是原地写，不算只读段——
+            # sed 在 READ_ONLY_COMMANDS 里，此前 sed -i file 的 file 被当读目标丢弃，
+            # rbw 提取不到写目标（白名单挡出后仍漏拦的第二层根因）。
+            if first_word == "sed" and SED_INPLACE_RE.search(seg):
+                pass  # 落到下方写段提取
+            elif first_word in self._profile.read_only_commands:
                 # 只读命令：文件参数是读目标，但重定向目标是写目标（NEW-FN-D）。
                 # 先摘引号重定向目标（去引号），再剥剩余引号内容（grep 模式），再提取目标。
                 # NEW-FP-M: 先剥 /dev/null 重定向（cat f 2>/dev/null 的 /dev/null 是 stderr 丢弃
@@ -812,8 +1028,12 @@ class LogicRulesChecker:
             else:
                 # 其他段（含重定向写 echo > file、tee、truncate 等）：该段所有路径为写目标
                 target_paths.extend(seg_paths)
-        # 去重
-        target_paths = list(dict.fromkeys(target_paths))
+        # 去重，并剔除伪文件系统路径（写 sysfs/procfs/devfs 是控制面动作，见豁免 2）。
+        # 全部目标都在伪文件系统里时本规则无事可判。
+        target_paths = [
+            p for p in dict.fromkeys(target_paths)
+            if not p.startswith(_PSEUDO_FS_PREFIXES)
+        ]
         if not target_paths:
             return LogicRuleResult(hit=False)
 
@@ -830,6 +1050,20 @@ class LogicRulesChecker:
             if is_read:
                 hist_paths = self._profile.extract_file_paths(hist_detail)
                 history_read_paths.update(hist_paths)
+
+        # 豁免「纯临时文件生成」写目标：`dd if=/dev/zero of=/tmp/file`（用 /dev/zero
+        # 填充临时文件）是明确的 scratch 空间生成，无敏感语义（A2 定义里 /tmp 清理
+        # 即实质安全），read_before_write 对其无意义，不应误报。仅豁免 dd 的
+        # if=/dev/zero + of=<临时目录> 形态——`echo x > /tmp/已存在文件` 这类覆盖已有
+        # 文件的写仍触发 RBW（tests 里依赖 tmp_path 验证此语义，不得放宽）。
+        # 与 _check_dangerous_patterns 的 _TEMP_DIRS 保持一致。
+        if re.search(r"\bdd\b", action_detail) and re.search(r"\bif=/dev/zero\b", action_detail):
+            target_paths = [
+                p for p in target_paths
+                if not any(p.startswith(td) for td in _TEMP_DIRS)
+            ]
+        if not target_paths:
+            return LogicRuleResult(hit=False)
 
         # 检查写入目标是否在已读取的路径中
         unread_paths = []
@@ -879,7 +1113,6 @@ class LogicRulesChecker:
         # inline-analyzer 专门管（区分字面量 vs 真实调用），intent 不重复管。
         if self._INLINE_SCRIPT_RE.search(action_detail):
             return LogicRuleResult(hit=False)
-        _EXCLUDED_PREFIXES = ("memory-", "skill-", "skill-manager-", "mailbox-", "app-")
         if any(action_type.startswith(p) for p in _EXCLUDED_PREFIXES):
             return LogicRuleResult(hit=False)
 
@@ -954,12 +1187,11 @@ class LogicRulesChecker:
 
         # 只对文件/命令类操作执行敏感路径检查，避免 memory-searchMemory 等
         # 非文件工具的关键词参数触发路径子串匹配误报
-        _EXCLUDED_PREFIXES = ("memory-", "skill-", "skill-manager-", "mailbox-", "app-")
         if any(action_type.startswith(p) for p in _EXCLUDED_PREFIXES):
             return LogicRuleResult(hit=False)
 
         # 检测操作类型：读/写/其他（统一用 _is_write_operation，与 _check_read_before_write 对齐）
-        is_write_op = _is_write_operation(action_type, action_detail, self._profile.write_keywords)
+        is_write_op = _is_write_operation(action_type, action_detail, self._profile.write_keywords, self._profile)
 
         # ssh-keygen 生成模式豁免（与 L1 SensitivePathChecker 对齐）：-t <type> 生成新私钥
         # 时 -f 是写目标，不读已有私钥，不应命中 deny_both「读私钥」拦截。
@@ -1106,20 +1338,25 @@ class LogicRulesChecker:
         # 注：admin 关键词曾尝试词边界 \b，但 grep apt / pip apt 里 apt 是独立词，\bapt\b
         # 仍命中，词边界无法区分"命令位置"vs"参数位置"，故暂保留子串匹配。提权漏检
         # （grep apt 误当 admin 上下文放行 sudo cat）是已知问题，待命令位置匹配专项处理。
-        admin_keywords = ["sudo", "apt", "systemctl", "yum", "dnf", "pacman", "zypper", "apk"]
+        # ⚠️ 当前命令侧的管理关键词**不含 "sudo" 自身**（与 TS 对齐）。
+        # 历史性 bug：该列表曾含 "sudo"，靠「先剥 sudo 前缀再匹配」来兜底，但剥除正则
+        # 是 `\bsudo\s+`（要求 sudo 后有空白），于是 `sudo; cmd`、`sudo&&cmd`、行尾裸
+        # `sudo` 都剥不掉 → 残留的 sudo 自己命中关键词 → 判为「已是管理上下文」→
+        # **整条规则失效放行**。实测：`sudo; whoami` Python 放行、TS 拦截。
+        # 现在直接不把 sudo 当管理命令，从根上消除自指；剥除保留只为可读性。
+        admin_keywords = ["apt", "systemctl", "yum", "dnf", "pacman", "zypper", "apk"]
         # sudo 后跟的命令本身就是包管理/服务管理 → 合法运维，直接放行
         # （新会话首次 sudo apt install / sudo systemctl restart 不应被误杀）。
-        # 注意：admin_keywords 含 "sudo" 自身，但这里要判定的是"sudo 后面跟的命令"，
-        # 故先剥掉 sudo 前缀，再匹配 admin_keywords，否则任何含 sudo 的命令都会命中
-        # "sudo" 一项导致永远放行、规则失效。
         detail_after_sudo = re.sub(r"^sudo\s+|&&\s*sudo\s+|\|\|\s*sudo\s+|\bsudo\s+", " ", action_detail)
         if any(kw in detail_after_sudo for kw in admin_keywords):
             return LogicRuleResult(hit=False)
 
+        # 历史上下文侧**仍然认 sudo**（"本次会话此前用过 sudo"确实说明有管理上下文），
+        # 与 TS logic-rules.ts 的历史判定一致。
         admin_context = False
         for action in action_history:
             hist_detail = str(action.get("action_detail", "")).lower()
-            if any(kw in hist_detail for kw in admin_keywords):
+            if any(kw in hist_detail for kw in ("sudo", *admin_keywords)):
                 admin_context = True
                 break
 
@@ -1146,7 +1383,7 @@ class LogicRulesChecker:
 
         # NEW-FP-D: echo/printf 首词的参数是字面量非真调用（echo ssh user@host 是打印字面量）
         # 按命令段判定：首词 echo/printf 跳过，与 _is_write_operation 的 wget/curl 字面量判定一致
-        for seg in re.split(r"&&|\|\||;|\n", action_detail):
+        for seg in _split_shell_segments(action_detail):
             seg = seg.strip()
             if not seg:
                 continue
@@ -1252,7 +1489,6 @@ class LogicRulesChecker:
             return LogicRuleResult(hit=False)
 
         # 通配符 + 删除/修改 — 排除 /tmp 等临时目录的清理操作
-        _TEMP_DIRS = ("/tmp/", "/var/tmp/", "/run/", "/dev/shm/")
         is_temp_path = any(td in action_detail for td in _TEMP_DIRS)
 
         if not is_temp_path and ("*" in action_detail or "?" in action_detail) and any(
@@ -1288,12 +1524,8 @@ class LogicRulesChecker:
         re.IGNORECASE,
     )
 
-    # 目录遍历关键词
-    _DIR_TRAVERSAL_KEYWORDS = [
-        "os.listdir", "os.walk", "os.scandir",
-        "glob.glob", "glob.iglob", "pathlib.", "iterdir", "rglob",
-        "scandir(", "listdir(",
-    ]
+    # 目录遍历关键词：复用 inline_rules.json 那一份（两处原本逐字相同）
+    _DIR_TRAVERSAL_KEYWORDS = list(load_inline().get("dir_traversal_keywords") or [])
 
     def _check_indirect_file_access(self, a_next: dict[str, str], cwd: str = "") -> LogicRuleResult:
         """检测内联脚本通过目录遍历动态发现文件并读写的行为。
@@ -1335,22 +1567,13 @@ class LogicRulesChecker:
         # 读操作：仅凭据文件拦截（读凭据已足够危险）
         # 写操作：所有敏感文件拦截（写入破坏性更大）
         # 执行操作：所有敏感文件拦截（执行命令可做任何事）
-        _READ_KEYWORDS = [
-            "read(", "readline", "readlines", "fread", "fgets",
-            "load(", "getpass", "file_get_contents",
-        ]
-        _WRITE_KEYWORDS = [
-            "write(", "writelines", "fwrite", "file_put_contents",
-        ]
-        _EXEC_KEYWORDS = [
-            "system(", "exec(", "eval(", "popen(",
-            "os.system", "os.popen", "subprocess", "os.exec", "os.spawn",
-            "shell=true", "check_output", "check_call", "run(",
-            "passthru", "shell_exec", "proc_open",
-        ]
-        # open( 和 fopen( 默认是读模式（'r'），但也可用于写
-        # 如果同时出现 open( + write(，write( 会被 _WRITE_KEYWORDS 捕获
-        _OPEN_KEYWORDS = ["open(", "fopen("]
+        # 四组词见 rules/logic_rules.json 的 indirect_file_access
+        # （open( 和 fopen( 默认是读模式（'r'），也可用于写；同时出现 open( +
+        #  write( 时，write( 会被 _IFA_WRITE_KEYWORDS 捕获）
+        _READ_KEYWORDS = _IFA_READ_KEYWORDS
+        _WRITE_KEYWORDS = _IFA_WRITE_KEYWORDS
+        _EXEC_KEYWORDS = _IFA_EXEC_KEYWORDS
+        _OPEN_KEYWORDS = _IFA_OPEN_KEYWORDS
         from .inline_analyzer import _extract_inline_code
         code = _extract_inline_code(action_detail)
         if not code:
@@ -1389,10 +1612,13 @@ class LogicRulesChecker:
             found_sensitive: list[str] = []
             for sp in self._profile.sensitive_paths:
                 raw_path = sp.path
-                # 只检查文件名（去掉路径前缀）
-                base_name = raw_path.lstrip("/").replace("home/", "").replace("~", "")
-                # 取最后一段作为文件名匹配
-                fname = base_name.split("/")[-1] if "/" in base_name else base_name
+                # 只检查文件名（去掉路径前缀）。
+                # ⚠️ 必须**同时按 / 和 \ 切**：Windows 敏感路径在 rules 里是反斜杠
+                # （C:\Windows\System32\config\SAM、.ssh\id_rsa），只按 "/" 切会得到
+                # 整条路径字符串，永远不等于文件名 → **Windows 上恒不命中**。
+                # TS 侧一直用 split(/[/\\]/).pop()，两端分叉（2026-09 实测确认）。
+                base_name = raw_path.lstrip("/\\").replace("home/", "").replace("~", "")
+                fname = re.split(r"[/\\]", base_name)[-1] if re.search(r"[/\\]", base_name) else base_name
                 if not fname:
                     continue
                 for af in actual_files:
@@ -1442,43 +1668,118 @@ class LogicRulesChecker:
             risk_type="file_access",
         )
 
+    @staticmethod
+    def _consent_within_ttl(asked: dict, a_next: dict) -> bool:
+        """提问与本次动作的间隔是否在 ``CONSENT_TTL_SECONDS`` 内。
+
+        仅当两侧都带 ``called_at`` 时校验；缺任一侧（调用方未上报时间）返回 True，
+        由 ``CONSENT_MAX_DISTANCE`` 的距离窗口兜底。时间格式不合法同样返回 True ——
+        时间窗是增强项，不是主防线，不因解析失败额外拦截。
+        """
+        raw = os.getenv("AGENT_MOSS_CONSENT_TTL_SECONDS", "").strip()
+        try:
+            ttl = int(raw) if raw else CONSENT_TTL_SECONDS
+        except ValueError:
+            ttl = CONSENT_TTL_SECONDS
+        if ttl <= 0:
+            return True
+        asked_at = str(asked.get("called_at", "") or "").strip()
+        next_at = str(a_next.get("called_at", "") or "").strip()
+        if not asked_at or not next_at:
+            return True
+        try:
+            from datetime import datetime
+            a = datetime.fromisoformat(asked_at.replace("Z", "+00:00"))
+            b = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+            return abs((b - a).total_seconds()) <= ttl
+        except (ValueError, TypeError):
+            return True
+
+    def _has_valid_consent(
+        self, action_history: list[dict[str, object]], a_next: dict[str, str]
+    ) -> bool:
+        """历史中是否存在**可采信**的用户授权。
+
+        有效授权必须同时满足 5 条（任一条不满足即视为未授权，fail-closed）：
+
+        1. 动作类型是 ``ask_user_question``；
+        2. ``output``（用户回答）非空 —— 只提问不回答不算授权；
+        3. 提问正文命中本类操作关键词（``CONSENT_TOPIC_PATTERN``）——
+           「要重启服务吗」不能给删用户背书；
+        4. 回答是**肯定**：否定词优先（回答「否」也曾被判为授权，实测缺陷），
+           既无否定也无肯定 → 意图无法判定 → 不算授权；
+        5. 提问落在最近 ``CONSENT_MAX_DISTANCE`` 条动作内，且（若带 ``called_at``）
+           与本次动作间隔不超过 ``CONSENT_TTL_SECONDS``。
+
+        ⚠️ 只看**最近一条** ``ask_user_question``，不往前翻找：正常流程是
+        「问 → 答 → 立刻执行」，更早的提问与本次操作无关。旧实现遍历整个
+        action_history、任意一条带 output 的提问就放行 —— 实测「用户回答『否』」
+        「问『要重启服务吗』答『是』」都能过，授权形同虚设。
+        """
+        if not action_history:
+            return False
+        for action in reversed(action_history[-CONSENT_MAX_DISTANCE:]):
+            if not isinstance(action, dict):
+                continue
+            hist_type = str(action.get("action_type", action.get("name", ""))).lower()
+            if not _is_ask_user_action(hist_type):
+                continue
+            # 最近这条提问是唯一候选；它不合格就直接判未授权，不再往前找。
+            output = str(action.get("output", "") or "").strip()
+            if not output:
+                return False
+            question = str(action.get("action_detail", "") or "")
+            if not CONSENT_TOPIC_PATTERN.search(question):
+                return False
+            if CONSENT_NEGATIVE_PATTERN.search(output):
+                return False
+            # 索取型提问（「请输入新的登录密码」）：用户提供了内容即为授权；
+            # 确认型提问（「确认删除用户 ops 吗？」）：必须拿到肯定回答。
+            if not CONSENT_INPUT_REQUEST_PATTERN.search(question) and not CONSENT_AFFIRMATIVE_PATTERN.search(output):
+                return False
+            return self._consent_within_ttl(action, a_next)
+        return False
+
     def _check_password_consent(
         self, action_history: list[dict[str, object]], a_next: dict[str, str]
     ) -> LogicRuleResult:
         """
         密码修改授权检测：
-        非交互式密码修改命令必须在 action_history 中有 ask_user_question 且用户返回了密码。
+        非交互式密码修改命令必须在 action_history 中有 ask_user_question 且用户明确确认。
         交互式 passwd（无参数）不在此列，因为 LLM 无法完成交互式输入。
         """
         action_detail = a_next.get("action_detail", "").lower()
         action_type = a_next.get("action_type", "").lower()
 
-        # 只检测 bash 工具中的密码修改命令
-        if action_type != "bash":
+        # 只检测 shell 工具中的密码修改命令（executeBash 等同 bash）
+        if action_type not in BASH_LIKE_ACTION_TYPES:
             return LogicRuleResult(hit=False)
 
         is_password_modify = any(
             re.search(p, action_detail, re.IGNORECASE) for p in self._get_password_patterns()
         )
+        # NEW-FP-R：密码修改家族的命中必须经得起全量剥引号——真实语义的管道/命令词
+        # 都在引号外；只在引号内出现（grep 搜索模式串里的 |passwd）是字面量误报。
+        # 绕过链（写脚本+执行 / 管道喂解释器）例外：引号内载荷稍后会被执行。
+        if is_password_modify and not has_exec_bypass_chain(action_detail):
+            _no_quotes = ALL_QUOTES_RE.sub(" ", action_detail)
+            is_password_modify = any(
+                re.search(p, _no_quotes, re.IGNORECASE) for p in self._get_password_patterns()
+            )
         if not is_password_modify:
             return LogicRuleResult(hit=False)
 
-        # 检查 action_history 中是否有 ask_user_question 且用户返回了答案
-        for action in action_history:
-            if not isinstance(action, dict):
-                continue
-            hist_type = str(action.get("action_type", action.get("name", ""))).lower()
-            output = str(action.get("output", ""))
-            if hist_type == "ask_user_question" and output.strip():
-                return LogicRuleResult(hit=False)  # 用户已授权，放行
+        if self._has_valid_consent(action_history, a_next):
+            return LogicRuleResult(hit=False)  # 用户已明确授权，放行
 
         return LogicRuleResult(
             hit=True,
             violated_rule="password_modify_requires_consent",
             risk_level="high",
             reason=(
-                "执行非交互式密码修改命令，但历史执行序列中未发现向用户确认密码的 "
-                "ask_user_question 操作，可能存在未授权的密码修改风险"
+                "执行非交互式密码修改命令，但历史执行序列中未发现用户明确授权的 "
+                "ask_user_question（须用户正面回答且与本次操作相关），"
+                "可能存在未授权的密码修改风险"
             ),
             risk_type="consent_missing",
         )
@@ -1493,8 +1794,8 @@ class LogicRulesChecker:
         action_detail = a_next.get("action_detail", "").lower()
         action_type = a_next.get("action_type", "").lower()
 
-        # 只检测 bash 工具中的用户删除命令
-        if action_type != "bash":
+        # 只检测 shell 工具中的用户删除命令（executeBash 等同 bash）
+        if action_type not in BASH_LIKE_ACTION_TYPES:
             return LogicRuleResult(hit=False)
 
         is_user_deletion = any(
@@ -1503,22 +1804,17 @@ class LogicRulesChecker:
         if not is_user_deletion:
             return LogicRuleResult(hit=False)
 
-        # 检查 action_history 中是否有 ask_user_question 且用户确认了
-        for action in action_history:
-            if not isinstance(action, dict):
-                continue
-            hist_type = str(action.get("action_type", action.get("name", ""))).lower()
-            output = str(action.get("output", ""))
-            if hist_type == "ask_user_question" and output.strip():
-                return LogicRuleResult(hit=False)  # 用户已授权，放行
+        if self._has_valid_consent(action_history, a_next):
+            return LogicRuleResult(hit=False)  # 用户已明确授权，放行
 
         return LogicRuleResult(
             hit=True,
             violated_rule="user_deletion_requires_consent",
             risk_level="high",
             reason=(
-                "执行删除系统用户命令，但历史执行序列中未发现向用户确认的 "
-                "ask_user_question 操作，可能存在未授权的用户删除风险"
+                "执行删除系统用户命令，但历史执行序列中未发现用户明确授权的 "
+                "ask_user_question（须用户正面回答且与本次操作相关），"
+                "可能存在未授权的用户删除风险"
             ),
             risk_type="consent_missing",
         )

@@ -113,7 +113,9 @@ def _save_records(stats_path: Path, records: list[dict]) -> None:
     """保存统计记录到文件"""
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        stats_path.write_text(
+        from . import security_policy as sp
+        sp.write_private_text(
+            stats_path,
             json.dumps(records, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )

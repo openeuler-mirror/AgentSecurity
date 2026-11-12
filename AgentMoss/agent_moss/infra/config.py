@@ -6,6 +6,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .rules_mode import is_builtin_only, is_runtime_config_disabled
+
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.json.example"
 
 
@@ -141,12 +143,21 @@ def load_config(config_path: str | Path | None = None) -> Config:
                 path = agent_moss_user_dir / "config.json"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(DEFAULT_CONFIG_PATH, path)
-                print(f"[AgentMoss] 已创建用户配置文件: {path}")
-                print(f"[AgentMoss] 请编辑该文件配置 LLM API Key（或设 AGENT_MOSS_LLM_API_KEY 环境变量）")
-            else:
-                path = None
+                # ⚠️ 走 stderr，不要 print 到 stdout —— CLI 的 stdout 是给脚本/管道
+                # 解析的 JSON，首次运行混入这两行会让 `agent-moss analyze x.json | jq`
+                # 直接失败（且只在"首次运行/换数据目录"时出现，很难复现）。
+                import sys as _sys
+                print(f"[AgentMoss] 已创建用户配置文件: {path}", file=_sys.stderr)
+                print(
+                    "[AgentMoss] 请编辑该文件配置 LLM API Key"
+                    "（或设 AGENT_MOSS_LLM_API_KEY 环境变量）",
+                    file=_sys.stderr,
+                )
 
-    if not path.exists():
+    # path 仍为 None = 无用户配置且包内模板缺失（config.json.example 未随包分发，
+    # 如 wheel 安装场景）。此时回退默认配置，不可对 None 调 .exists()（历史 bug：
+    # AttributeError: 'NoneType' object has no attribute 'exists'）。
+    if path is None or not path.exists():
         return _build_config({})
 
     suffix = path.suffix.lower()
@@ -235,6 +246,13 @@ def _build_config(data: dict) -> Config:
         enabled=cache_data.get("enabled", True),
         max_size=cache_data.get("max_size", 1000),
     )
+    # 环境变量覆盖：AGENT_MOSS_DISABLE_CACHE=1 关闭判定结果缓存 —— 不再写
+    # {临时目录}/agent_moss_policy_cache/。只做命令判定、不做沙箱隔离的部署不需要
+    # 这份缓存产物（与 AGENT_MOSS_SAVE_POLICY=0 同一动机：别在 /tmp 堆无用文件）。
+    # 语义对齐 AGENT_MOSS_DISABLE_HEURISTIC / DISABLE_LOGIC_RULES 的 "=1 关闭"；
+    # 等价于 config.json 的 "cache": {"enabled": false}（env 优先，无需手编配置）。
+    if os.getenv("AGENT_MOSS_DISABLE_CACHE") == "1":
+        cache_config.enabled = False
 
     retry_data = data.get("retry", {})
     retry_config = RetryConfig(
@@ -247,21 +265,38 @@ def _build_config(data: dict) -> Config:
     # L1_heuristic → heuristic_enabled / L2_logic_rules → logic_rules_enabled /
     # L3_llm_analysis → llm_analysis_enabled。这样 console toggle 真正控到引擎
     # （否则各层开关只是 UI 状态，引擎照常全跑）。默认与 config.json 一致。
+    _builtin_only = is_builtin_only()
+    _runtime_disabled = is_runtime_config_disabled()
     _layers = {}
-    try:
-        from .runtime_config import has_runtime_config, load_runtime_config
-        if has_runtime_config():
-            _layers = (load_runtime_config() or {}).get("layers", {}) or {}
-    except Exception:
-        _layers = {}  # runtime_config 不可用（如 seed 阶段）则保持 config.json 值
+    if not _runtime_disabled:
+        try:
+            from .runtime_config import has_runtime_config, load_runtime_config
+            if has_runtime_config():
+                _layers = (load_runtime_config() or {}).get("layers", {}) or {}
+        except Exception:
+            _layers = {}  # runtime_config 不可用（如 seed 阶段）则保持 config.json 值
+    # cold / builtin 模式下规则开关只认环境变量：忽略 runtime JSON / 配置文件里的
+    # 层级开关，默认全开；下面的 AGENT_MOSS_DISABLE_* 环境变量覆盖仍然生效。
     security_config = SecurityConfig(
-        enabled=sec_data.get("enabled", True),
-        heuristic_enabled=_layers.get("L1_heuristic", sec_data.get("heuristic_enabled", True)),
-        logic_rules_enabled=_layers.get("L2_logic_rules", sec_data.get("logic_rules_enabled", True)),
-        llm_analysis_enabled=_layers.get("L3_llm_analysis", sec_data.get("llm_analysis_enabled", True)),
+        # cold / builtin：忽略配置文件里的全局安全开关（规则开关只认环境变量）。
+        enabled=True if _runtime_disabled else sec_data.get("enabled", True),
+        heuristic_enabled=(
+            True if _runtime_disabled
+            else _layers.get("L1_heuristic", sec_data.get("heuristic_enabled", True))
+        ),
+        logic_rules_enabled=(
+            True if _runtime_disabled
+            else _layers.get("L2_logic_rules", sec_data.get("logic_rules_enabled", True))
+        ),
+        llm_analysis_enabled=(
+            True if _runtime_disabled
+            else _layers.get("L3_llm_analysis", sec_data.get("llm_analysis_enabled", True))
+        ),
         formal_observe_mode=sec_data.get("formal_observe_mode", False),
-        rules_path=sec_data.get("rules_path", ""),
-        skills_dir=sec_data.get("skills_dir", ""),
+        # builtin：忽略配置里的自定义规则文件/skill 目录（只用包内资源）；
+        # cold：允许这两项作为“启动时输入”，由引擎在首次加载后冻结。
+        rules_path="" if _builtin_only else sec_data.get("rules_path", ""),
+        skills_dir="" if _builtin_only else sec_data.get("skills_dir", ""),
     )
 
     # 环境变量覆盖 security 和 LLM 配置
@@ -442,7 +477,12 @@ def get_agent_moss_setting(key: str, default: str | int | bool = "") -> str:
 
 
 def is_llm_enabled() -> bool:
-    """判断是否启用 LLM 深度分析"""
+    """判断是否启用 LLM 深度分析。
+
+    cold / builtin 模式下规则开关只认环境变量（忽略 settings JSON）。
+    """
+    if is_runtime_config_disabled():
+        return os.getenv("AGENT_MOSS_DISABLE_LLM") != "1"
     disable_value = get_agent_moss_setting("AGENT_MOSS_DISABLE_LLM", "")
     return disable_value != "1"
 
@@ -471,6 +511,42 @@ def get_llm_timeout() -> int:
         return 300
 
 
+def _get_int_setting(key: str, default: int) -> int:
+    """读整型配置；非法值/未设置 → 默认值。"""
+    raw = get_agent_moss_setting(key, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_llm_history_max_items() -> int:
+    """L3 prompt 最多注入多少条历史动作（0 = 不限，默认 20）。
+
+    客户的写文件类 tool call，`action_detail` 可能包含整个文件内容，历史
+    累积几十条后 prompt 会膨胀到几十万字符。只保留最近 N 条既够判断意图
+    偏离，又能把 prompt 控制在可用范围。
+    """
+    return _get_int_setting("AGENT_MOSS_LLM_HISTORY_MAX_ITEMS", 20)
+
+
+def get_llm_action_detail_max_chars() -> int:
+    """L3 prompt 中单条历史动作详情最多保留多少字符（0 = 不截断，默认 500）。
+
+    截断保留头部（命令本身）+ 尾部（结构），中间标注省略长度。
+    """
+    return _get_int_setting("AGENT_MOSS_LLM_ACTION_DETAIL_MAX_CHARS", 500)
+
+
+def get_llm_max_prompt_tokens() -> int:
+    """L3 输入 prompt 的 token 总预算（0 = 不限，默认 0）。
+
+    超限时按「历史条数减半 → 单条截断长度减半 → 截断当前动作详情」逐级压缩，
+    保证 prompt 不会因为超长 tool call 无限膨胀。
+    """
+    return _get_int_setting("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", 0)
+
+
 def get_log_path() -> str:
     """获取 LLM prompt 日志路径"""
     return get_agent_moss_setting("AGENT_MOSS_LOG_PATH", "")
@@ -487,18 +563,27 @@ def is_brain_enabled() -> bool:
 
     默认关闭（开发中，避免污染 L1/L2 判定和 L3 prompt），仅当显式设置
     AGENT_MOSS_BRAIN_ENABLED=1（env 或 agent_moss_settings.json）时启用。
+
+    cold / builtin 模式下**强制关闭**：Brain 自学习规则来自用户数据目录，属于
+    用户级运行期规则来源，不属于冷启动/内置输入。
     """
+    if is_runtime_config_disabled():
+        return False
     enable_value = get_agent_moss_setting("AGENT_MOSS_BRAIN_ENABLED", "")
     return enable_value == "1"
 
 
 def is_heuristic_enabled() -> bool:
-    """判断是否启用层1特征匹配静态检测"""
+    """判断是否启用层1特征匹配静态检测（cold / builtin 下只认环境变量）"""
+    if is_runtime_config_disabled():
+        return os.getenv("AGENT_MOSS_DISABLE_HEURISTIC") != "1"
     return get_agent_moss_setting("AGENT_MOSS_DISABLE_HEURISTIC", "") != "1"
 
 
 def is_logic_rules_enabled() -> bool:
-    """判断是否启用层2逻辑规则检测"""
+    """判断是否启用层2逻辑规则检测（cold / builtin 下只认环境变量）"""
+    if is_runtime_config_disabled():
+        return os.getenv("AGENT_MOSS_DISABLE_LOGIC_RULES") != "1"
     return get_agent_moss_setting("AGENT_MOSS_DISABLE_LOGIC_RULES", "") != "1"
 
 
@@ -538,6 +623,9 @@ def load_custom_rules() -> list[dict]:
     """
     import json as _json
 
+    # 仅内置规则模式：AGENT_MOSS_CUSTOM_RULES 属于用户注入规则，一并忽略。
+    if is_builtin_only():
+        return []
     raw = get_agent_moss_setting("AGENT_MOSS_CUSTOM_RULES", "")
     if not raw:
         return []

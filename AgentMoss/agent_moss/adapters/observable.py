@@ -58,10 +58,16 @@ class ObservableAdapter:
         action_history = []
         for h in history_raw:
             if isinstance(h, dict):
-                action_history.append({
+                history_item = {
                     "name": h.get("name") or h.get("action_type") or h.get("tool", ""),
                     "action_detail": h.get("action_detail") or h.get("command", ""),
-                })
+                }
+                # 透传 output（工具返回/用户回答）—— L2 授权（consent）判定依赖它：
+                # 判「用户是否已授权」看的是 ask_user_question 的回答，不是提问正文。
+                # 与 server/routes.py 的标准分支保持同一口径。
+                if "output" in h:
+                    history_item["output"] = h.get("output", "")
+                action_history.append(history_item)
 
         result = {
             "session_id": session_id,

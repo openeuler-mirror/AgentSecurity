@@ -5,10 +5,13 @@ import os
 import platform
 import time
 import logging
+import uuid
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from ..__version__ import __version__
+from ..engine.skill_engine import default_skills_dir
+from ..infra import security_policy as sp
 from .models import (
     AnalyzeRequest,
     AnalyzeResponse,
@@ -22,13 +25,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
 
 
+def _internal_error(exc: Exception) -> HTTPException:
+    """500 错误归一化：默认只回一个 ref，完整堆栈留在服务端日志。
+
+    ``str(e)`` 会把内部路径、配置值、解析片段带进响应体。调用方**本身就是被
+    检测对象**，拿到这些可以据此规避（设计说明书 14.4.1 / SEC-10）。
+    需要旧行为排查问题时设 ``AGENT_MOSS_ERROR_DETAIL=full``。
+    """
+    if sp.error_detail_mode() == "full":
+        return HTTPException(status_code=500, detail=str(exc))
+    ref = uuid.uuid4().hex[:8]
+    logger.exception("内部错误（ref=%s）", ref)
+    return HTTPException(status_code=500, detail=f"Internal server error (ref: {ref})")
+
+
 # ==================== Stateful incremental (L2.2 有状态) ====================
 
 def _chain_state_for_agent(agent_id: str):
-    """拿到某 agent 的链状态仓储（按 agent_id 分桶）。"""
+    """拿到链状态仓储。
+
+    分桶由 ``AGENT_MOSS_CHAIN_SCOPE`` 决定：默认 ``system`` —— 所有 agent 共用
+    一个桶（组合攻击针对的是这台服务器，换 agent 分步实施也不能漏）；只有多租户
+    部署才切到 ``agent`` 模式。
+    """
     from ..engine.formal_engine.chain_state import get_chain_state_store
+    from ..infra import security_policy as sp
+
     store = get_chain_state_store()
-    return _AgentState(store, agent_id or "default")
+    return _AgentState(store, sp.chain_bucket(agent_id))
 
 
 class _AgentState:
@@ -43,9 +67,16 @@ class _AgentState:
         a_next: dict,
         session_id: str,
         is_error: bool = False,
+        source_agent: str = "",
+        instance_id: str = "",
     ) -> dict:
         r = self.store.apply_action(
-            self.agent_id, a_next=a_next, session_id=session_id, is_error=is_error
+            self.agent_id,
+            a_next=a_next,
+            session_id=session_id,
+            is_error=is_error,
+            source_agent=source_agent,
+            instance_id=instance_id,
         )
         return {
             "matched": r.matched.to_judgment() if r.matched else None,
@@ -78,7 +109,7 @@ def _get_brain_store():
 def _get_brain_skill_manager():
     from ..brain.skill_manager import BrainSkillManager
     from pathlib import Path
-    skills_dir = Path(__file__).parent.parent / "skills"
+    skills_dir = default_skills_dir()
     return BrainSkillManager(skills_dir=skills_dir)
 
 
@@ -266,34 +297,37 @@ async def health():
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest):
+async def analyze(req: AnalyzeRequest, request: Request):
     try:
-        from ..adapters.observable import is_raw_format
         from ..engine.analyzer import analyze as run_analysis
         from ..profiles import get_profile
 
-        # Step 1: 适配器转换（如果传入的是原始 syscall 格式）
-        data = req.model_dump()
-        if is_raw_format(data):
-            from ..adapters import ObservableAdapter
-            adapter = ObservableAdapter()
-            adapted = adapter.adapt(data)
-            # 合并适配后的字段回 req
-            session_id = adapted.get("session_id", req.session_id)
-            prompt_session = adapted.get("prompt_session", req.prompt_session)
-            a_next = {"action_type": adapted["a_next"]["action_type"], "action_detail": adapted["a_next"]["action_detail"]}
-            action_history = [{"name": h.get("name", ""), "action_detail": h.get("action_detail", "")} for h in adapted.get("action_history", [])]
-            reason = adapted.get("reason", req.reason)
-            os_type = adapted.get("os_type", req.os_type)
-            cwd = adapted.get("cwd", req.cwd)
-        else:
-            session_id = req.session_id
-            prompt_session = req.prompt_session
-            a_next = {"action_type": req.a_next.action_type, "action_detail": req.a_next.action_detail}
-            action_history = [{"name": h.action_type, "action_detail": h.action_detail} for h in req.action_history]
-            reason = req.reason
-            os_type = req.os_type
-            cwd = req.cwd
+        # Step 1: 取字段（原始可观测格式已在 **模型校验前** 适配成标准格式 —— 见
+        # models.py::AnalyzeRequest._adapt_observable_format。这里不再分支：
+        # 原先的 `is_raw_format(req.model_dump())` 分支是**不可达死代码**，
+        # 因为真正的原始 payload 缺少必填的 a_next，会在校验处 422。）
+        session_id = req.session_id
+        prompt_session = req.prompt_session
+        # called_at 一并透传：L2 授权（consent）的时效窗（CONSENT_TTL_SECONDS）
+        # 需要「提问时刻」与「本次动作时刻」两侧都有时间戳才生效；缺了它就只剩
+        # 「最近 N 条」的距离窗口兜底。
+        a_next = {
+            "action_type": req.a_next.action_type,
+            "action_detail": req.a_next.action_detail,
+            "called_at": req.a_next.called_at,
+        }
+        # ⚠️ 必须透传 output（工具返回 = 用户对 ask_user_question 的回答）。
+        # L2 的授权（consent）判定看的是**用户答了什么**（logic_rules.py 的
+        # `action.get("output", "")`），不是提问正文。历史 bug：这里只映射
+        # name/action_detail，output 被丢掉 → 即使调用方传了用户已确认的回答，
+        # 引擎看到的仍是空 → 已授权的改密/删用户被判「未授权」。
+        # （TS 路由 routes.ts 早已透传 output，双端在此分叉；2026-10 修正。）
+        action_history = [
+            {**h.model_dump(), "name": h.action_type} for h in req.action_history
+        ]
+        reason = req.reason
+        os_type = req.os_type
+        cwd = req.cwd
 
         # prompt_history: 完整的交错历史 prompt（可选）。每轮 {"text", "actions"}，
         # 供 L2 意图一致性 / L3 语义分析使用；空则回退单条 prompt_session。
@@ -324,12 +358,48 @@ async def analyze(req: AnalyzeRequest):
         if not agent_id and req.metadata:
             agent_id = str(req.metadata.get("agent_type") or "")
 
+        # 安全（2026-10）：启用「每 agent 一个 token」后，请求声明的 agent_id 必须与
+        # token 对应 —— 否则任何人都能声称自己是 xiaoo 并往它的时间线里写东西。
+        # 未配置该模式时 principal 为空、bind_agent 恒放行（与历史行为一致）。
+        _principal = sp.principal_of(request.headers, request.url.path)
+        _bound_ok, agent_id = sp.bind_agent(_principal, agent_id)
+        if not _bound_ok:
+            raise HTTPException(
+                status_code=403,
+                detail=f"agent_id 与所持凭证不匹配: {agent_id}",
+            )
+
+        # 跨会话批量访问信号（2026-10）：正常 agent 只用自己的会话；拿到 token 的
+        # 冒充者为了凑组合链反例路径，常在短时间内声明大量不同 session_id。
+        # 默认只告警（不改变任何判定），AGENT_MOSS_SESSION_SWEEP_ACTION=deny 才拦截。
+        _sweep_key = _principal or ("ip:" + (getattr(request.client, "host", "") or "-"))
+        _sweep_n, _sweep_hit = sp.note_session_access(_sweep_key, session_id)
+        if _sweep_hit:
+            if sp.session_sweep_action() == "deny":
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"短时间内访问了 {_sweep_n} 个不同会话，超出阈值 "
+                        f"{sp.session_sweep_threshold()}（疑似冒充/扫描）"
+                    ),
+                )
+            logger.warning(
+                "⚠️ 跨会话批量访问: key=%s 窗口内 %d 个不同 session（阈值 %d）",
+                _sweep_key, _sweep_n, sp.session_sweep_threshold(),
+            )
+
         # Step 2: OS 自动检测
         if not os_type:
             os_type = platform.system().lower()
             # 非 Windows 统一用 linux
             if os_type != "windows":
                 os_type = "linux"
+
+        # 来源实例：仅用于展示层脱敏（同实例不隐藏），不参与判定。
+        instance_id = str(
+            (getattr(req, "instance_id", "") or "")
+            or ((req.metadata or {}).get("instance_id") or "")
+        )
 
         # Step 3: 获取 OS Profile 并调用分析引擎
         profile = get_profile(os_type)
@@ -340,6 +410,10 @@ async def analyze(req: AnalyzeRequest):
         # analysis is in progress (synchronous blocking call in async handler).
         loop = asyncio.get_event_loop()
         llm_config = req.metadata.get("llm_config") if req.metadata else None
+        # 严格模式：完全不接受 per-request LLM 配置（默认接受，保持原行为）
+        if llm_config and not sp.per_request_llm_enabled():
+            logger.info("已忽略请求携带的 metadata.llm_config（AGENT_MOSS_ALLOW_PER_REQUEST_LLM=0）")
+            llm_config = None
         llm_log_path = req.metadata.get("llm_log_path") if req.metadata else None
         # ⚠️ 必须用关键字参数调用 analyze：analyze 签名含 scenario_id（6abe6c6 在
         # llm_log_path 之前插入），此前按位置传参（14 实参对 15 形参）从第 12 位起
@@ -365,6 +439,7 @@ async def analyze(req: AnalyzeRequest):
                 llm_log_path=llm_log_path,  # 来自 req.metadata.llm_log_path（per-request 日志路径）
                 prompt_history=prompt_history,   # 交错历史 prompt（可选）
                 session_history=session_history,  # 多 session 历史（L2.2 跨会话验证）
+                instance_id=instance_id,  # 来源实例（仅展示层脱敏）
             ),
         )
         duration_ms = (time.monotonic() - start) * 1000
@@ -400,6 +475,9 @@ async def analyze(req: AnalyzeRequest):
                     a_next,
                     session_id=session_id,
                     is_error=bool(metadata.get("is_error", False)),
+                    # 来源：真实 agent（不是桶 key），仅用于链路径取证/展示
+                    source_agent=agent_id,
+                    instance_id=instance_id,
                 )
                 if inc["should_block"]:
                     j = inc["matched"] or (inc["exfil"][0] if inc["exfil"] else None)
@@ -414,8 +492,14 @@ async def analyze(req: AnalyzeRequest):
                             risk_level=j.get("risk_level", "high"),
                             risk_type="formal_verification",
                             violated_layers=violated,
-                            # 反例路径：每步 [session_id, seq, stage, timestamp]
-                            violation_chain=j.get("path", []) or [],
+                            # 反例路径：每步 [session_id, seq, action_detail, timestamp]
+                            # 安全（2026-10）：跨会话节点脱敏 —— 这条时间线按 agent_id
+                            # 共享，别人能往里写；原样返回等于把别人的命令原文递出去。
+                            # 当前会话的节点保持原样（本来就是调用方自己的数据）。
+                            violation_chain=sp.redact_chain(
+                                j.get("path", []) or [], instance_id, session_id),
+                            violation_graph=sp.redact_graph(
+                                j.get("graph"), instance_id, session_id),
                         )
                         logger.info(
                             "stateful 增量拦截: agent=%s property=%s risk=%s",
@@ -435,10 +519,12 @@ async def analyze(req: AnalyzeRequest):
             confidence=result.get("confidence", 100),
             analysis_duration_ms=duration_ms,
             violation_chain=result.get("violation_chain", []) or [],
+            violation_graph=sp.redact_graph(result.get("violation_graph"), instance_id, session_id),
         )
+    except HTTPException:
+        raise  # 鉴权/越界等显式状态码不能被兜底 500 覆盖
     except Exception as e:
-        logger.exception("Analysis failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @router.post("/review", response_model=ReviewResponse)
@@ -456,9 +542,22 @@ async def review(req: ReviewRequest):
         from ..engine.formal_engine.chain_state import get_chain_state_store
         from .agent_gate_reader import load_agent_gate_sessions
 
+        # 安全（2026-10）：db_path 原先可以是任意本地路径 —— 等于让调用方指定
+        # 「读哪个文件」。现在限制在 AgentGate 标准目录 + AGENT_MOSS_REVIEW_PATHS。
+        if req.db_path and not sp.path_within(req.db_path, sp.review_roots()):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "db_path 不在允许读取的目录内；标准 AgentGate 部署无需配置，"
+                    "自定义路径请加入 AGENT_MOSS_REVIEW_PATHS"
+                ),
+            )
+
         agent_id = req.agent_id or "default"
         store = get_chain_state_store()
-        tracker = store.load_or_new(agent_id)
+        # 与实时链路同一个桶：review 全量读到的历史要写进增量引擎之后会读的位置，
+        # 否则"谁触发 review 谁才有跨 agent 历史"的不一致会一直存在。
+        tracker = store.load_or_new(sp.chain_bucket(agent_id))
 
         # 1. 读取历史（db_path 直读 > 显式 sessions）
         sessions: list[dict] = []
@@ -514,6 +613,19 @@ async def review(req: ReviewRequest):
                 min_sup=2,
             )
 
+        # 5. 结果出口（2026-10）：review 是 fire-and-forget，调用方（AgentGate）
+        #    只检查 HTTP 状态码、不解析响应体 —— 违规结果此前**没有任何出口**，
+        #    全量范围内的 P3–P8 等于静默漏报。这里至少落一条 warning，让
+        #    "历史上存在完整攻击链"这件事可见。
+        if violations:
+            logger.warning(
+                "全量回顾发现性质违规: agent=%s count=%d properties=%s",
+                agent_id or "-", len(violations),
+                ", ".join(str(v.get("property_id", "?")) for v in violations[:8]),
+            )
+        elif not verified:
+            logger.warning("全量回顾 verified=False 但未返回 violation 明细: agent=%s", agent_id or "-")
+
         return ReviewResponse(
             agent_id=agent_id,
             seeded_nodes=added,
@@ -523,6 +635,7 @@ async def review(req: ReviewRequest):
             state_nodes=len(tracker.nodes),
             discovered_patterns=discovered,
         )
+    except HTTPException:
+        raise  # 鉴权/越界等显式状态码不能被兜底 500 覆盖
     except Exception as e:
-        logger.exception("Review failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)

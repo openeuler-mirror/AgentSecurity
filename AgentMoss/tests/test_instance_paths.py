@@ -1,6 +1,6 @@
 """instance 数据目录隔离 + 数据归属用户 的单元测试。
 
-对齐 TS ts/src/infra/paths.test.ts。验证：
+验证：
 - 无 instance → <data_root>/agent_moss_token_stats.json
 - 有 instance → <data_root>/<instance>/agent_moss_token_stats.json
 - AGENT_MOSS_DATA_DIR 覆盖数据根（root 服务写当前用户目录）
@@ -54,27 +54,25 @@ def test_data_root_override():
     assert Path(_fresh_token_path()) == Path("/home/hkl/.config/agentmoss/opendesk/agent_moss_token_stats.json")
 
 
-def test_root_fallback_to_owner_home(monkeypatch):
-    """root 运行时（非 install 注入，env 未设）探测真实用户目录，而非 /root。"""
+def test_root_uses_root_home(monkeypatch):
+    """root 运行时（sudo systemctl / 直接 root 启动）数据就落在 /root，不猜真实用户。"""
     from agent_moss.infra import paths
     monkeypatch.setattr(paths, "_is_root", lambda: True)
-    monkeypatch.setattr(paths, "_resolve_owner_home", lambda: Path("/home/hkl"))
     # 清掉 env，模拟任何 sudo systemctl start（无 AGENT_MOSS_DATA_DIR）
     os.environ.pop("AGENT_MOSS_DATA_DIR", None)
     os.environ.pop("AGENT_MOSS_INSTANCE", None)
-    assert Path(paths.get_data_root()) == Path("/home/hkl/.config/agentmoss")
-    assert Path(paths.get_token_stats_path()) == Path("/home/hkl/.config/agentmoss/agent_moss_token_stats.json")
+    assert Path(paths.get_data_root()) == paths.DEFAULT_DATA_ROOT
+    assert Path(paths.get_token_stats_path()) == paths.DEFAULT_DATA_ROOT / "agent_moss_token_stats.json"
 
 
-def test_root_fallback_respects_instance(monkeypatch):
-    """root + instance 时，token 落到 <owner_home>/<instance>/。"""
+def test_root_uses_root_home_respects_instance(monkeypatch):
+    """root + instance 时，token 落到 <root 数据目录>/<instance>/。"""
     from agent_moss.infra import paths
     monkeypatch.setattr(paths, "_is_root", lambda: True)
-    monkeypatch.setattr(paths, "_resolve_owner_home", lambda: Path("/home/hkl"))
     os.environ.pop("AGENT_MOSS_DATA_DIR", None)
     os.environ["AGENT_MOSS_INSTANCE"] = "xiaoo"
-    assert Path(paths.get_token_stats_path()) == Path(
-        "/home/hkl/.config/agentmoss/xiaoo/agent_moss_token_stats.json"
+    assert Path(paths.get_token_stats_path()) == (
+        paths.DEFAULT_DATA_ROOT / "xiaoo" / "agent_moss_token_stats.json"
     )
 
 

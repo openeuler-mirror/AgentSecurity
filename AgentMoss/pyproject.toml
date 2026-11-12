@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-moss"
-version = "0.15.1"
+version = "0.17.22"
 description = "Multi-layer security analysis engine for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"

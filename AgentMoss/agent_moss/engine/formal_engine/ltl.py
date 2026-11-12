@@ -16,7 +16,7 @@ LTL 公式 AST（嵌套列表，在事件迹位置 0 处评估，公式满足 = 
   ["U", l, r]         until：存在 j 使 r 在 j 成立，且 [i, j) 内 l 一直成立
 
 witness 语义（修复"历史全局匹配 → 永久拒绝锁定"FP，与 properties.py 的
-witness_idx 对齐，见 docs/DETECTION_METHODS.md 6.3）：
+witness_idx 对齐）：
   实时判定只当**当前动作（a_next = 图末节点）是使公式从不满足变为满足的必要
   witness**时才判违规：公式在"含当前动作的迹"上成立，且在"不含当前动作的迹"
   上不成立 → 当前动作触发了攻击模式。历史中已随机出现的完整模式不再误伤后续

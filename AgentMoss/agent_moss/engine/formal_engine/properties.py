@@ -15,9 +15,12 @@ fail-closed：阶段标记/资源提取无法确认时按"已发生"保守处理
 性质验证对任何"可能违反"路径即报反例（宁可多拦，不可漏）。
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable
+
+from ...rules_loader import load_formal_rules
 
 from .decode import strip_string_literals
 from .ir import MultiSessionGraph, PropertyViolation
@@ -71,6 +74,67 @@ _EXFIL_ACTION_RE = re.compile(
 )
 
 
+def _node_key(session_id, seq) -> tuple:
+    return (str(session_id), int(seq))
+
+
+def _graph_from_path(
+    graph: MultiSessionGraph,
+    path: list,
+    edge_type: str = "next",
+    property_meta: dict | None = None,
+    roles: list | None = None,
+    witness_last: bool = True,
+    property_expression: list | None = None,
+) -> dict:
+    """把反例路径转成前端可画的结构化图：节点 + 相邻边。
+
+    节点信息从行为图反查（取完整 action_detail / stage / resources），
+    路径里只有 (session_id, seq, detail) 三元组时也能降级构造。
+    property_meta：性质元信息（property_id / property_short / property_name）。
+    roles：每个路径节点在性质中的角色（如 P1 的 LISTEN/EXEC/SCAN）。
+    property_expression：性质表达式 token 与节点位置的对应关系，
+        如 [{"token": "LISTEN", "node_index": 0}, ...]。
+    """
+    by_key = {_node_key(n.session_id, n.seq): n for n in graph.all_nodes}
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    for item in path:
+        sid, seq = item[0], item[1]
+        n = by_key.get(_node_key(sid, seq))
+        if n is not None:
+            nodes.append({
+                "session_id": n.session_id,
+                "seq": n.seq,
+                "stage": n.stage,
+                "action_detail": n.action_detail,
+                "resources": sorted(n.resources),
+                "instance_id": n.instance_id,
+            })
+        else:
+            nodes.append({
+                "session_id": sid,
+                "seq": seq,
+                "stage": "",
+                "action_detail": str(item[2]) if len(item) > 2 else "",
+                "resources": [],
+                "instance_id": "",
+            })
+        if len(nodes) > 1:
+            edges.append({"from": len(nodes) - 2, "to": len(nodes) - 1, "type": edge_type})
+    for i, role in enumerate(roles or []):
+        if i < len(nodes) and role:
+            nodes[i]["role"] = role
+    if witness_last and nodes:
+        nodes[-1]["witness"] = True
+    out: dict = {"nodes": nodes, "edges": edges}
+    if property_meta:
+        out.update(property_meta)
+    if property_expression:
+        out["property_expression"] = property_expression
+    return out
+
+
 def check_cross_session_chain(graph: MultiSessionGraph) -> list[PropertyViolation]:
     """P1：跨会话组合链 — 阶段子序列匹配作用于拼接图。
 
@@ -80,7 +144,7 @@ def check_cross_session_chain(graph: MultiSessionGraph) -> list[PropertyViolatio
     witness 语义（graph.witness_idx 非 None，实时判定）：
       只当**当前动作（a_next = 图末节点）补全链的最后阶段**时才判违规——
       历史中已随机出现的完整链不再影响后续良性动作（修复"历史全局匹配 →
-      永久拒绝锁定"FP，见 docs/DETECTION_METHODS.md 六.3；对齐站点 L2.2
+      永久拒绝锁定"FP，对齐站点 L2.2
       "仅当当前事件属于 violation witness 时才返回 block"）。
     witness_idx 为 None（低频回顾 /api/v1/review 全量历史）时保留原行为：
       报告历史中已形成的任何完整链。
@@ -115,6 +179,19 @@ def check_cross_session_chain(graph: MultiSessionGraph) -> list[PropertyViolatio
                 reason=chain["reason"],
                 risk_level=chain["risk_level"],
                 path=path,
+                graph=_graph_from_path(
+                    graph, path,
+                    property_meta={
+                        "property_id": "cross-" + chain["id"],
+                        "property_short": "P1",
+                        "property_name": "跨会话组合链",
+                    },
+                    roles=list(stages),
+                    property_expression=[
+                        {"token": s, "node_index": i}
+                        for i, s in enumerate(stages)
+                    ],
+                ),
             ))
             return violations  # 命中即停（与 L2 短路语义一致）
         else:
@@ -135,6 +212,19 @@ def check_cross_session_chain(graph: MultiSessionGraph) -> list[PropertyViolatio
                     reason=chain["reason"],
                     risk_level=chain["risk_level"],
                     path=path,
+                    graph=_graph_from_path(
+                        graph, path,
+                        property_meta={
+                            "property_id": "cross-" + chain["id"],
+                            "property_short": "P1",
+                            "property_name": "跨会话组合链",
+                        },
+                        roles=list(stages),
+                        property_expression=[
+                            {"token": s, "node_index": i}
+                            for i, s in enumerate(stages)
+                        ],
+                    ),
                 ))
     return violations
 
@@ -160,14 +250,17 @@ def check_sensitive_data_flow(graph: MultiSessionGraph) -> list[PropertyViolatio
     if not nodes:
         return violations
 
-    # taint: node_idx -> 来源描述
-    tainted: dict[int, str] = {}
+    # taint: node_idx -> (来源描述, 父节点索引或 None)
+    tainted: dict[int, tuple[str, int | None]] = {}
     for i, n in enumerate(nodes):
         if n.stage == "CRED" and any(_CRED_FILE_RE.search(r) for r in n.resources):
-            tainted[i] = f"{n.session_id}#{n.seq} 访问 {sorted(n.resources)[0]}"
+            tainted[i] = (f"{n.session_id}#{n.seq} 访问 {sorted(n.resources)[0]}", None)
 
     if not tainted:
         return violations
+
+    # 传播边记录：(parent, child) -> 共享资源（前端图上的 data 边标签）
+    taint_edges: dict[tuple[int, int], str] = {}
 
     # 前向传播（迭代直到收敛；图小，线性可接受）
     changed = True
@@ -175,11 +268,61 @@ def check_sensitive_data_flow(graph: MultiSessionGraph) -> list[PropertyViolatio
         changed = False
         for e in graph.all_edges:
             if e.src in tainted and e.dst not in tainted:
-                src_res = nodes[e.src].resources
-                dst_res = nodes[e.dst].resources
-                if src_res & dst_res:  # 共享资源 → 传播
-                    tainted[e.dst] = tainted[e.src]
+                shared = nodes[e.src].resources & nodes[e.dst].resources
+                if shared:  # 共享资源 → 传播
+                    tainted[e.dst] = (tainted[e.src][0], e.src)
+                    taint_edges[(e.src, e.dst)] = sorted(shared)[0]
                     changed = True
+
+    def _trace_path(idx: int) -> list[int]:
+        """沿 parent 回溯出 taint 源 → 当前节点的完整路径。"""
+        chain = [idx]
+        seen = {idx}
+        while tainted[chain[-1]][1] is not None:
+            parent = tainted[chain[-1]][1]
+            if parent in seen:  # 防御环
+                break
+            chain.append(parent)
+            seen.add(parent)
+        return list(reversed(chain))
+
+    def _taint_graph(chain: list[int]) -> dict:
+        g_nodes: list[dict] = []
+        g_edges: list[dict] = []
+        for k, ni in enumerate(chain):
+            n = nodes[ni]
+            role = "source" if k == 0 else ("sink" if k == len(chain) - 1 else "carrier")
+            g_nodes.append({
+                "session_id": n.session_id,
+                "seq": n.seq,
+                "stage": n.stage,
+                "action_detail": n.action_detail,
+                "resources": sorted(n.resources),
+                "role": role,
+                "instance_id": n.instance_id,
+            })
+            if k > 0:
+                prev = chain[k - 1]
+                g_edges.append({
+                    "from": k - 1,
+                    "to": k,
+                    "type": "data",
+                    "label": taint_edges.get((prev, ni), ""),
+                })
+        if g_nodes:
+            g_nodes[-1]["witness"] = True
+        expr: list[dict] = [{"token": "CRED", "node_index": 0}]
+        if len(chain) > 2:
+            expr.append({"token": "共享载体", "node_index": list(range(1, len(chain) - 1))})
+        expr.append({"token": "EXFIL", "node_index": len(chain) - 1})
+        return {
+            "property_id": "sensitive-data-flow",
+            "property_short": "P2",
+            "property_name": "敏感数据传播外传",
+            "property_expression": expr,
+            "nodes": g_nodes,
+            "edges": g_edges,
+        }
 
     witness = graph.witness_idx
     # 检查 tainted 动作是否外传（witness 语义：只查当前动作；回顾：查全部）
@@ -187,11 +330,13 @@ def check_sensitive_data_flow(graph: MultiSessionGraph) -> list[PropertyViolatio
     for i in candidates:
         n = nodes[i]
         if i in tainted and _EXFIL_RE.search(n.action_detail):
+            chain = _trace_path(i)
             violations.append(PropertyViolation(
                 property_id="sensitive-data-flow",
-                reason=f"敏感数据传播外传：{tainted[i]} → {n.session_id}#{n.seq} 经共享载体外发",
+                reason=f"敏感数据传播外传：{tainted[i][0]} → {n.session_id}#{n.seq} 经共享载体外发",
                 risk_level="critical",
-                path=[(n.session_id, n.seq, n.action_detail[:60])],
+                path=[(nodes[j].session_id, nodes[j].seq, nodes[j].action_detail[:60]) for j in chain],
+                graph=_taint_graph(chain),
             ))
             if witness is not None:
                 return violations  # 实时判定命中即停
@@ -241,9 +386,11 @@ def _extract_inline_shell(s: str) -> list[str]:
 
 
 # 包管理器：sudo 后第一个词是它们 → 装包/运维，非提权
-_PKG_MGR = frozenset({"apt", "apt-get", "aptitude", "yum", "dnf", "pacman", "zypper", "apk", "brew"})
+# 名单：单一事实源 rules/formal_rules.json（双端同源）。
+_FORMAL_RULES = load_formal_rules()
+_PKG_MGR = frozenset((_FORMAL_RULES.get("privesc") or {}).get("package_managers") or ())
 # sudo 后紧跟的裸 shell 提权词（第一个 token）
-_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "nologin"})
+_SHELLS = frozenset((_FORMAL_RULES.get("privesc") or {}).get("bare_shells") or ())
 
 
 def _contains_privesc(shell: str) -> bool:
@@ -351,12 +498,70 @@ def _is_exfil_node(n) -> bool:
     return False
 
 
+def _parse_ts(ts: str | None) -> float | None:
+    """解析 called_at（ISO 或 ``YYYY-MM-DD HH:MM:SS``）。失败返回 None。"""
+    if not ts:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        s = str(ts).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _privesc_exfil_window_sec() -> int:
+    """提权→外传的时间窗口（秒）。默认 1800；0 = 不限（旧行为）。
+
+    为什么需要：P4 的语义是"提权后任意外传即违例"。没有窗口时，三天前
+    ``sudo bash`` 装软件、今天正常 ``curl`` 上传日志也会命中 —— 这是范式
+    精度问题，不是范围问题，局部窗口同样存在。窗口把"很久以前、与本次
+    外传无关的提权"排除掉。
+    """
+    raw = (os.getenv("AGENT_MOSS_PRIVESC_EXFIL_WINDOW_SEC") or "").strip()
+    if not raw:
+        return 1800
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1800
+
+
+def _privesc_in_window(nodes, privesc_at: list[int], exfil_idx: int, window_sec: int) -> list[int]:
+    """只保留 EXFIL 之前、且距 EXFIL 不超过窗口的 PRIVESC（按节点顺序过滤）。
+
+    无时间戳的节点**保守保留**（宁可多拦）；EXFIL 本身无时间戳时不过滤，
+    行为与加窗口前完全一致。
+    """
+    if window_sec <= 0:
+        return [i for i in privesc_at if i < exfil_idx]
+    exfil_ts = _parse_ts(getattr(nodes[exfil_idx], "timestamp", None))
+    if exfil_ts is None:
+        return [i for i in privesc_at if i < exfil_idx]
+    out: list[int] = []
+    for i in privesc_at:
+        if i >= exfil_idx:
+            continue
+        ts = _parse_ts(getattr(nodes[i], "timestamp", None))
+        if ts is None or exfil_ts - ts <= window_sec:
+            out.append(i)
+    return out
+
+
 def check_never_exfil_after_privesc(graph: MultiSessionGraph) -> list[PropertyViolation]:
-    """P3：□(PRIVESC → ¬◇ EXFIL) — 一旦出现提权，任意外传（跨 session/时距）即违例。
+    """P3：□(PRIVESC → ¬◇ EXFIL) — 提权后**窗口内**的外传即违例。
 
     独立于预置链 `privesc-cred-exfil`（那要求按序 PRIVESC→CRED→EXFIL 三段且
-    由固定链定义驱动）；这里只要求图上存在"任意 PRIVESC 在前、任意 EXFIL 在后"
-    的事件对即拦截——覆盖乱序/跨会话/中间夹杂大量无关动作的变体。
+    由固定链定义驱动）；这里只要求图上存在"PRIVESC 在前、EXFIL 在后"的事件
+    对即拦截——覆盖乱序/跨会话/中间夹杂大量无关动作的变体。
+
+    **时间窗口（2026-10）**：只在"提权 → 外传"间隔不超过
+    ``AGENT_MOSS_PRIVESC_EXFIL_WINDOW_SEC``（默认 1800 秒）时判违规。
+    没有时间戳（旧调用方 / 旧数据）时退回不设窗口的旧行为。
 
     witness 语义（graph.witness_idx 非 None，实时判定）：只当**当前动作
     （a_next = 图末节点）**是 EXFIL 且历史中有 PRIVESC 在前才判违规——历史中
@@ -371,6 +576,7 @@ def check_never_exfil_after_privesc(graph: MultiSessionGraph) -> list[PropertyVi
     if len(nodes) < 2:
         return violations
     witness = graph.witness_idx
+    window = _privesc_exfil_window_sec()
     # PRIVESC 前置以"提权语义"为准（stage 或文本）；EXFIL 后置以 _is_exfil_node。
     privesc_at: list[int] = [i for i, n in enumerate(nodes) if _is_privesc_node(n)]
     if not privesc_at:
@@ -382,29 +588,55 @@ def check_never_exfil_after_privesc(graph: MultiSessionGraph) -> list[PropertyVi
         if not ev_idx:
             return violations
         first_ev = min(ev_idx)
-        if any(i < first_ev for i in privesc_at):
-            pre = [nodes[i] for i in privesc_at if i < first_ev][-1]
+        candidates = _privesc_in_window(nodes, privesc_at, first_ev, window)
+        if candidates:
+            pre = nodes[candidates[-1]]
             post = nodes[first_ev]
+            path = [(pre.session_id, pre.seq, pre.action_detail[:60]),
+                    (post.session_id, post.seq, post.action_detail[:60])]
             return [PropertyViolation(
                 property_id="no-exfil-after-privesc",
-                reason="提权后出现外传：提权(前) → 外传(后)，违反 □(PRIVESC→¬◇EXFIL)",
+                reason="提权后出现外传：提权(前) → 外传(后)，违反 □(PRIVESC→◇EXFIL) 窗口约束",
                 risk_level="critical",
-                path=[(pre.session_id, pre.seq, pre.action_detail[:60]),
-                      (post.session_id, post.seq, post.action_detail[:60])],
+                path=path,
+                graph=_graph_from_path(
+                    graph, path, "next",
+                    {"property_id": "no-exfil-after-privesc",
+                     "property_short": "P4",
+                     "property_name": "提权后禁止外传"},
+                    ["privesc", "sink"],
+                    True,
+                    [{"token": "PRIVESC", "node_index": 0},
+                     {"token": "EXFIL", "node_index": 1}],
+                ),
             )]
         return violations
     for i in privesc_at:
         for j in range(i + 1, len(nodes)):
             n = nodes[j]
-            if _is_exfil_node(n):
-                violations.append(PropertyViolation(
-                    property_id="no-exfil-after-privesc",
-                    reason="提权后出现外传：提权(前) → 外传(后)，违反 □(PRIVESC→¬◇EXFIL)",
-                    risk_level="critical",
-                    path=[(nodes[i].session_id, nodes[i].seq, nodes[i].action_detail[:60]),
-                          (n.session_id, n.seq, n.action_detail[:60])],
-                ))
-                return violations  # 一条足矣，命中即停
+            if not _is_exfil_node(n):
+                continue
+            if not _privesc_in_window(nodes, [i], j, window):
+                continue
+            path = [(nodes[i].session_id, nodes[i].seq, nodes[i].action_detail[:60]),
+                    (n.session_id, n.seq, n.action_detail[:60])]
+            violations.append(PropertyViolation(
+                property_id="no-exfil-after-privesc",
+                reason="提权后出现外传：提权(前) → 外传(后)，违反 □(PRIVESC→◇EXFIL) 窗口约束",
+                risk_level="critical",
+                path=path,
+                graph=_graph_from_path(
+                    graph, path, "next",
+                    {"property_id": "no-exfil-after-privesc",
+                     "property_short": "P4",
+                     "property_name": "提权后禁止外传"},
+                    ["privesc", "sink"],
+                    True,
+                    [{"token": "PRIVESC", "node_index": 0},
+                     {"token": "EXFIL", "node_index": 1}],
+                ),
+            ))
+            return violations  # 一条足矣，命中即停
     return violations
 
 
@@ -458,24 +690,46 @@ def check_never_exfil_after_cred(graph: MultiSessionGraph) -> list[PropertyViola
         if any(i < first_ev for i in cred_at):
             pre = [nodes[i] for i in cred_at if i < first_ev][-1]
             post = nodes[first_ev]
+            path = [(pre.session_id, pre.seq, pre.action_detail[:60]),
+                    (post.session_id, post.seq, post.action_detail[:60])]
             return [PropertyViolation(
                 property_id="no-exfil-after-credential",
                 reason="读取凭据后出现外传，违反 □(CRED→¬◇EXFIL)",
                 risk_level="critical",
-                path=[(pre.session_id, pre.seq, pre.action_detail[:60]),
-                      (post.session_id, post.seq, post.action_detail[:60])],
+                path=path,
+                graph=_graph_from_path(
+                    graph, path, "data",
+                    {"property_id": "no-exfil-after-credential",
+                     "property_short": "P5",
+                     "property_name": "读取凭据后禁止外传"},
+                    ["source", "sink"],
+                    True,
+                    [{"token": "CRED", "node_index": 0},
+                     {"token": "EXFIL", "node_index": 1}],
+                ),
             )]
         return violations
     for i in cred_at:
         for j in range(i + 1, len(nodes)):
             n = nodes[j]
             if _is_exfil_node(n):
+                path = [(nodes[i].session_id, nodes[i].seq, nodes[i].action_detail[:60]),
+                        (n.session_id, n.seq, n.action_detail[:60])]
                 violations.append(PropertyViolation(
                     property_id="no-exfil-after-credential",
                     reason="读取凭据后出现外传，违反 □(CRED→¬◇EXFIL)",
                     risk_level="critical",
-                    path=[(nodes[i].session_id, nodes[i].seq, nodes[i].action_detail[:60]),
-                          (n.session_id, n.seq, n.action_detail[:60])],
+                    path=path,
+                    graph=_graph_from_path(
+                        graph, path, "data",
+                        {"property_id": "no-exfil-after-credential",
+                         "property_short": "P5",
+                         "property_name": "读取凭据后禁止外传"},
+                        ["source", "sink"],
+                        True,
+                        [{"token": "CRED", "node_index": 0},
+                         {"token": "EXFIL", "node_index": 1}],
+                    ),
                 ))
                 return violations
     return violations
@@ -511,7 +765,7 @@ _COMPUTE_RE = re.compile(
     re.IGNORECASE,
 )
 # 解释器/终端类 action_type：直接算 compute（无论 detail）
-_STRONG_COMPUTE_TYPES = {"python", "node", "exec", "terminal", "cmd"}
+_STRONG_COMPUTE_TYPES = frozenset(_FORMAL_RULES.get("compute_action_types") or ())
 
 
 def _is_compute_node(n) -> bool:
@@ -594,6 +848,24 @@ def check_low_integrity_command_exec(graph: MultiSessionGraph) -> list[PropertyV
 # ==================== Rule 12 敏感数据聚合外传 ====================
 
 
+# P8 的来源特征：只有**实际读取文件内容**的动作才算"收集数据"。
+# ls/stat/file 等元数据查看、echo/printf 写入只是"接触资源"，不构成数据源。
+# 2026-10 修误报：`ls -l f; echo x > f` 两个事件曾把一次普通外传误判为
+# "聚合 2 个数据源"（两个都只是碰了同一个文件，没有读取其内容）。
+_DATA_SOURCE_READ_RE = re.compile(
+    r"\b(?:cat|head|tail|less|more|sed|awk|grep|strings|base64|xxd|od|dd)\b"
+    r"|\b(?:open|read_text|read_bytes)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _is_data_source_node(n) -> bool:
+    """P8 的来源节点：CRED 访问、低完整性源、或显式读取文件内容。"""
+    if n.stage == "CRED" or n.is_low_source:
+        return True
+    return bool(_DATA_SOURCE_READ_RE.search(n.action_detail))
+
+
 def check_sensitive_data_aggregation(graph: MultiSessionGraph) -> list[PropertyViolation]:
     """Rule 12：sensitive-data-aggregation — egress 聚合 ≥2 个不同事件源。
 
@@ -618,12 +890,19 @@ def check_sensitive_data_aggregation(graph: MultiSessionGraph) -> list[PropertyV
             res_index.setdefault(r, []).append(i)
 
     def _sources_for(exfil_idx: int) -> set:
-        """EXFIL 节点经共享载体接触过的去重事件源（session_id, seq）。"""
+        """EXFIL 节点经共享载体接触过的去重**数据来源**事件（session_id, seq）。
+
+        只统计真正的数据来源（CRED / 低完整性源 / 显式读取），排除 ls、echo
+        写入等仅"接触资源"的事件——否则一次普通外传会被前置的元数据查看和
+        普通写入误判为"聚合 2 源"（2026-10 FP 修复）。
+        """
         srcs: set = set()
         n = nodes[exfil_idx]
         for r in n.resources:
             for j in res_index.get(r, []):
                 if j == exfil_idx:
+                    continue
+                if not _is_data_source_node(nodes[j]):
                     continue
                 srcs.add((nodes[j].session_id, nodes[j].seq))
         return srcs
@@ -640,6 +919,15 @@ def check_sensitive_data_aggregation(graph: MultiSessionGraph) -> list[PropertyV
                 reason=f"敏感数据聚合外传：egress 聚合 {len(srcs)} 个事件源数据（Rule 12）",
                 risk_level="critical",
                 path=[(n.session_id, n.seq, n.action_detail[:60])],
+                graph=_graph_from_path(
+                    graph, [(n.session_id, n.seq, n.action_detail[:60])], "next",
+                    {"property_id": "sensitive-data-aggregation",
+                     "property_short": "P8",
+                     "property_name": "敏感数据聚合外传"},
+                    ["sink"],
+                    True,
+                    [{"token": "EXFIL", "node_index": 0}],
+                ),
             ))
             if witness is not None:
                 return violations  # 实时判定命中即停

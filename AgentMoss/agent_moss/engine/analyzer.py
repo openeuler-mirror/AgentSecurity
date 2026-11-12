@@ -12,6 +12,7 @@ Step 2: Allow → 查缓存 / 生成 policy
   → 返回 Allow + policy
 """
 
+import logging
 import tempfile
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..profiles.base import OSProfile
 
-from ..infra.config import Config, get_default_config, is_policy_gen_enabled
+from ..infra.config import Config, get_agent_moss_setting, get_default_config, is_policy_gen_enabled
 from ..infra.llm_client import call_llm
 from ..infra.parsers import parse_policy_from_llm
 from ..infra.policy_cache import PolicyCache, get_default_cache
@@ -76,6 +77,7 @@ def analyze(
     llm_log_path: str | None = None,
     prompt_history: list[dict[str, object]] | None = None,
     session_history: list[dict[str, object]] | None = None,
+    instance_id: str = "",
 ) -> dict[str, str]:
     """
     分析 agent 的下一步动作是否在安全范围内，并在允许时生成最小 policy。
@@ -128,6 +130,7 @@ def analyze(
             llm_log_path=llm_log_path,
             prompt_history=prompt_history,
             session_history=session_history,
+            instance_id=instance_id,
         )
 
         if not judgment.allowed:
@@ -145,6 +148,9 @@ def analyze(
                 "risk_level": judgment.risk_level,
                 "risk_type": judgment.risk_type,
                 "confidence": judgment.confidence,
+                # 组合式拦截的结构化攻击链（前端可视化）；普通单步拦截为空
+                "violation_graph": judgment.violation_graph,
+                "violation_chain": judgment.violation_chain,
             }
             moss_log.log_result("Deny", result["reason"])
             return result
@@ -320,9 +326,39 @@ def analyze(
         return result
 
 
-def _save_policy_to_file(session_id: str, policy_toml: str) -> Path:
-    POLICY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = session_id.replace("/", "_").replace("\\", "_")
-    filepath = POLICY_OUTPUT_DIR / f"{safe_name}.toml"
-    _ = filepath.write_text(policy_toml, encoding="utf-8")
-    return filepath
+def _save_policy_to_file(session_id: str, policy_toml: str) -> Path | None:
+    """把最小权限 Policy 落盘到 {临时目录}/agent_moss/{session_id}.toml。
+
+    落盘是给**执行侧沙箱**（按会话读取该文件配置 Landlock/namespace 隔离）用的；
+    若调用方只取 analyze() 返回的 decision/policy 字段、不做沙箱隔离，则这份文件
+    纯属无谓 I/O（每次 Allow 都写，实测 ~0.6ms/次；session_id 唯一时还会按请求
+    堆积）。此类调用方可设 ``AGENT_MOSS_SAVE_POLICY=0`` 关闭落盘——只影响文件，
+    analyze() 返回值与判定结果不变。
+    """
+    if get_agent_moss_setting("AGENT_MOSS_SAVE_POLICY", "1") == "0":
+        return None
+    # ⚠️ 落盘失败**绝不能影响分析结果**：这份文件只是给执行侧沙箱用的旁路产物
+    # （见上方说明），analyze() 的返回值与判定与它无关。
+    # 历史 bug：这里不设防，于是 /tmp/agent_moss/ 下若恰好有**同名但不可写**的旧文件
+    # （实测本机有 25 个 root 拥有的残留，历史上 root 跑过一次就会留下），
+    # write_text 抛 PermissionError → 整步异常 → 外层 fail-closed → **一律 Deny
+    # 「未知异常」**。表现是"同一个 session_id 在一台机器上永远 Deny、换台机器就好"，
+    # 判定随 /tmp 内容变化，且失败方向是误报。
+    try:
+        # 安全（2026-10）：/tmp 下的固定目录可被他人预创建/换成符号链接。
+        # 目录必须是我们的、非符号链接、0700；写入用 O_NOFOLLOW + 0600。
+        from ..infra import security_policy as sp
+        if not sp.ensure_private_dir(POLICY_OUTPUT_DIR):
+            logging.getLogger("agent_moss").warning(
+                "Policy 输出目录 %s 不安全（被其他用户拥有或为符号链接），跳过落盘"
+                "（不影响判定与返回值）", POLICY_OUTPUT_DIR)
+            return None
+        safe_name = session_id.replace("/", "_").replace("\\", "_").replace("..", "__")
+        filepath = POLICY_OUTPUT_DIR / f"{safe_name}.toml"
+        sp.write_private_text(filepath, policy_toml)
+        return filepath
+    except OSError as e:
+        logging.getLogger("agent_moss").warning(
+            "策略文件落盘失败（不影响判定）: %s: %s", POLICY_OUTPUT_DIR, e,
+        )
+        return None

@@ -1,0 +1,8 @@
+{
+  "gate_url": "http://127.0.0.1:9100",
+  "timeout": 5.0,
+  "agent_type": "qwenpaw",
+  "fail_closed": false,
+  "api_token": "",
+  "extra_metadata": {}
+}

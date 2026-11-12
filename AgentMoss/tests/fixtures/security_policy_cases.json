@@ -1,0 +1,200 @@
+{
+  "_comment": "AgentMoss 安全策略的双端共享金标准。Python 与 TS 都读这一份并逐条断言 —— 任何一端改了行为都会红。注意：默认鉴权模式是 auto（首次启动自动生成 token），测试环境统一以 AGENT_MOSS_AUTH_MODE=off 运行，因此 auth_enabled_when_off=false。",
+  "defaults": {
+    "origin_check": true,
+    "max_inflight": 16,
+    "rate_limit_qps": 100,
+    "chain_detail": "redacted",
+    "max_body_bytes": 16777216,
+    "auth_mode": "auto",
+    "auth_enabled_when_off": false,
+    "queue_wait_sec": 5
+  },
+  "origin": [
+    {
+      "origin": "",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": true
+    },
+    {
+      "origin": "http://127.0.0.1:9090",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": true
+    },
+    {
+      "origin": "http://127.0.0.1:9090/",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": true
+    },
+    {
+      "origin": "https://evil.example",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": false
+    },
+    {
+      "origin": "http://localhost:9090",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": false
+    },
+    {
+      "origin": "app://opendesk",
+      "host": "127.0.0.1:9090",
+      "extra": [
+        "app://opendesk"
+      ],
+      "expected": true
+    },
+    {
+      "origin": "null",
+      "host": "127.0.0.1:9090",
+      "extra": [],
+      "expected": false
+    },
+    {
+      "origin": "null",
+      "host": "127.0.0.1:9090",
+      "extra": [
+        "null"
+      ],
+      "expected": true
+    },
+    {
+      "origin": "https://evil.example",
+      "host": "",
+      "extra": [],
+      "expected": false
+    }
+  ],
+  "redact": [
+    {
+      "session": "mine",
+      "chain": [
+        [
+          "victim-session",
+          0,
+          "cat /home/victim/secret.csv",
+          "2026-10-20T10:00:00"
+        ],
+        [
+          "mine",
+          1,
+          "nmap 10.0.0.5",
+          "2026-10-20T10:00:01"
+        ]
+      ],
+      "expected": [
+        [
+          "<other-session>",
+          0,
+          "<已隐藏>",
+          "2026-10-20T10:00:00"
+        ],
+        [
+          "mine",
+          1,
+          "nmap 10.0.0.5",
+          "2026-10-20T10:00:01"
+        ]
+      ]
+    },
+    {
+      "session": "s",
+      "chain": [],
+      "expected": []
+    },
+    {
+      "session": "s",
+      "chain": [
+        [
+          "s",
+          0,
+          "ls",
+          "t"
+        ]
+      ],
+      "expected": [
+        [
+          "s",
+          0,
+          "ls",
+          "t"
+        ]
+      ]
+    }
+  ],
+  "llm_url": [
+    {
+      "url": "",
+      "allowlist": "",
+      "expected": true
+    },
+    {
+      "url": "https://api.example.com/v1",
+      "allowlist": "",
+      "expected": true
+    },
+    {
+      "url": "http://127.0.0.1:11434/v1",
+      "allowlist": "",
+      "expected": true
+    },
+    {
+      "url": "file:///etc/passwd",
+      "allowlist": "",
+      "expected": false
+    },
+    {
+      "url": "ftp://example.com/x",
+      "allowlist": "",
+      "expected": false
+    },
+    {
+      "url": "http://169.254.169.254/latest",
+      "allowlist": "",
+      "expected": false
+    },
+    {
+      "url": "http://169.254.1.2/x",
+      "allowlist": "",
+      "expected": false
+    },
+    {
+      "url": "http://metadata.google.internal/x",
+      "allowlist": "",
+      "expected": false
+    },
+    {
+      "url": "https://api.allowed.com/v1",
+      "allowlist": "api.allowed.com",
+      "expected": true
+    },
+    {
+      "url": "https://other.com/v1",
+      "allowlist": "api.allowed.com",
+      "expected": false
+    }
+  ],
+  "path_within": [
+    {
+      "path": "/tmp/agentmoss.log",
+      "roots": [
+        "home",
+        "tmp"
+      ],
+      "expected": true
+    },
+    {
+      "path": "/etc/passwd",
+      "roots": [
+        "home",
+        "tmp"
+      ],
+      "expected": false
+    }
+  ]
+}

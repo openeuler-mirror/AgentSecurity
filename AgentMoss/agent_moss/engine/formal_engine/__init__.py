@@ -13,8 +13,6 @@
 - stateful.py：StatefulChainTracker —— 时间线持续累积 + 链指针增量推进 +
   生命周期（alive/dead/never_activated）+ 敏感数据 taint 增量传播。
   每次新动作实时判定（O(链数)），结果与 FormalEngine 全量 verify 一致。
-
-双端镜像：TS 端 ts/src/engine/formal-engine/ 与本包逐文件对齐。
 """
 
 from .engine import FormalEngine

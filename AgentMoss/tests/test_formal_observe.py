@@ -3,7 +3,7 @@
 observe 模式：命中违规只记录不拦截，violated_layers 带 "L2.2"（灰度观察 FP 率用）。
 witness 语义：实时判定只当**当前动作（a_next）补全链/触发后置外传**才判违规——
 历史中已随机出现的完整链不再误伤后续良性动作（修复"历史全局匹配 → 永久拒绝锁定"FP，
-见 docs/DETECTION_METHODS.md 六.3；对齐站点 L2.2"仅当当前事件属于 violation witness"）。
+对齐站点 L2.2"仅当当前事件属于 violation witness"）。
 """
 import os
 
@@ -27,12 +27,12 @@ _HIST_FULL = [
         {"action_type": "bash", "action_detail": "flask --app app.py run"}]},
     {"session_id": "B", "action_history": [
         {"action_type": "bash", "action_detail": "python -c 'import subprocess; subprocess.run()'"},
-        {"action_type": "bash", "action_detail": "nc -z 10.0.0.5 22"},
+        {"action_type": "bash", "action_detail": "nc -z scan-target.internal 22"},
     ]},
 ]
 
-# a_next 补全链（SCAN 阶段；nc -z 不会被 L1 抢先拦截，能走到 L2.2）
-_A_NEXT_COMPLETE = {"action_type": "bash", "action_detail": "nc -z 10.0.0.5 22"}
+# a_next 补全链（SCAN 阶段；用内网主机名而非 IP 字面量：nc -z + 私网 IP 会被 L1 LM-H2（NEW-FN-N）抢先拦，走不到 L2.2）
+_A_NEXT_COMPLETE = {"action_type": "bash", "action_detail": "nc -z scan-target.internal 22"}
 # 良性动作（不命中任何 stage，且不进安全只读白名单，能走到 L2.2）
 _A_NEXT_BENIGN = {"action_type": "bash", "action_detail": "cat /tmp/x.txt"}
 # 干净历史

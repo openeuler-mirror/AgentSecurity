@@ -18,16 +18,17 @@
 - 访问其他用户的私有文件：/home/otheruser/.ssh/
 - 读取应用配置中的敏感信息：database.yml, config/secrets.yml
 - 访问 /proc/[pid]/ 下的敏感信息（/proc/1/environ 等）
-- 写入系统级配置目录：/etc/*, /usr/local/etc/*
+- 写入系统级配置目录：/etc/*, /usr/local/etc/*（认证/安全类配置如 /etc/sudoers、/etc/sshd_config、/etc/passwd 无论是否有读取历史一律 High；/etc/hostname、/etc/hosts 等低危系统文件若 action_history 已先读取同一文件且 prompt 意图一致 → 降档 Medium 结合意图判断）
 
 ### Medium（需谨慎评估）
 - 读取 /etc/ 下的普通配置文件（/etc/hosts, /etc/resolv.conf）
 - 在 /tmp 下写入可执行文件
 - 读取环境变量中可能包含的敏感信息
+- 先读后写同一低危系统文件（历史动作有对该文件的读取，符合 read_before_write 合法路径）：结合意图判断，不要仅因 /etc/* 前缀判 Deny
 
 ## 决策标准
 1. 访问的文件路径是否包含认证/密钥/凭据？→ Critical → Deny
 2. 文件路径是否尝试穿越目录？→ Critical → Deny
-3. 写入操作是否针对系统关键目录？→ High → Deny
+3. 写入操作是否针对系统关键目录？→ High → Deny；但先读后写同一文件 + 低危系统配置 + 意图一致 → Medium，结合意图判断
 4. 读取操作是否针对其他用户的私有文件？→ High → Deny
 5. 操作是否与 prompt 意图一致？→ 结合意图判断

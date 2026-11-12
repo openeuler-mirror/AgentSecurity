@@ -1,0 +1,15 @@
+{
+  "_说明": [
+    "覆盖规则：你写了哪个类别，那个类别就整份以你的为准（内置同名类别不再生效）；",
+    "没写的类别照常用内置。空数组 = 不覆盖，所以本文件**原样放着 = 什么都不改**。",
+    "怎么填、可直接照抄的样例：见同目录 README.md。",
+    "要删掉内置的某一条（而不是整类替换）：用 agent-moss rules init --with-builtin。",
+    "改完自查：agent-moss rules status"
+  ],
+  "dangerous_commands": [],
+  "injection_detection": [],
+  "sensitive_path_access": [],
+  "intent_consistency": [],
+  "password_modify_consent": [],
+  "user_deletion_consent": []
+}

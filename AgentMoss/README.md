@@ -4,7 +4,7 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 
 > v2 更新：新增 OS Profile 系统（Linux/Windows 自适应）、两级快速放行白名单、rm 命令分级检测、脚本内容预扫描、LLM 结果缓存、Provider 自动识别与 Header 注入、fail-closed 安全原则。
 >
-> v0.4.0 新增：非交互式密码修改检测（passwd/chpasswd/newusers/lnewusers 等）、密码修改授权检测（ask_user_question 前置检查）、内置安全 Skill 白名单（xiaoo-guardian 直接放行）、系统信息命令快速放行（whoami/id/hostname 等 12 个命令）、shell 重定向写入检测、AcTrail 执法事件上报。
+> v0.4.0 新增：非交互式密码修改检测（passwd/chpasswd/newusers/lnewusers 等）、密码修改授权检测（ask_user_question 前置检查）、内置安全 Skill 白名单（xiaoo-guardian 直接放行）、系统信息命令快速放行（whoami/id/hostname 等 12 个命令）、shell 重定向写入检测。
 >
 > v0.5.0 新增：L1/L2 规则收窄减少误杀（sudo 只拦截危险命令、rm -rf /tmp 不拦截、dd/mkfs/format 收窄、/etc/passwd 仅从 L1 移除、git push --force 降级为 medium）、nmap/masscan/zmap 网络扫描检测、lnewusers 批量用户添加检测、L2 通配符删除排除临时目录、用户/组删除授权检测、chgpasswd/lpasswd/gpasswd 检测。
 
@@ -12,18 +12,14 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 
 - [架构](#架构)
 - [快速开始](#快速开始)
+- [场景定制规则（客户沙箱）](#场景定制规则客户沙箱)
 - [LLM 配置](#llm-配置)
-- [AcTrail 集成](#actrail-集成)
 - [openEuler 部署](#openeuler-部署)
 - [API 参考](#api-参考)
 - [Policy Console（策略管控台）](#policy-console策略管控台)
 - [runtime_config（运行时持久化配置）](#runtime_config运行时持久化配置)
 - [配置](#配置)
 - [项目结构](#项目结构)
-- [测试](#测试)
-- [环境变量参考](docs/ENV_VARS.md)
-- [竞争力说明（规则集来源 / 竞品对比 / 测试准确率 / L3 token 消耗）](docs/COMPETITIVENESS.md)
-- [形式化引擎与组合攻击链路 — 实现总览](docs/L2.2_FORMAL_COMBO_ENGINE.md)
 
 ## 架构
 
@@ -78,9 +74,6 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 │    ├── LLM 结果缓存 (200 条 FIFO)                            │
 │    ├── Provider 自动识别 (15+ Provider)                       │
 │    └── LLM 语义安全判断 (fail-closed)                         │
-├─────────────────────────────────────────────────────────────┤
-│          AcTrail 事件上报 (fire-and-forget)                    │
-│  Allow/Deny 决策 → AcTrail SQLite Enforcement 事件            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,11 +104,6 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 pip install agent-moss
 ```
 
-**TypeScript (npm)**：
-```bash
-npm install @kenhkl/agent-moss
-```
-
 如需从源码安装：
 
 ```bash
@@ -124,9 +112,6 @@ cd AgentMoss
 
 # Python 版
 pip install -e .
-
-# TypeScript 版
-cd ts && npm install && npm run build
 ```
 
 ### CLI 使用
@@ -163,10 +148,39 @@ agent-moss server --mode socket --config /etc/agent_moss/agent_moss.yaml
 
 ### API 调用
 
+> **鉴权（2026-10 起默认开启，发布版本 ≥ 0.16.15）**：除 `/api/v1/health` 外，所有接口都要求
+> `Authorization: Bearer <token>`。首次启动会自动生成，位置：
+> `<数据目录>/auth_token`（默认 `~/.config/agentmoss/auth_token`，权限 0600）。
+> 下面示例里的 `$TOKEN` 请先 `TOKEN=$(cat ~/.config/agentmoss/auth_token)`。
+>
+> **root/systemd 注意**：root（sudo/systemd/直接运行）下数据目录固定为
+> `/root/.config/agentmoss`，**不再**按 `SUDO_USER` / `LOGNAME` / 首个普通用户猜测真实用户目录；
+> token 固定在 `/root/.config/agentmoss/auth_token`。非 root 用户要访问 root 服务的数据
+> （含 token）时，显式设置 `AGENT_MOSS_DATA_DIR`，或传 `AGENT_MOSS_AUTH_TOKEN` /
+> `AGENT_MOSS_AUTH_TOKEN_FILE`。
+>
+> 启动日志会打印实际路径：`安全策略: ... auth=on(/path/to/auth_token)`；
+> `auth=off` 表示显式关闭了鉴权，`auth=on(explicit)` 表示用了 `AGENT_MOSS_AUTH_TOKEN*`，
+> `auth=on(no-token!)` 表示 token 生成失败（通常是数据目录不可写），此时服务以无鉴权方式继续运行，需立即检查。
+>
+> 相关环境变量：
+>
+> | 变量 | 作用 |
+> |---|---|
+> | `AGENT_MOSS_AUTH_MODE` | `auto`（默认，自动生成/读取 token）/ `off`（关闭鉴权） |
+> | `AGENT_MOSS_AUTH_TOKEN` | 显式指定全局 token |
+> | `AGENT_MOSS_AUTH_TOKEN_FILE` | 从文件读取全局 token |
+> | `AGENT_MOSS_AGENT_TOKENS` | 逐 agent token，如 `opendesk=tok-a,qwenpaw=tok-b`；启用后 `agent_id` 必须与 token 匹配 |
+>
+> 返回 401 时：检查请求头里的 token 与 AgentMoss 实际使用的 token 是否一致
+> （`/api/v1/health` 免鉴权，不能用它验证）。需要恢复旧行为：`AGENT_MOSS_AUTH_MODE=off`。
+
 **HTTP TCP 方式：**
 
 ```bash
+TOKEN=$(cat ~/.config/agentmoss/auth_token)
 curl -X POST http://127.0.0.1:9090/api/v1/analyze \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "session_id": "test-001",
@@ -187,6 +201,7 @@ curl -X POST http://127.0.0.1:9090/api/v1/analyze \
 ```bash
 curl --unix-socket /var/run/agent_moss/agent_moss.sock \
   -X POST http://localhost/api/v1/analyze \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "session_id": "test-001",
@@ -210,46 +225,60 @@ curl --unix-socket /var/run/agent_moss/agent_moss.sock \
 }
 ```
 
-### TypeScript / Node.js 调用
+## 场景定制规则（客户沙箱）
 
-```typescript
-import { createApp } from '@kenhkl/agent-moss';
+**场景规则**是针对特定客户的**部署级**安全约束，如「沙箱用户只能读写这几个目录」「禁止 ssh」。
+出厂内置一个 `bank` 场景（银行沙箱）：
 
-const app = createApp();
-// 通过 Hono app.fetch 在 Node.js / Bun / Electron 中调用
-// 或启动独立服务: npx agent-moss server --port 9090
+| 规则 | 级别 | 效果 |
+|---|---|---|
+| 路径白名单 | high | 只允许 `/home/sandbox`、`/opt/sandbox`、`/tmp`；**其余路径（含根目录 `/`）一律拦**，含 `..` 回溯、`~其它用户` 等逃逸写法 |
+| 禁 ssh | critical | 阻断远程访问 / 横向移动类命令 |
+
+### ⚠️ 启用方式：环境变量（不设就完全不生效）
+
+```bash
+export AGENT_MOSS_SCENARIO=bank          # 多场景逗号分隔：bank,meow
+agent-moss server --port 9090            # 设好后**重启服务**
 ```
 
-也可以直接 HTTP 调用：
+**注意三点**：
 
-```typescript
-const resp = await fetch('http://127.0.0.1:9090/api/v1/analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-        session_id: 'sess-001',
-        a_next: { action_type: 'bash', action_detail: 'ls -la' },
-        os_type: 'linux',
-        cwd: '/home/user',
-    }),
-});
-const result = await resp.json();
-// → { decision: 'Allow'|'Deny', risk_level: 'low'|'...', ... }
+1. **不设这个变量 = 场景规则一条都不跑**（不是「默认宽松」，是「形同虚设」）——
+   白名单外的路径会照常放行。这是**部署级**配置，改完必须**重启进程**。
+2. **HTTP 请求无法指定场景 id**（`/api/v1/analyze` 不接受该字段），
+   服务化部署只能靠这个环境变量。
+3. 控制台会在**未启用时隐藏「场景定制」页** —— 看不到该页 = 没启用。
+
+### 部署后请确认这行启动日志
+
+服务启动时会打印**部署自检**，直接告诉你场景有没有生效：
+
+```
+================ AgentMoss 部署自检 ================
+runtime 配置: /home/<user>/.config/agentmoss/agent_moss_runtime.json
+层级开关: L1_heuristic=on L2_logic_rules=on L3_llm_analysis=on agent_rules_enabled=on scenario_rules_enabled=on
+场景规则已启用: bank（来源：环境变量 AGENT_MOSS_SCENARIO）      ← 这一行
+==================================================
 ```
 
-**响应示例 (Deny)**：
+**没设**的话那行会变成醒目告警：
 
-```json
-{
-  "decision": "Deny",
-  "reason": "检测到递归强制删除关键路径 (rm -rf /...)",
-  "risk_level": "critical",
-  "risk_type": "script_execution",
-  "violated_layers": ["L1.1"],
-  "confidence": 95,
-  "analysis_duration_ms": 1.2
-}
 ```
+⚠️  场景规则【未启用】—— 环境变量 AGENT_MOSS_SCENARIO 未设置。
+    场景定制规则（如银行沙箱的目录白名单 / 禁 ssh）**不会生效**，白名单外的路径会被放行。
+    启用方式：设 AGENT_MOSS_SCENARIO=<场景id>（如 bank；多场景逗号分隔）后**重启本服务**。
+```
+
+### 静态规则的边界
+
+场景规则是**静态闸门**（看命令文本判断），下面两类挡不住，必须靠执行侧沙箱
+（AgentMoss 生成的 Landlock / namespace 策略）兜底：
+
+- **软链逃逸**：白名单目录里放一个指向 `/etc` 的软链，再 `cat /tmp/link/passwd`
+- **运行时才确定的命令**：`X=$(cat /tmp/cmd.txt); $X`
+
+新增客户场景：在 `agent_moss/scenarios/<id>/rules.json` 加规则。
 
 ## LLM 配置
 
@@ -364,28 +393,15 @@ export AGENT_MOSS_DISABLE_LLM=1
 
 自动识别 Provider 后，OpenRouter 和 xAI 会注入特定 HTTP Header（Referer、Title），确保平台正确计费。
 
-## AcTrail 集成
-
-AgentMoss 可以将每次安全分析的 allow/deny 决策作为 Enforcement 事件写入 [AcTrail](https://gitcode.com/openeuler/AcTrail) 的存储，实现统一的 agent 行为审计。
-
-### 启用
-
-```bash
-# 环境变量方式
-export ACTRAIL_ENABLED=1
-export ACTRAIL_STORAGE_PATH=/tmp/actrail.sqlite  # 默认路径
-
-# 启动 AgentMoss
-agent-moss server --port 9090
-```
-
-### Policy Console（策略管控台）
+## Policy Console（策略管控台）
 
 AgentMoss 自带浏览器策略管控台，可视化调整三层开关、规则启停、deny_mode、skill 开关，查看 token 用量统计。Python 版和 TS 版功能对等（同一套前端 SPA，同一套 HTTP API 契约）。
 
 **访问**：服务启动后，浏览器打开 `http://127.0.0.1:9090/console`（端口随服务实际监听端口）。
 
-**鉴权**：默认本机（127.0.0.1）免鉴权，便于 iframe 嵌入；如需远程访问，设 `AGENT_MOSS_CONSOLE_TOKEN` 环境变量，请求带 `Authorization: Bearer <token>`。
+**鉴权**：与其他接口一致 —— 默认要求 `Authorization: Bearer <token>`（首次启动自动生成，
+见上方「API 调用」）。页面首次打开会弹窗要求输入一次，之后存在浏览器本地。
+如需独立控制台凭证，仍可设 `AGENT_MOSS_CONSOLE_TOKEN`（该值对 `/console/api/*` 有效）。
 
 **Console API**（前端 SPA 调用，也可直接 curl）：
 
@@ -426,59 +442,11 @@ runtime config 是 AgentMoss 的**运行时策略持久化层**，区别于启�
 - **seed**：首次加载时若文件不存在，自动从源码常量 seed 出厂默认（含全部 builtin 规则）并落盘
 - **merge**：每次加载时与源码默认 merge——保留用户开关，补入新 builtin，源码已删的 builtin 标记 `source_removed`+禁用（指纹去重，跨 id 变更识别同一规则）
 - **优先级**：`AGENT_MOSS_DISABLE_*` env > runtime JSON > `agent_moss_settings.json` > 默认。env 永远最高（Console 会展示被 env 接管的开关为灰色不可改）
-- **热生效**：`is_layer_enabled` 每次判定现读 runtime JSON，Console 改完立刻生效，无需重启服务
+- **热生效**：`is_layer_enabled` 每次判定现读 runtime JSON，Console 或**手工编辑文件**都在下一次判定生效（含 `layers` / `agent_rules` / `scenario_rules`），无需重启服务
+- **规则来源模式**：`AGENT_MOSS_RULES_MODE=hot|cold|builtin`。`cold` 是冷启动：启动时读内置 + 规则目录 / `CUSTOM_RULES` / 场景并冻结，runtime JSON / Console 完全不参与（适合“客户提供规则 + 防止 runtime 污染”）；`builtin` 仅内置规则（连规则目录也不读）；默认 `hot` 保持上述热加载行为。别名：`AGENT_MOSS_RULES_BUILTIN_ONLY=1`=builtin，`AGENT_MOSS_DISABLE_RULE_HOT_RELOAD=1`=cold
 - **query 写操作**：Python 和 TS 均实现全套（seed/merge/CRUD/update_*/`_or_default` 回退），双栈行为一致
 
 Console UI 即是对 runtime config 的可视化操作层；直接编辑 JSON 或用 env 覆盖是另外两个入口，三者最终都落到同一份 runtime JSON。
-
-## 配置
-
-| 环境变量 | 说明 | 默认值 |
-|---------|------|--------|
-| `ACTRAIL_ENABLED` | 设为 `1` 启用上报 | 未设置（禁用） |
-| `ACTRAIL_STORAGE_PATH` | AcTrail SQLite 数据库路径 | `/tmp/actrail.sqlite` |
-| `ACTRAIL_TIMEOUT_MS` | 写入超时（毫秒） | `100` |
-
-### 事件格式
-
-AgentMoss 写入 AcTrail 的 `events` 表，payload 格式为 `Enforcement` 类型：
-
-```json
-{
-  "backend": "agent-moss",
-  "operation": "tool_call",
-  "decision": "allow|deny",
-  "result": "allowed|denied",
-  "tool.name": "bash",
-  "tool.command": "cat /var/log/syslog",
-  "agent.session_id": "session-001",
-  "agent.prompt": "read log file",
-  "risk.level": "low",
-  "risk.type": "",
-  "reason": "...",
-  "violated_layers": "1,2",
-  "confidence": "100",
-  "duration_ms": "2.3"
-}
-```
-
-### 架构
-
-```
-AgentMoss (Python HTTP)          AcTrail (eBPF daemon)
-┌─────────────────┐             ┌─────────────────┐
-│ POST /analyze   │             │                 │
-│   ↓             │             │  SQLite 存储     │
-│ 三层防御分析     │             │  (events 表)    │
-│   ↓             │  fire-and-  │                 │
-│ Allow/Deny      │──forget────▶│ Enforcement     │
-│   ↓             │  写入 SQLite │ 事件落库        │
-│ 返回给调用方     │             │                 │
-└─────────────────┘             └─────────────────┘
-                                        ↓
-                               actrailviewer / actrailweb
-                               统一查看 agent 行为审计
-```
 
 ## openEuler 部署
 
@@ -526,7 +494,7 @@ sudo systemctl enable --now agent_moss
 
 # HTTP 模式验证
 curl http://127.0.0.1:9090/api/v1/health
-# {"status":"healthy","version":"<当前版本，见 pyproject.toml / ts/package.json>"}
+# {"status":"healthy","version":"<当前版本，见 pyproject.toml>"}
 
 # Socket 模式验证
 curl --unix-socket /var/run/agent_moss/agent_moss.sock \
@@ -563,7 +531,7 @@ AGENT_MOSS_INSTANCE=xiaoo agent-moss status
 
 > **instance 隔离「进程识别 + token 消耗」，不隔离规则配置。** 同机所有实例共享同一份 `~/.config/agentmoss/agent_moss_runtime.json`（除非显式设 `AGENT_MOSS_RUNTIME_CONFIG_PATH` 指向不同文件）。通用 L1/L2/L3 规则全局一致；不同 agent 的定制规则在文件内按 `agent_rules.<agent_id>` 分区天然隔离。任意 console 修改都写入共享文件，其他实例同步生效。
 
-> **token 消耗按实例隔离**：设了 `AGENT_MOSS_INSTANCE=<name>` 时，token 统计文件落在 `<data_root>/<instance>/agent_moss_token_stats.json`（如 `opendesk` → `~/.config/agentmoss/opendesk/...`），各 agent 只读写自己实例的文件；未设则用默认 `~/.config/agentmoss/agent_moss_token_stats.json`。「最近调用」(console `token-stats/recent`) 读同一文件，随之隔离。详见 `docs/ENV_VARS.md`。
+> **token 消耗按实例隔离**：设了 `AGENT_MOSS_INSTANCE=<name>` 时，token 统计文件落在 `<data_root>/<instance>/agent_moss_token_stats.json`（如 `opendesk` → `~/.config/agentmoss/opendesk/...`），各 agent 只读写自己实例的文件；未设则用默认 `~/.config/agentmoss/agent_moss_token_stats.json`。「最近调用」(console `token-stats/recent`) 读同一文件，随之隔离。
 
 ### 防火墙（HTTP 模式需要）
 
@@ -578,6 +546,7 @@ sudo firewall-cmd --reload
 |------|------|------|
 | `GET` | `/api/v1/health` | 健康检查 |
 | `POST` | `/api/v1/analyze` | 安全分析 |
+| `POST` | `/api/v1/review` | 低频全量回顾（供 AgentGate 触发） |
 
 ### POST /api/v1/analyze
 
@@ -585,32 +554,47 @@ sudo firewall-cmd --reload
 
 ```json
 {
-  "session_id": "会话ID (必填)",
-  "prompt_session": "原始任务描述 (可选，用于注入检测)",
-  "action_history": [{"action_type": "...", "action_detail": "..."}],
+  "session_id": "sess-001",
+  "prompt_session": "list files",
+  "prompt_history": [
+    {"text": "list files", "actions": [{"action_type": "bash", "action_detail": "ls -la"}]}
+  ],
+  "action_history": [
+    {"action_type": "bash", "action_detail": "pwd", "called_at": "2026-11-10T10:00:00"}
+  ],
+  "session_history": [
+    {"session_id": "other", "action_history": [{"action_type": "bash", "action_detail": "cat /tmp/r.txt"}]}
+  ],
   "a_next": {
     "action_type": "bash",
-    "action_detail": "cat /etc/passwd"
+    "action_detail": "cat /etc/passwd",
+    "called_at": "2026-11-10T10:00:01"
   },
   "reason": "执行理由 (可选)",
+  "agent_id": "",
+  "instance_id": "",
   "os_type": "",
   "cwd": "/home/user/project",
-  "metadata": {"agent_id": "...", "sandbox_id": "..."}
+  "metadata": {"stateful_incremental": false}
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `session_id` | string | 是 | 会话唯一标识 |
-| `prompt_session` | string | 否 | 原始任务描述（层1 注入检测会扫描此字段） |
-| `action_history` | array | 否 | 历史动作序列 |
+| `prompt_session` | string | 否 | 最近一条用户提示（层1 注入检测会扫描此字段） |
+| `prompt_history` | array | 否 | 交错 prompt 历史：`[{text, actions: [{action_type, action_detail}]}]` |
+| `action_history` | array | 否 | 历史动作：`[{action_type, action_detail, called_at?, output?}]`。`ask_user_question` 动作应带 `output`（用户回答），否则改密/删用户授权会被判未授权 |
+| `session_history` | array | 否 | 多 session 历史：`[{session_id, action_history: [...]}]`，供 L2.2 跨会话验证 |
 | `a_next.action_type` | string | 是 | 动作类型 (bash/file_read/file_write 等) |
 | `a_next.action_detail` | string | 是 | 命令/动作详情 |
+| `a_next.called_at` | string | 否 | ISO 8601 时间，供 L2 授权时效窗和 P4 提权外传窗口使用 |
 | `reason` | string | 否 | 执行理由 |
 | `os_type` | string | 否 | `"linux"` / `"windows"`，留空自动检测 |
 | `cwd` | string | 否 | 当前工作目录 |
-| `agent_id` | string | 否 | 调用方 agent 标识（如 `xiaoo` / `opendesk`）。留空走通用模式。详见 [SECURITY_RULES.md「三方 agent 定制规则」](SECURITY_RULES.md#三方-agent-定制规则agent_mossagentsidrulesjson) |
-| `metadata` | object | 否 | 扩展元数据（`llm_config`/`llm_log_path` per-request LLM 配置） |
+| `agent_id` | string | 否 | 调用方 agent 标识（如 `xiaoo` / `opendesk`）。留空走通用模式。 |
+| `instance_id` | string | 否 | agent 安装实例标识，仅用于展示层脱敏 |
+| `metadata` | object | 否 | 扩展元数据（`llm_config`/`llm_log_path`/`stateful_incremental`/`is_error` 等） |
 
 **响应字段**：
 
@@ -625,6 +609,39 @@ sudo firewall-cmd --reload
 | `policy` | string | Cerberus TOML 策略 (Allow 时) |
 | `confidence` | int | 置信度 0-100 |
 | `analysis_duration_ms` | float | 分析耗时（毫秒） |
+| `violation_chain` | array | 组合链反例路径（按引擎返回的步骤数组） |
+| `violation_graph` | object/null | 结构化攻击链图：`{nodes, edges}`，供前端可视化 |
+
+### POST /api/v1/review
+
+低频全量回顾（供 AgentGate 触发），从状态库/历史会话重新验证攻击链。
+
+**请求字段**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `agent_id` | string | 否 | 目标 agent（决定状态库分桶） |
+| `db_path` | string | 否 | AgentGate SQLite 文件或 tool_calls JSON 目录；为空则用 `sessions` |
+| `sessions` | array | 否 | 多 session 历史，结构同 `session_history` |
+| `a_next` | object | 否 | 可选，连同当前动作一起判定 |
+| `is_error` | bool | 否 | 当前动作是否执行失败（生命周期判定） |
+| `output_pending` | bool | 否 | 返回待攻击前序链清单 |
+
+**响应字段**：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `agent_id` | string | 目标 agent |
+| `seeded_nodes` | int | 写入状态库的节点数 |
+| `verified` | bool | 全量形式化验证是否通过 |
+| `violations` | array | 全量验证发现的违规 |
+| `pending_prefixes` | array | 待补全的攻击前序链 |
+| `state_nodes` | int | 状态库累计节点数 |
+| `discovered_patterns` | array | 数据驱动发现的跨 session 危险组合 |
+
+### GET /api/v1/health
+
+响应字段：`status`（服务状态）、`version`（版本）、`instance`（实例归属标识，未配置为空串）。
 
 ## 配置
 
@@ -632,7 +649,6 @@ sudo firewall-cmd --reload
 
 ### 环境变量
 
-> 完整清单（含 audit_agent 迁移对照、bridge.py 端口变量、配置优先级）见 [`docs/ENV_VARS.md`](docs/ENV_VARS.md)。
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
@@ -644,23 +660,26 @@ sudo firewall-cmd --reload
 | `AGENT_MOSS_LLM_MAX_TOKENS` | LLM 最大输出 token 数 | `4096` |
 | `AGENT_MOSS_LLM_TIMEOUT` | LLM 单次调用超时（秒）| `300` |
 | `AGENT_MOSS_LLM_RETRIES` | LLM 调用重试次数 | `2`（共 3 次尝试） |
+| `AGENT_MOSS_LLM_HISTORY_MAX_ITEMS` | L3 prompt 最多注入多少条历史动作（0 = 不限）| `20` |
+| `AGENT_MOSS_LLM_ACTION_DETAIL_MAX_CHARS` | L3 prompt 中单条历史动作详情最多保留字符数（0 = 不截断）| `500` |
+| `AGENT_MOSS_LLM_MAX_PROMPT_TOKENS` | L3 输入 prompt 的 token 总预算（0 = 不限），超限逐级压缩历史 | `0` |
 | `AGENT_MOSS_LLM_FAIL_MODE` | LLM 失败策略：`fail_open`（默认 Allow+warn）/ `fail_closed`（Deny）| `fail_open` |
 | `AGENT_MOSS_DISABLE_LLM` | 设为 `1` 禁用层3 LLM | 未设置 |
 | `AGENT_MOSS_DISABLE_HEURISTIC` | 设为 `1` 禁用层1 特征匹配 | 未设置 |
 | `AGENT_MOSS_DISABLE_LOGIC_RULES` | 设为 `1` 禁用层2 逻辑规则 | 未设置 |
 | `AGENT_MOSS_LOG_PATH` | 全量 hook 日志 + LLM prompt 日志（bridge 记 HOOK_INPUT/OUTPUT，L3 记 prompt，写同文件；对应 audit_agent `AUDIT_LOG_PATH`）| 未设置（不记录）|
 | `AGENT_MOSS_CUSTOM_RULES` | 自定义规则 JSON 数组 | `[]` |
+| `AGENT_MOSS_RULES_MODE` | 规则来源模式：`hot`（默认）/ `cold`（冷启动：启动时读规则目录并冻结，runtime/Console 不参与）/ `builtin`（仅内置）。非法值按 builtin fail-safe | 未设置（hot）|
+| `AGENT_MOSS_RULES_BUILTIN_ONLY` | 设为 `1` = builtin（仅内置）| 未设置 |
+| `AGENT_MOSS_DISABLE_RULE_HOT_RELOAD` | 设为 `1` = cold（禁用 runtime/Console 热加载，但启动时仍读规则目录）| 未设置 |
 | `AGENT_MOSS_ENABLE_POLICY_GEN` | 设为 `1` 启用 Policy 生成 | 未设置 |
 | `AGENT_MOSS_CONFIG_PATH` | 主配置 YAML 路径 | `~/.config/agentmoss/agent_moss.yaml` |
-| `AGENT_MOSS_DATA_DIR` | 数据根目录（所有 `~/.config/agentmoss` 文件落盘位置）。systemd 下即使 root 启动也按安装用户落盘 | `~/.config/agentmoss` |
+| `AGENT_MOSS_DATA_DIR` | 数据根目录（所有 `~/.config/agentmoss` 文件落盘位置）。root（含 systemd）下默认固定 `/root/.config/agentmoss`，不猜真实用户；非 root 访问 root 服务时需显式指定。**其下 `rules/` 子目录可整份覆盖内置规则**（见「自定义规则」通道 B）| `~/.config/agentmoss` |
 | `AGENT_MOSS_RUNTIME_CONFIG_PATH` | runtime JSON（层级开关+规则启停持久化）| `~/.config/agentmoss/agent_moss_runtime.json` |
 | `AGENT_MOSS_TOKEN_STATS_PATH` | token 用量统计 JSON（显式优先于 instance 派生路径）| 见「token 消耗按实例隔离」|
 | `AGENT_MOSS_SETTINGS_PATH` | `agent_moss_settings.json` 路径 | 包内默认 |
 | `AGENT_MOSS_CONSOLE_TOKEN` | Console Bearer 鉴权 token | 未设（本机免鉴权）|
 | `AGENT_MOSS_URL` / `HOST` / `PORT` | bridge.py 连服务用（端口被占自动 findFreePort）| `127.0.0.1:9090` |
-| `ACTRAIL_ENABLED` | 设为 `1` 启用 AcTrail 事件上报 | 未设置（禁用） |
-| `ACTRAIL_STORAGE_PATH` | AcTrail SQLite 数据库路径 | `/tmp/actrail.sqlite` |
-| `ACTRAIL_TIMEOUT_MS` | AcTrail 写入超时（毫秒） | `100` |
 
 ### 配置文件
 
@@ -668,7 +687,19 @@ sudo firewall-cmd --reload
 
 ### 自定义规则
 
-通过 `AGENT_MOSS_CUSTOM_RULES` 环境变量注入自定义正则规则：
+**三条通道，语义不同，别用混**（都能加载「你们自己的规则」，但代价不一样）：
+
+| 通道 | 怎么用 | 语义 | 内置规则更新时 |
+|---|---|---|---|
+| **A. runtime config**（Console） | 控制台增删改，或直接编辑 `~/.config/agentmoss/agent_moss_runtime.json` | **逐条合并** | ✅ 新内置规则**自动出现且默认启用** |
+| **B. 覆盖目录** `<data_root>/rules/` | 放同名 `l1_rules.json` / `l2_rules.json` / `l3_rules.json` / `mc_rules.json` / `tool_registry.json` | **整份替换**该文件 | ❌ 不反映，需自行跟进 |
+| **C. 环境变量** | `AGENT_MOSS_CUSTOM_RULES` 注入 L1 正则 | 追加 | ✅ 不受影响 |
+
+> `data_root` 默认 `~/.config/agentmoss`，可用 `AGENT_MOSS_DATA_DIR` 改。
+> **通道 B 是整份替换**：只想改其中一类，也要先拷完整的内置文件再改 —— 少写顶层键会让
+> 对应类别**一条规则都不跑**（服务启动与加载时都会打显著告警）。日常调规则优先用 A。
+
+**C. 环境变量注入：**
 
 ```bash
 export AGENT_MOSS_CUSTOM_RULES='[
@@ -718,7 +749,6 @@ AgentMoss/
 │   │   ├── runtime_config.py # runtime JSON：seed/merge/CRUD/层级开关持久化 (51 函数)
 │   │   ├── token_stats.py   # token 用量统计 (JSON 持久化)
 │   │   ├── llm_client.py     # LLM 客户端 (流式回退 + Provider header 适配)
-│   │   ├── actrail.py        # AcTrail 事件上报
 │   │   ├── logging.py / parsers.py / policy_cache.py / prompt_templates.py
 │   ├── server/               # HTTP API 服务层 (FastAPI)
 │   │   ├── app.py            # 应用 + run_server + _find_free_port (端口动态分配)
@@ -730,156 +760,9 @@ AgentMoss/
 │   ├── adapters/  # 适配器层 (observable)
 │   ├── skills/    # 安全 Skill 规则 (Markdown)
 │   ├── templates/ # Prompt 模板 + policy_mapping
-│   ├── agents/    # 三方 agent 定制化扩展 (xiaoO / opendesk) — rules.json 单一事实源，py+ts 共享
+│   ├── agents/    # 三方 agent 定制化扩展 (xiaoO / opendesk) — rules.json 单一事实源
 │   └── brain/     # 规则自学习/存储
 │
-├── ts/                       # TypeScript 实现 (npm: @kenhkl/agent-moss) — 功能与 Python 对等
-│   ├── src/
-│   │   ├── cli.ts            # CLI 入口 (init/analyze/server)
-│   │   ├── config.ts         # 配置 (环境变量 + fail-open)
-│   │   ├── models.ts         # Zod 数据模型
-│   │   ├── routes.ts         # Hono API 路由 (health/analyze)
-│   │   ├── server.ts         # Hono HTTP + findFreePort + 挂载 Console
-│   │   ├── actrail.ts / package-json.ts
-│   │   ├── engine/           # 三层防御引擎 (与 py 对等)
-│   │   │   ├── coordinator.ts / heuristic.ts / logic-rules.ts
-│   │   │   ├── llm-analyzer.ts / script-analyzer.ts / script-content-analyzer.ts
-│   │   │   ├── inline-analyzer.ts / skill-loader.ts / template-loader.ts
-│   │   │   ├── token-stats.ts / types.ts
-│   │   ├── infra/runtime-config.ts  # runtime JSON 全功能 (seed/merge/CRUD/query，对齐 py)
-│   │   └── console/          # Policy Console (Hono sub-app, 23 路由 1:1 对齐 py)
-│   │       ├── router.ts / index.ts
-│   │       └── static/index.html  # 复用 py 的同一份 SPA
-│   └── package.json
-│
-├── hooks/xiaoO/             # xiaoO hook 桥接 (bridge.py + plugin.json)
-│   └── bridge.py             # stdin JSON → POST /api/v1/analyze → stdout {result,reason}；探测兜底
 ├── config/agent_moss.yaml   # YAML 配置模板
-├── docs/
-│   ├── design.md             # 架构需求设计
-│   ├── ENV_VARS.md           # 环境变量参考 + audit_agent 迁移对照
-│   └── ...
-└── tests/
-    ├── conftest.py / test_all_cases.py / test_agents_xiaoo.py / test_brain.py
-    ├── test_find_free_port.py  # 端口动态分配单测
-    └── cases/                  # 测试用例 JSON
 ```
 
-## 测试
-
-### 用例归一：单一事实源
-
-所有安全分析测试用例集中在 `tests/cases/{l1,l2,l3}/*.json`（**226 个**，按 L1/L2/L3 分子目录），**Python 与 TypeScript 双端共用同一批 case**（双端各自另有语言特有的手写单测，故 pytest/vitest 报告 passed 总数 > JSON 数且两数不同，详见 `tests/cases/README.md`）。每个 JSON 含：
-
-| 字段 | 说明 |
-|---|---|
-| `expected_decision` | 期望决策（`Deny`/`Allow`），双端都断言 |
-| `expected_risk_level` | 期望风险等级（`critical`/`high`/`medium`/`low`），双端都断言 |
-| `expected_risk_type` | 期望风险类型（文档用，不断言） |
-| `expected_layers` | 期望命中层（文档用，不断言） |
-| `llm_required` | L3 case 标 `true`：禁 LLM 时 skip，需有效 LLM key 真跑 |
-| `input` | `{session_id, action_history, a_next, reason, os_type, cwd}` |
-
-按子目录分层：`l1/` 164 个（特征匹配命中+放行）、`l2/` 25 个（逻辑规则命中+放行）、`l3/` 28 个（13 个 security skill 命中+放行，`llm_required:true`）。
-
-**新增 case 只改一个 JSON**，双端自动跑：
-
-```bash
-# 新增 case：复制一个现有 JSON 改内容即可（按层放对应子目录）
-cp tests/cases/l1/deny-01-chmod-777.json tests/cases/l1/deny-99-mine.json
-# 编辑 deny-99-mine.json 的 desc / expected_* / input
-```
-
-### Python 端
-
-```bash
-# 前两层静态规则（禁用 LLM，CI 默认跑法，189 个 L1+L2 case 全绿）
-python3 -m pytest tests/test_all_cases.py::TestLayer1And2 -v
-
-# 仅跑 JSON case 加载器（L1+L2，禁 LLM）
-AGENT_MOSS_DISABLE_LLM=1 python3 -m pytest tests/test_all_cases.py::TestLayer1And2 -v
-
-# 包含 L3 LLM 层（需有效 LLM key，28 个 L3 case 真调 LLM，串行跑约 2~4 分钟）
-# key/地址/model 从 env 或 ~/.config/agentmoss/config.json 统一判定 + 连通性探测，
-# 判定通过才真跑；缺 key 或 key 不通则 skip（见下「L3 判定策略」）
-python3 -m pytest tests/test_all_cases.py::TestLayer3 -v
-# 若需显式覆盖 config.json，仍可传环境变量：
-#   AGENT_MOSS_LLM_API_KEY="sk-xxx" AGENT_MOSS_LLM_BASE_URL="https://api.deepseek.com/v1" AGENT_MOSS_LLM_MODEL="deepseek-v4-flash"
-```
-
-入口：`tests/test_all_cases.py`
-
-- `TestLayer1And2` 参数化读 `tests/cases/{l1,l2}/*.json`，断言 `expected_decision` / `expected_risk_level`
-- `TestLayer3` 参数化读 `tests/cases/l3/*.json`，跑不跑由 `llm_probe_available` fixture 决定（判定源 env+config.json 有 key 且连通性探测通过才真调 LLM，否则 `pytest.skip`）
-- `TestHeuristicDetector` / `TestLogicRules` / `TestOSProfile` / `TestCoordinator` 跑各子模块单测
-
-#### L3 判定策略（双端统一）
-
-L3 是否真跑由**统一判定源 + 连通性探测**决定，Python 与 TS 对称（避免两端判定不一致 + 坏 key fail-open 假通过）：
-
-1. **判定源**：`AGENT_MOSS_LLM_API_KEY` env → 否则 `~/.config/agentmoss/config.json` 的 `llm.api_key`（Python 走 `get_default_config().llm.api_key`，TS 走 `isLLMAvailable()`）。
-2. **连通性探测**：有 key 再发一次 `max_tokens=1` ping（Python `_probe_llm` / TS `probeLLMConnection`）。连通才真跑；key 无效/网络不通 → 明确提示 + skip，不假通过。
-3. **同源**：probe 的 base_url/model/api_key 与 L3 实际调用一致，probe 通过即真跑可信。
-
-### TypeScript 端
-
-```bash
-cd ts
-
-# JSON case 加载器（L1+L2，禁用 LLM，189 个 L1+L2 case 全绿）
-npx vitest run src/__tests__/json-cases.test.ts
-
-# 全量（含 heuristic / logic-rules / coordinator / agents 等）
-npx vitest run
-
-# 类型检查
-npx tsc --noEmit
-
-# 包含 L3 LLM 层（需有效 LLM key，28 个 L3 case 真调 LLM）
-# 注意 TS 端与 Python 端有两个差异：
-#   1) vitest 默认每 test 5s 超时，L3 跑 LLM 慢需加 --test-timeout=120000
-#   2) 加载器并行跑 28 个 L3 case 会撞 LLM rate limit 走 fallback 假命中，
-#      已加串行 gate + --no-file-parallelism 避免
-# key/地址/model 从 env 或 config.json 统一判定 + 连通性探测，判定通过才真跑
-npx vitest run src/__tests__/json-cases.test.ts --no-file-parallelism --test-timeout=120000
-# 若需显式覆盖：
-#   AGENT_MOSS_LLM_API_KEY="sk-xxx" AGENT_MOSS_LLM_BASE_URL="https://api.deepseek.com/v1" AGENT_MOSS_LLM_MODEL="deepseek-v4-flash"
-```
-
-入口：`ts/src/__tests__/json-cases.test.ts`
-
-- `beforeAll`：判定源（`isLLMAvailable`，env + config.json）无 key → 设 `AGENT_MOSS_DISABLE_LLM=1`（仅跑 L1+L2，对齐 Python）；有 key → `probeLLMConnection()` 发一次 ping，连通才保留 LLM；key 无效/网络不通 → 禁 LLM + 明确提示，避免坏 key fail-open 假通过
-- 读 `tests/cases/{l1,l2,l3}/*.json`，转 `snake_case → camelCase`，调 `runAnalysis`，断言 `expected_decision` / `expected_risk_level`
-- **L1/L2 用例（非 `llm_required`）强制禁 LLM**（对齐 Python `default_config`）：只测 L1+L2 静态结果，避免 LLM 二次判定翻盘（Allow 变 Deny）导致波动。仅 `llm_required` 的 L3 case 在 LLM 可用时真跑
-- **risk_level 断言**：仅对 L1/L2 case 断言；L3 case 只断言 `expected_decision`（LLM 层 risk_level 有非确定性波动，对齐 Python `TestLayer3`）
-- `llm_required:true` 的 L3 case：禁 LLM 时 `it.skip`；有 key + 探测通过时串行 gate（promise 链）一次只跑一个，避免并行撞 LLM rate limit 走 fail-open fallback 假命中
-- 与 Python `TestLayer1And2` / `TestLayer3` 共用同一批 case，双端行为不一致会立刻暴露
-
-### 双端跑 L3 差异说明
-
-| 差异点 | Python | TypeScript |
-|---|---|---|
-| L3 跑法 | `TestLayer3` 参数化串行跑，pytest 自带 test 超时足够 | 加载器需 `--test-timeout=120000`（vitest 默认 5s 不够）+ `--no-file-parallelism`（串行 gate 避免撞 rate limit） |
-| LLM 字段名 | Python 解析兼容 `risk_level`/`riskLevel` 两种 | TS 已修 `runLLMAnalysis` 兼容两种（之前只取 `riskLevel` 拿不到走兜底 `'low'`） |
-| 禁 LLM 跑 L3 | `TestLayer3` 全 skip | 加载器 `llm_required:true` case 单个 skip |
-| L3 判定源 | `get_default_config().llm.api_key`（env + config.json） | `isLLMAvailable()`（env + config.json） |
-| 连通性探测 | `conftest.py` `_probe_llm`（session 缓存，只 ping 一次） | `config.ts` `probeLLMConnection()`（beforeAll 探测一次） |
-
-### LLM 测试与 API Key
-
-- L3 是否真跑由**统一判定源 + 连通性探测**决定，Python 与 TS 对称（见上文「L3 判定策略」）：
-  - 判定源：`AGENT_MOSS_LLM_API_KEY` env → 否则 `~/.config/agentmoss/config.json` 的 `llm.api_key`
-  - 连通性探测：有 key 再发 `max_tokens=1` ping，连通才真跑；key 无效/网络不通 → 明确提示 + skip（**不假通过**）
-- 无 Key 时：Python `TestLayer3` skip；TS 加载器设 `AGENT_MOSS_DISABLE_LLM=1`，L3 case `it.skip`
-- **禁用 LLM 跑纯静态测试**：TS 加载器内部已设 `AGENT_MOSS_DISABLE_LLM=1`；Python 默认就是不调 LLM
-
-### 双端一致性核对
-
-除 JSON case 加载器外，还有专项一致性测试：
-
-| 测试 | 核对内容 |
-|---|---|
-| `ts/src/__tests__/dual-parity.test.ts` | `isWriteOperation` 双端对同一批 case 返回一致 |
-| `ts/src/__tests__/json-cases.test.ts` | 226 个 JSON case 双端 `decision` + `risk_level` 一致 |
-
-> **归一前**：Python 跑 Python 的 `test_all_cases.py`，TS 跑 TS 的 `*.test.ts`，期望值各写各的，双端不一致发现不了。**归一后**：期望值写在 JSON 里，双端共用，改一处 JSON 双端同步——`ts/src/__tests__/json-cases.test.ts` 加载器一上线就暴露了 2 处真实代码差异 + 3 处 JSON 期望值错误。

@@ -22,6 +22,7 @@
 - 安装来自官方仓库的包（需检查版本和已知漏洞）
 - 安装开发依赖（需检查是否为生产环境）
 - 包版本锁定文件修改（需检查变更内容）
+- 从 Git URL 安装**组织内部/已知信任来源**的包（如 prompt 明确说明 trusted-org / 公司认证账号的 GitHub 仓库）：企业内部包不走公共仓库是常态，来源可信且 prompt 意图明确时降档评估，不要仅因「非 npmjs.com/PyPI 的 URL」字样判 High（对齐 script_execution_guard 对 sudo 包管理的口径）
 
 ## 决策标准
 1. 包名是否为 typosquatting？→ Critical → Deny

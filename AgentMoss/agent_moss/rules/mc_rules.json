@@ -1,5 +1,5 @@
 {
-  "_comment": "L2.2 模型检测规则单一事实源（Python + TS 共用）。原子命题正则 + LTL 公式（前缀 AST）。公式在事件迹位置 0 处评估：LTL 公式满足 = 攻击存在。对应站点 detection-l2-2.html 的 10 条 LTL + 5 条 CTL 规则（CTL 活性降级为 G(!φ) 安全不变量，见 docs/DETECTION_METHODS.md 5.4）。",
+  "_comment": "L2.2 模型检测规则单一事实源（Python + TS 共用）。原子命题正则 + LTL 公式（前缀 AST）。公式在事件迹位置 0 处评估：LTL 公式满足 = 攻击存在。对应站点 detection-l2-2.html 的 9 条 LTL + 5 条 CTL 规则（2026-09 移除 2 条单动作冗余：mc-ltl-010 F(install_persistence) 与 mc-ctl-001 F(clear_logs) —— 它们误伤正常运维，且攻击场景已由链式规则 006/007/008 覆盖）（CTL 活性降级为 G(!φ) 安全不变量）。",
   "ap_patterns": {
     "reads_credential": [
       "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*[~]?/\\.ssh(?:/[\\w.-]+)?\\b",
@@ -336,34 +336,6 @@
       "risk_level": "critical",
       "action": "block",
       "reason": "敏感数据→归档→外传（mc-ltl-009）"
-    },
-    {
-      "id": "mc-ltl-010",
-      "type": "ltl",
-      "formula": [
-        "F",
-        [
-          "ap",
-          "install_persistence"
-        ]
-      ],
-      "risk_level": "medium",
-      "action": "approval",
-      "reason": "持久化机制安装，需审批（mc-ltl-010）"
-    },
-    {
-      "id": "mc-ctl-001",
-      "type": "ltl",
-      "formula": [
-        "F",
-        [
-          "ap",
-          "clear_logs"
-        ]
-      ],
-      "risk_level": "critical",
-      "action": "block",
-      "reason": "安全不变量：任何情况不得清除日志（mc-ctl-001，AG(!clear_logs) 线性迹降级：违反 ⟺ 出现 clear_logs ⟺ F(clear_logs) 成立）"
     }
   ]
 }

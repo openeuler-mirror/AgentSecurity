@@ -1,0 +1,73 @@
+{
+  "_comment": "L2 逻辑规则的识别词表（Python engine/logic_rules.py ↔ TS engine/logic-rules.ts 单一事实源）。全部为子串匹配，被匹配文本先转小写。",
+  "_dir_traversal_note": "目录遍历词表不在这里：它复用 inline_rules.json 的 dir_traversal_keywords —— 两处原本就是逐字相同的 10 条，再放一份就是给自己造双份维护。",
+  "indirect_file_access": {
+    "_comment": "间接文件访问（Rule 4.5）：内联脚本用目录遍历动态发现文件 + 读写/执行调用。四组词分别决定「有没有文件操作」和「是读还是写/执行」—— 写/执行时所有敏感文件都拦，只读时只拦凭据文件。",
+    "read_keywords": [
+      "read(",
+      "readline",
+      "readlines",
+      "fread",
+      "fgets",
+      "load(",
+      "getpass",
+      "file_get_contents"
+    ],
+    "write_keywords": [
+      "write(",
+      "writelines",
+      "fwrite",
+      "file_put_contents"
+    ],
+    "exec_keywords": [
+      "system(",
+      "exec(",
+      "eval(",
+      "popen(",
+      "os.system",
+      "os.popen",
+      "subprocess",
+      "os.exec",
+      "os.spawn",
+      "shell=true",
+      "check_output",
+      "check_call",
+      "run(",
+      "passthru",
+      "shell_exec",
+      "proc_open"
+    ],
+    "open_keywords": [
+      "open(",
+      "fopen("
+    ]
+  },
+  "_more": "另有几组「谁算写操作 / 谁算临时目录」的通用名单，原先散在 logic_rules.py 的三个函数里各写一份。",
+  "non_write_tool_prefixes": [
+    "memory-",
+    "skill-manager-",
+    "mailbox-",
+    "app-"
+  ],
+  "_non_write_tool_prefixes_comment": "写判定豁免的非写工具前缀（不含 skill-，与 heuristic 的敏感路径排除名单刻意差一项）。",
+  "write_commands": [
+    "cp",
+    "mv",
+    "install",
+    "tee",
+    "dd",
+    "truncate",
+    "mkfs",
+    "fdisk",
+    "parted"
+  ],
+  "_write_commands_comment": "写/删命令集合（逐段首词判定，供重定向/通配判定用）。",
+  "source_arg_commands": [
+    "cp",
+    "mv",
+    "install",
+    "rsync"
+  ],
+  "_source_arg_commands_comment": "第一个位置参数是「源文件」的命令：源在敏感目录 → 视为读取。",
+  "_reused": "不重复存的两组：① 写/删命令词边界正则 = platform_traits.json 的 write_command_res（逐字相同）；② 工具排除前缀 = heuristic_rules.json 的 sensitive_excluded_prefixes（逐字相同）；③ 临时目录名单 = heuristic_rules.json 的 temp_dirs（L1/L2 共用一份）。"
+}

@@ -16,6 +16,8 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+
+from ...rules_loader import load_formal_rules
 import urllib.parse
 
 # ---------------- 解码算法 ----------------
@@ -66,7 +68,8 @@ _QUOTED_STR_RE = re.compile(r"""
 # 非输出类命令（python3 -c / bash -c / eval / exec 等）的引号内容是「要执行的代码」，
 # 不可剥——否则连 os.system 等真实攻击形态一起被剥掉（漏报）。
 # 注意：那是「顶层命令词」判定（命令起始 token），不是全文包含判定。
-_OUTPUT_CMDS = frozenset({"echo", "printf", "print"})  # 只剥纯输出；grep/cat 等查询类引号内是搜索词（有安全语义），不剥
+# 数据见 rules/formal_rules.json 的 output_commands（与 TS 同源）。
+_OUTPUT_CMDS = frozenset(load_formal_rules().get("output_commands") or ())
 
 
 def strip_string_literals(text: str) -> str:

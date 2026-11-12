@@ -1,0 +1,40 @@
+{
+  "_comment": "L1 特征检测里的小型名单（Python engine/heuristic.py ↔ TS engine/heuristic.ts 单一事实源）。统一为子串/前缀匹配，大小写不敏感（匹配前先转小写）。",
+  "sensitive_excluded_prefixes": [
+    "memory-",
+    "skill-",
+    "skill-manager-",
+    "mailbox-",
+    "app-"
+  ],
+  "_sensitive_excluded_prefixes_comment": "敏感路径检测排除的非文件工具前缀（避免 memory-searchMemory 等误报）。前缀匹配。",
+  "search_action_prefixes": [
+    "search-",
+    "web-",
+    "browser-",
+    "query-",
+    "websearch",
+    "web_search"
+  ],
+  "search_action_exact": [
+    "websearch",
+    "web_search",
+    "search",
+    "query"
+  ],
+  "_search_action_comment": "搜索/查询类工具：其 action_detail 是「查询数据」（如 query=...）不是指令，注入关键词检测跳过它，否则搜「jailbreak」资料会被误判为注入。命中口径 = 前缀匹配(search_action_prefixes) 或 精确名(search_action_exact)。",
+  "loopback_hosts": [
+    "localhost",
+    "::1",
+    "0.0.0.0",
+    "[::1]"
+  ],
+  "_loopback_hosts_comment": "回环地址豁免名单（另加 127.* 前缀）。命令里所有 http(s) URL 都在回环 → 不判外传。",
+  "temp_dirs": [
+    "/tmp",
+    "/var/tmp",
+    "/run",
+    "/dev/shm"
+  ],
+  "_temp_dirs_comment": "临时目录（批量删除豁免）。L1 的 _check_dangerous_patterns 与 L2 的 read_before_write 共用这一份；调用方按需拼尾随斜杠做 startswith。"
+}
