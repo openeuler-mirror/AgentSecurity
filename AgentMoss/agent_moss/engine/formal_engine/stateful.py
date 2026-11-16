@@ -21,16 +21,41 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _fingerprint(session_id: str, action_type: str, action_detail: str, called_at: str) -> str:
+    """动作指纹（seed 去重用）。
+
+    只对**带 called_at 的动作**生成 —— 同一 session 里重复执行同一命令是
+    合法行为，没有时间戳就无法区分，宁可不作为也不误去重。
+    """
+    raw = "\x00".join((str(session_id), str(action_type), str(action_detail), str(called_at)))
+    return hashlib.blake2b(raw.encode("utf-8", "replace"), digest_size=8).hexdigest()
+
 # 时间线上限（安全相关节点；平凡动作即便不单独建安全语义节点也会被 append，
 # 高频大项目下需上限保护防无限增长。超限忽略新节点，建议定期 /api/v1/review 重建。）
-_MAX_NODES = 100000
+#
+# 可用 AGENT_MOSS_CHAIN_MAX_NODES 覆盖（默认 10 万）。按客户 QPS 5-10 估算，
+# **几小时就会触顶**；触顶后新动作不入链、组合链检测失效，所以必须提前预警
+# （见 _CAPACITY_WARN_RATIOS）而不能等撞墙。
+def _max_nodes() -> int:
+    try:
+        return int(os.getenv("AGENT_MOSS_CHAIN_MAX_NODES", "100000") or "100000")
+    except ValueError:
+        return 100000
+
+
+_MAX_NODES = _max_nodes()
+#: 容量分级预警阈值（达到即打一条 warning，每档只打一次）
+_CAPACITY_WARN_RATIOS = (0.7, 0.85, 0.95)
 
 # ---------------- 生命周期/敏感数据 辅助正则 ----------------
 
@@ -254,6 +279,19 @@ class StatefulChainTracker:
         # 时间线（全局序）
         self.nodes: list[StateNode] = []
         self._session_ends: set = set()  # session 已结束（预留）
+        #: 已入时间线的动作指纹（**只有带 called_at 的动作才登记**）。
+        #:
+        #: 为什么需要（2026-11 实测）：`seed()` 原先无条件追加历史 —— 同一批
+        #: session seed 5 次，节点从 2 条变成 10 条。AgentGate 每 100 次
+        #: analyze 就触发一次 review 并 seed 全量历史，跑一小时能把 10 万节点
+        #: 上限打满，之后 `_append` 静默丢弃新节点 → **组合链检测彻底失效**。
+        #:
+        #: 只用 `(_agent, _type, _detail, called_at)` 做键；`called_at` 为空时
+        #: 不登记也不去重（同一 session 重复执行同一命令是合法行为，无时间戳
+        #: 无法区分，宁可重复也不能漏）。
+        self._seeded_keys: set[str] = set()
+        #: 已打过的容量预警档位（0.7 / 0.85 / 0.95），防每请求刷屏
+        self._capacity_warned: set[float] = set()
 
         # 每条链的推进指针: chain_id -> (matched, session_id 组合)
         self._ptr: dict[str, int] = {}
@@ -476,14 +514,26 @@ class StatefulChainTracker:
         时间线上限保护：防无限增长（高频大项目下平凡动作会持续产生节点）。
         超限后**忽略新节点**（warn 一次）并返回 None，由外部低频 /api/v1/review
         重建来恢复（seq==index 不变式不被破坏，链指针/taint 索引安全）。
+
+        幂等（2026-11）：带 ``called_at`` 的动作按「session + 类型 + 详情 +
+        时间」去重。review 会周期性重复 seed 全量历史，不去重就会成倍膨胀。
         """
         ad = str(action.get("action_detail", "") or "")
         at = str(action.get("action_type", "") or "")
         if not ad:
             return None
+        _called_at = str(action.get("called_at", "") or "")
+        _dedupe_key = ""
+        if _called_at:
+            _dedupe_key = _fingerprint(session_id, at, ad, _called_at)
+            if _dedupe_key in self._seeded_keys:
+                return None  # 这条动作已经在时间线里了
+        # 触顶保护（硬上限）
         if len(self.nodes) >= _MAX_NODES:
             logger.warning(
-                "stateful 时间线达上限 %d（agent=%s），忽略新节点；建议重建状态库",
+                "stateful 时间线达上限 %d（agent=%s），忽略新节点；"
+                "组合链检测已无法覆盖新动作，请用 `agent-moss state backup` 备份后 "
+                "`agent-moss state reset --yes` 重建",
                 _MAX_NODES, self.agent_id,
             )
             return None
@@ -505,6 +555,21 @@ class StatefulChainTracker:
         )
         self.nodes.append(node)
         self.seq_next += 1
+        if _dedupe_key:
+            self._seeded_keys.add(_dedupe_key)
+        # 容量分级预警（2026-11）：在**触顶之前**提醒，给运维留处理时间。
+        # 放在 append 之后，这样「第 70 条落库时正好打 70% 的提醒」。
+        _n = len(self.nodes)
+        for _ratio in _CAPACITY_WARN_RATIOS:
+            if _n >= int(_MAX_NODES * _ratio) and _ratio not in self._capacity_warned:
+                self._capacity_warned.add(_ratio)
+                logger.warning(
+                    "stateful 时间线已用 %d%%（%d/%d 节点，agent=%s）。"
+                    "达 100%% 后新动作将不再入链、组合链检测失效。"
+                    "建议：agent-moss state backup 备份后视情况 reset，"
+                    "或调大 AGENT_MOSS_CHAIN_MAX_NODES",
+                    int(_ratio * 100), _n, _MAX_NODES, self.agent_id,
+                )
         return node
 
     def _advance_chains(self, node: StateNode) -> ChainMatch | None:
@@ -740,12 +805,22 @@ class StatefulChainTracker:
 
     def to_snapshot(self) -> dict:
         """持久化快照：节点 + 指针 + taint + alive 资源（供 SQLite 存）。"""
+        return self.finalize_snapshot(self.to_snapshot_parts())
+
+    def to_snapshot_parts(self) -> dict:
+        """**锁内调用**：只做浅拷贝（O(n) 复制指针，2 万节点约 0.2ms）。
+
+        为什么要拆成两阶段（2026-11 招行长稳实测）：``to_snapshot`` 完整构建
+        2 万节点要 40ms、4 万节点 117ms。如果它在状态锁内执行，每秒一次的落盘
+        就是一次全局卡顿 —— 所有 ``apply_action`` 都要等，实测长稳 10 分钟
+        QPS 从 47 掉到 32、p95 从 225ms 涨到 529ms。
+
+        现在：锁内只取引用（浅拷贝），真正的逐节点构建和 json.dumps 在锁外做
+        （``finalize_snapshot``）。节点对象创建后不再被修改，浅拷贝安全。
+        """
         return {
             "agent_id": self.agent_id,
-            "nodes": [
-                {k: (v if k != "resources" else list(v)) for k, v in n.__dict__.items()}
-                for n in self.nodes
-            ],
+            "nodes": list(self.nodes),
             "ptrs": dict(self._ptr),
             "tainted": sorted(self._tainted),
             # taint 传播路径（前端攻击链图）；taint_edge_label 是 tuple key，
@@ -754,12 +829,49 @@ class StatefulChainTracker:
             "taint_origin": dict(self._taint_origin),
             "alive": {k: v for k, v in self._alive_resources.items()},
             "seq_next": self.seq_next,
+            # seed 去重指纹：不持久化的话，重启后 review 会再把全量历史追加一遍。
+            # 锁内只做 set 浅拷贝（10 万条约 2ms），排序在 finalize 里做。
+            "seeded_keys": set(self._seeded_keys),
+        }
+
+    @staticmethod
+    def finalize_snapshot(parts: dict) -> dict:
+        """**锁外调用**：把浅拷贝展开成可 JSON 化的完整快照。"""
+        return {
+            "agent_id": parts["agent_id"],
+            "nodes": [
+                {k: (v if k != "resources" else list(v)) for k, v in n.__dict__.items()}
+                for n in parts["nodes"]
+            ],
+            "ptrs": parts["ptrs"],
+            "tainted": parts["tainted"],
+            "taint_parent": parts["taint_parent"],
+            "taint_origin": parts["taint_origin"],
+            "alive": parts["alive"],
+            "seq_next": parts["seq_next"],
+            "seeded_keys": sorted(parts.get("seeded_keys") or ()),
         }
 
     def restore(self, snapshot: dict | None) -> None:
-        """从快照恢复（幂等，供服务重启后重建）。"""
+        """从快照恢复（幂等，供服务重启后重建）。
+
+        ⚠️ 幂等要求先清空（2026-11）：原先直接 ``nodes.append`` —— 同一个
+        tracker 被 restore 两次，节点就翻倍。这与 ``seed`` 重复追加是同一类坑，
+        只是当前调用路径恰好每次 new 新对象才没暴露。防御性清空。
+        """
         if not snapshot:
             return
+        self.nodes = []
+        self._ptr = {}
+        self._tainted = set()
+        self._taint_parent = {}
+        self._taint_origin = {}
+        self._taint_edge_label = {}
+        self._tainted_resources = set()
+        self._alive_resources = {}
+        self._seeded_keys = set()
+        self._capacity_warned = set()
+        self.seq_next = 0
         self.agent_id = str(snapshot.get("agent_id", self.agent_id))
         for raw in snapshot.get("nodes", []) or []:
             n = StateNode(
@@ -788,6 +900,18 @@ class StatefulChainTracker:
             str(k): int(v) for k, v in (snapshot.get("taint_origin") or {}).items()
         }
         self._taint_edge_label = {}  # 旧快照无此字段：边标签缺失，图结构不受影响
+        # seed 去重指纹（旧快照没有这个字段：从已有节点重建，保证升级后
+        # 第一次 review 不会把历史再追加一遍）
+        _keys = snapshot.get("seeded_keys")
+        if _keys:
+            self._seeded_keys = {str(k) for k in _keys}
+        else:
+            self._seeded_keys = set()
+            for n in self.nodes:
+                if getattr(n, "timestamp", ""):
+                    self._seeded_keys.add(
+                        _fingerprint(n.session_id, n.action_type, n.action_detail, n.timestamp)
+                    )
         # 重建 taint 资源反索引：由染毒节点的 resources 推导（并集 all）
         self._tainted_resources = set()
         for i in self._tainted:

@@ -200,6 +200,26 @@ class LLMAnalyzer:
         if log_path:
             self._log_prompt(judge_prompt, a_next, log_path)
 
+        # 4.6 追踪日志：完整 prompt（AGENT_MOSS_TRACE_LEVEL=full 时）。
+        # 与上面的 llm_log_path 独立 —— 那个需要调用方显式配置路径，这个只要
+        # 打开追踪开关就落到数据目录，客户排障时不必先配 env。
+        try:
+            from ..infra.trace_log import is_trace_enabled, LEVEL_FULL, trace_full
+
+            if is_trace_enabled(LEVEL_FULL):
+                trace_full(
+                    "l3.prompt",
+                    phase="security_judge",
+                    model=llm_config_to_use.model,
+                    base_url=llm_config_to_use.base_url,
+                    action_type=a_next.get("action_type", ""),
+                    action_detail=a_next.get("action_detail", ""),
+                    prompt=judge_prompt,
+                    prompt_chars=len(judge_prompt),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
         # 5. 调用 LLM（带超时和重试）
         max_retries = config.retry.max_retries
         retry_interval = config.retry.retry_interval
@@ -228,6 +248,9 @@ class LLMAnalyzer:
                 provider=overrides.get("provider", config.llm.provider),
                 temperature=config.llm.temperature,
                 max_tokens=config.llm.max_tokens,
+                # per-request 只覆盖调用相关字段；extra_body 是部署级参数
+                # （关思考等），始终跟随全局配置，不允许调用方替服务端决定。
+                extra_body=config.llm.extra_body,
             )
 
         # 根据 LLM 超时时间自动计算单次 call_llm 超时时间
@@ -250,6 +273,30 @@ class LLMAnalyzer:
                         config=llm_config_to_use,
                     )
                     llm_result = future.result(timeout=llm_timeout)
+
+                # 追踪日志：完整响应（full 级别）。
+                # 这里的 content 是**模型最终答案**；思考内容（reasoning_*）在
+                # 网关侧就被剥掉了，要看到它得靠 llm_client 的空返回诊断。
+                try:
+                    from ..infra.trace_log import (
+                        is_trace_enabled as _te,
+                        LEVEL_FULL as _LF,
+                        trace_full as _tf,
+                    )
+
+                    if _te(_LF):
+                        _tf(
+                            "l3.response",
+                            phase="security_judge",
+                            attempt=attempt,
+                            model=llm_result.model,
+                            content=llm_result.content,
+                            prompt_tokens=llm_result.prompt_tokens,
+                            completion_tokens=llm_result.completion_tokens,
+                            elapsed_ms=round((time.monotonic() - _call_start) * 1000, 1),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # 记录 token 用量（step="L3_security_judge"）
                 try:
@@ -278,6 +325,20 @@ class LLMAnalyzer:
                     )
                     raise
                 judgment.source = "llm"
+                try:
+                    from ..infra.trace_log import trace_summary as _ts
+
+                    _ts(
+                        "l3.verdict",
+                        allowed=judgment.allowed,
+                        risk_level=judgment.risk_level,
+                        risk_type=judgment.risk_type,
+                        reason=judgment.reason,
+                        confidence=judgment.confidence,
+                        elapsed_ms=round((time.monotonic() - _call_start) * 1000, 1),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 # 写入缓存（超出上限时淘汰最旧条目）
                 if len(self._cache) >= self._cache_max:
                     self._cache.popitem(last=False)

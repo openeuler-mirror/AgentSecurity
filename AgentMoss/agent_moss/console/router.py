@@ -52,6 +52,15 @@ from ..infra.token_stats import (
     reset_token_stats,
 )
 
+# ⚠️ 本文件的路由处理函数**一律用 `def`、不要写成 `async def`**（2026-11 修）。
+#
+# 原因：FastAPI 对 `def` 处理函数会自动丢进线程池执行，对 `async def` 则在事件
+# 循环里**同步**跑完整个函数体。本文件的每个接口都是同步 IO（读/写 175KB 的
+# runtime 配置、token 统计 JSON、skill 文件），写成 async def 等于每次调用都把
+# 事件循环卡住 5~20ms；写接口还要整份 dump + 清空全局缓存。招行现场表现为
+# 「analyze 一多，console 就打不开」的一部分。
+#
+# 判据：函数体里**没有任何 await** 就必须用 def。将来真要写异步逻辑再改回去。
 router = APIRouter(prefix="/console")
 
 
@@ -94,7 +103,7 @@ def _verify_auth(request: Request) -> bool:
     return False
 
 
-async def auth_dependency(request: Request):
+def auth_dependency(request: Request):
     if not _verify_auth(request):
         raise HTTPException(
             status_code=401, detail="Unauthorized: invalid or missing Bearer token"
@@ -107,6 +116,10 @@ async def auth_dependency(request: Request):
 class LayerToggle(BaseModel):
     layer_key: str  # "L1_heuristic" | "L2_logic_rules" | "L3_llm_analysis"
     enabled: bool
+
+
+class LogLevelUpdate(BaseModel):
+    level: str  # DEBUG / INFO / WARNING / ERROR / CRITICAL
 
 
 class RuleToggle(BaseModel):
@@ -273,7 +286,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def index():
+def index():
     """返回 SPA index.html"""
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
@@ -287,7 +300,7 @@ async def index():
 
 
 @router.get("/api/layers", dependencies=[Depends(auth_dependency)])
-async def get_layers():
+def get_layers():
     """获取 L1/L2/L3 开关状态 + env 覆盖"""
     runtime = _runtime_for_view()
     return {
@@ -299,7 +312,7 @@ async def get_layers():
 
 
 @router.put("/api/layers", dependencies=[Depends(auth_dependency)])
-async def set_layers(body: LayerToggle):
+def set_layers(body: LayerToggle):
     valid_keys = {"L1_heuristic", "L2_logic_rules", "L3_llm_analysis"}
     if body.layer_key not in valid_keys:
         raise HTTPException(status_code=400, detail=f"Invalid layer_key: {body.layer_key}")
@@ -427,7 +440,7 @@ def _l2_2_runtime_to_view(runtime_l2_2: dict) -> dict:
 
 
 @router.get("/api/rules", dependencies=[Depends(auth_dependency)])
-async def get_rules(layer: str | None = None, category: str | None = None):
+def get_rules(layer: str | None = None, category: str | None = None):
     runtime = _runtime_for_view()
     result: dict = {}
     for layer_key in ["L1_rules", "L2_rules"]:
@@ -462,32 +475,32 @@ def _with_l2_2_view(runtime: dict) -> dict:
 
 
 @router.put("/api/rules/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_rule(body: RuleToggle):
+def toggle_rule(body: RuleToggle):
     """开关单条规则。返回完整 runtimeConfig（避免前端全局状态被部分数据覆盖）。"""
     return _with_l2_2_view(update_rule_enabled(body.layer, body.category, body.rule_id, body.enabled))
 
 
 @router.put("/api/rules/deny_mode", dependencies=[Depends(auth_dependency)])
-async def change_rule_deny_mode(body: DenyModeUpdate):
+def change_rule_deny_mode(body: DenyModeUpdate):
     if body.deny_mode not in ("deny_write", "deny_read", "deny_both"):
         raise HTTPException(status_code=400, detail=f"无效的 deny_mode: {body.deny_mode}")
     return _with_l2_2_view(update_rule_deny_mode(body.layer, body.category, body.rule_id, body.deny_mode))
 
 
 @router.put("/api/rules/skip_l3", dependencies=[Depends(auth_dependency)])
-async def change_rule_skip_l3(body: SkipL3Update):
+def change_rule_skip_l3(body: SkipL3Update):
     return _with_l2_2_view(update_rule_skip_l3(
         body.layer, body.category, body.rule_id, body.skip_l3_on_disabled
     ))
 
 
 @router.put("/api/categories/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_category(body: CategoryToggle):
+def toggle_category(body: CategoryToggle):
     return _with_l2_2_view(update_category_enabled(body.layer, body.category, body.enabled))
 
 
 @router.post("/api/rules", dependencies=[Depends(auth_dependency)])
-async def create_rule(body: NewRule):
+def create_rule(body: NewRule):
     """新增自定义规则"""
     rule_dict: dict = {}
     for field in ("pattern", "keyword", "risk_level", "risk_type", "reason", "lang",
@@ -510,7 +523,7 @@ async def create_rule(body: NewRule):
 
 
 @router.delete("/api/rules", dependencies=[Depends(auth_dependency)])
-async def remove_rule(body: DeleteRule):
+def remove_rule(body: DeleteRule):
     """删除自定义规则（内置规则不可删除）"""
     runtime = delete_custom_rule(body.layer, body.category, body.rule_id)
     if runtime is None:
@@ -522,28 +535,28 @@ async def remove_rule(body: DeleteRule):
 
 
 @router.get("/api/skills", dependencies=[Depends(auth_dependency)])
-async def get_skills():
+def get_skills():
     runtime = _runtime_for_view()
     return runtime.get("L3_skills", {})
 
 
 @router.put("/api/skills/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_skill(body: SkillToggle):
+def toggle_skill(body: SkillToggle):
     return _with_l2_2_view(update_skill_enabled(body.skill_id, body.enabled))
 
 
 @router.put("/api/skill-categories/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_skill_category(body: SkillCategoryToggle):
+def toggle_skill_category(body: SkillCategoryToggle):
     return _with_l2_2_view(update_skill_category_enabled(body.category, body.enabled))
 
 
 @router.post("/api/skills", dependencies=[Depends(auth_dependency)])
-async def create_skill(body: NewSkill):
+def create_skill(body: NewSkill):
     return _with_l2_2_view(add_custom_skill(body.skill_id, body.category, body.keywords, body.content))
 
 
 @router.delete("/api/skills", dependencies=[Depends(auth_dependency)])
-async def remove_skill(body: DeleteSkill):
+def remove_skill(body: DeleteSkill):
     runtime = delete_custom_skill(body.skill_id, body.category)
     if runtime is None:
         raise HTTPException(status_code=403, detail="内置 skill 不可删除，只能禁用")
@@ -551,7 +564,7 @@ async def remove_skill(body: DeleteSkill):
 
 
 @router.get("/api/skills/{skill_id}/content", dependencies=[Depends(auth_dependency)])
-async def get_skill_content(skill_id: str):
+def get_skill_content(skill_id: str):
     """获取 skill 的完整 Markdown 内容。优先用户自定义目录，再内置 skills 目录。"""
     # 防路径穿越：skill_id 只允许字母数字下划线横线
     if not skill_id.replace("-", "").replace("_", "").isalnum():
@@ -573,13 +586,13 @@ async def get_skill_content(skill_id: str):
 
 
 @router.get("/api/agents", dependencies=[Depends(auth_dependency)])
-async def get_agents():
+def get_agents():
     """获取所有 agent 定制规则（含 enabled 状态，供 console 展示）。"""
     return {"agents": get_agent_rules(_runtime_for_view())}
 
 
 @router.put("/api/agents/rules/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_agent_rule(body: AgentRuleToggle):
+def toggle_agent_rule(body: AgentRuleToggle):
     """切换某 agent 某条规则的 enabled。"""
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
@@ -590,7 +603,7 @@ async def toggle_agent_rule(body: AgentRuleToggle):
 
 
 @router.post("/api/agents/rules", dependencies=[Depends(auth_dependency)])
-async def create_agent_rule(body: NewAgentRule):
+def create_agent_rule(body: NewAgentRule):
     """向某 agent 的某类别新增规则条目。"""
     rule = {k: v for k, v in body.model_dump().items()
             if k not in ("agent_id", "category") and v is not None}
@@ -599,7 +612,7 @@ async def create_agent_rule(body: NewAgentRule):
 
 
 @router.delete("/api/agents/rules", dependencies=[Depends(auth_dependency)])
-async def remove_agent_rule(body: DeleteAgentRule):
+def remove_agent_rule(body: DeleteAgentRule):
     """删除某 agent 某条规则。"""
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
@@ -610,7 +623,7 @@ async def remove_agent_rule(body: DeleteAgentRule):
 
 
 @router.put("/api/agents/categories/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_agent_category(body: AgentCategoryToggle):
+def toggle_agent_category(body: AgentCategoryToggle):
     """切换某 agent 某类别的整类开关（category_enabled）。"""
     runtime = update_agent_category_enabled(body.agent_id, body.category, body.enabled)
     return {"agents": get_agent_rules(runtime)}
@@ -631,7 +644,7 @@ def _enabled_scenario_ids() -> list[str]:
 
 
 @router.get("/api/scenarios", dependencies=[Depends(auth_dependency)])
-async def get_scenarios():
+def get_scenarios():
     """获取所有场景定制规则（含 enabled 状态，供 console 展示）。
 
     只返回**已启用**的场景（由 AGENT_MOSS_SCENARIO env 决定）——没有 env 时不显示
@@ -646,7 +659,7 @@ async def get_scenarios():
 
 
 @router.put("/api/scenarios/rules/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_scenario_rule(body: ScenarioRuleToggle):
+def toggle_scenario_rule(body: ScenarioRuleToggle):
     """切换某场景某条规则的 enabled。"""
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
@@ -657,7 +670,7 @@ async def toggle_scenario_rule(body: ScenarioRuleToggle):
 
 
 @router.post("/api/scenarios/rules", dependencies=[Depends(auth_dependency)])
-async def create_scenario_rule(body: NewScenarioRule):
+def create_scenario_rule(body: NewScenarioRule):
     """向某场景的某类别新增规则条目。"""
     rule = {k: v for k, v in body.model_dump().items()
             if k not in ("scenario_id", "category") and v is not None}
@@ -666,7 +679,7 @@ async def create_scenario_rule(body: NewScenarioRule):
 
 
 @router.delete("/api/scenarios/rules", dependencies=[Depends(auth_dependency)])
-async def remove_scenario_rule(body: DeleteScenarioRule):
+def remove_scenario_rule(body: DeleteScenarioRule):
     """删除某场景某条规则。"""
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
@@ -677,7 +690,7 @@ async def remove_scenario_rule(body: DeleteScenarioRule):
 
 
 @router.put("/api/scenarios/categories/enabled", dependencies=[Depends(auth_dependency)])
-async def toggle_scenario_category(body: ScenarioCategoryToggle):
+def toggle_scenario_category(body: ScenarioCategoryToggle):
     """切换某场景某类别的整类开关（category_enabled）。"""
     runtime = update_scenario_category_enabled(body.scenario_id, body.category, body.enabled)
     return {"scenarios": get_scenario_rules(runtime), "enabled": _enabled_scenario_ids()}
@@ -687,7 +700,7 @@ async def toggle_scenario_category(body: ScenarioCategoryToggle):
 
 
 @router.get("/api/config", dependencies=[Depends(auth_dependency)])
-async def get_full_config():
+def get_full_config():
     """获取完整 runtime config（含 L2_2 形式化只读视图，供前端"形式化"页展示）"""
     # ⚠️ `dict(...)` 这层浅拷贝**不能省**：`_runtime_for_view()` 在正常模式下返回的是
     # `load_runtime_config()` 的**进程内缓存对象本身**，直接往上面写 L2_2 / builtin_only
@@ -708,8 +721,27 @@ async def get_full_config():
     return cfg
 
 
+@router.get("/api/log-level", dependencies=[Depends(auth_dependency)])
+def get_log_level():
+    """当前日志级别（0.17.23 起支持运行时调整，不用重启）。"""
+    from ..infra.logging import current_log_level
+
+    return {"level": current_log_level()}
+
+
+@router.put("/api/log-level", dependencies=[Depends(auth_dependency)])
+def set_log_level_api(body: LogLevelUpdate):
+    """运行时改日志级别（排障时临时开 DEBUG，排完改回）。"""
+    from ..infra.logging import set_log_level
+
+    try:
+        return {"level": set_log_level(body.level)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/api/env-overrides", dependencies=[Depends(auth_dependency)])
-async def get_env_status():
+def get_env_status():
     # ⚠️ 必须包一层 ``{"overrides": ...}``：前端（console/static/index.html）
     # `loadEnvOverrides()` 读的是 ``resp?.overrides``，直接返回扁平 map 会让
     # 「环境变量接管」信息**恒为空**（禁用了哪些层看不出来）。TS 端
@@ -718,7 +750,7 @@ async def get_env_status():
 
 
 @router.post("/api/reset", dependencies=[Depends(auth_dependency)])
-async def reset_config():
+def reset_config():
     """重置配置到出厂默认（删除用户本地副本，下次调用自动重新生成）"""
     config_path = get_runtime_config_path()
     if config_path.exists():
@@ -730,7 +762,7 @@ async def reset_config():
 
 
 @router.get("/api/token-stats", dependencies=[Depends(auth_dependency)])
-async def get_token_stats_api(
+def get_token_stats_api(
     days: int = 0,
     start_date: str | None = None,
     end_date: str | None = None,
@@ -740,12 +772,12 @@ async def get_token_stats_api(
 
 
 @router.get("/api/token-stats/recent", dependencies=[Depends(auth_dependency)])
-async def get_recent_token_records(limit: int = 20, offset: int = 0):
+def get_recent_token_records(limit: int = 20, offset: int = 0):
     return {"records": get_recent_records(limit, offset), "total": get_recent_records_count()}
 
 
 @router.get("/api/token-stats/trend", dependencies=[Depends(auth_dependency)])
-async def get_token_trend_api(
+def get_token_trend_api(
     days: int = 0,
     start_date: str | None = None,
     end_date: str | None = None,
@@ -755,7 +787,7 @@ async def get_token_trend_api(
 
 
 @router.post("/api/token-stats/reset", dependencies=[Depends(auth_dependency)])
-async def reset_token_stats_api():
+def reset_token_stats_api():
     reset_token_stats()
     return {"detail": "Token stats reset successfully"}
 

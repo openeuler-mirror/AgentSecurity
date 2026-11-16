@@ -262,17 +262,29 @@ def check_sensitive_data_flow(graph: MultiSessionGraph) -> list[PropertyViolatio
     # 传播边记录：(parent, child) -> 共享资源（前端图上的 data 边标签）
     taint_edges: dict[tuple[int, int], str] = {}
 
-    # 前向传播（迭代直到收敛；图小，线性可接受）
-    changed = True
-    while changed:
-        changed = False
-        for e in graph.all_edges:
-            if e.src in tainted and e.dst not in tainted:
-                shared = nodes[e.src].resources & nodes[e.dst].resources
-                if shared:  # 共享资源 → 传播
-                    tainted[e.dst] = (tainted[e.src][0], e.src)
-                    taint_edges[(e.src, e.dst)] = sorted(shared)[0]
-                    changed = True
+    # 前向传播：BFS 队列，O(V + E)。
+    #
+    # 2026-11 修复：原先「反复遍历所有边直到收敛」，最坏要 n 轮 —— 当所有节点
+    # 共享同一资源（重复执行同类命令在真实历史里极常见）时退化成 O(n²)：
+    # 实测 1000 条相同命令 1003ms，而 1000 条各不相同的命令只要 75ms。
+    # 这个函数在 **analyze 热路径**上（每次请求都跑），必须线性。
+    from collections import deque
+
+    _adj: dict[int, list] = {}
+    for e in graph.all_edges:
+        _adj.setdefault(e.src, []).append(e)
+
+    _queue: deque[int] = deque(tainted.keys())
+    while _queue:
+        _src = _queue.popleft()
+        for e in _adj.get(_src, ()):
+            if e.dst in tainted:
+                continue
+            shared = nodes[e.src].resources & nodes[e.dst].resources
+            if shared:  # 共享资源 → 传播
+                tainted[e.dst] = (tainted[e.src][0], e.src)
+                taint_edges[(e.src, e.dst)] = sorted(shared)[0]
+                _queue.append(e.dst)
 
     def _trace_path(idx: int) -> list[int]:
         """沿 parent 回溯出 taint 源 → 当前节点的完整路径。"""
@@ -814,17 +826,28 @@ def check_low_integrity_command_exec(graph: MultiSessionGraph) -> list[PropertyV
             low_at[i] = n.action_detail[:60]
             low_resources |= n.resources
 
-    # 2. 沿共享资源传播（迭代收敛）
-    changed = True
-    while changed:
-        changed = False
-        for i, n in enumerate(nodes):
+    # 2. 沿共享资源传播：资源 → 节点索引 + BFS 队列（2026-11）。
+    # 原先「反复遍历所有节点直到不动点」，资源种类少时最坏 O(n²)。
+    from collections import deque
+
+    _res_index: dict[str, list[int]] = {}
+    for i, n in enumerate(nodes):
+        for r in n.resources:
+            _res_index.setdefault(r, []).append(i)
+
+    _queue: deque[str] = deque(low_resources)
+    _seen_res: set[str] = set(low_resources)
+    while _queue:
+        _r = _queue.popleft()
+        for i in _res_index.get(_r, ()):
             if i in low_at:
                 continue
-            if n.resources & low_resources:
-                low_at[i] = f"继承自 {sorted(n.resources & low_resources)[0]}"
-                low_resources |= n.resources
-                changed = True
+            low_at[i] = f"继承自 {_r}"
+            for nr in nodes[i].resources:
+                if nr not in _seen_res:
+                    _seen_res.add(nr)
+                    low_resources.add(nr)
+                    _queue.append(nr)
 
     if not low_at:
         return violations
@@ -974,18 +997,25 @@ def check_cross_session_reachability(graph: MultiSessionGraph) -> list[PropertyV
     if not sources:
         return violations
 
-    # data 边 + next 边构成图，用共享资源传播可达（BFS/迭代直到不动点）
+    # data 边 + next 边构成图，用共享资源传播可达。
+    # BFS 队列（2026-11）：与 check_sensitive_data_flow 同款修复 ——
+    # 「反复遍历所有边直到不动点」最坏 O(V×E)，历史里重复命令多时退化成 n 轮。
+    from collections import deque
+
+    _adj: dict[int, list] = {}
+    for e in graph.all_edges:
+        _adj.setdefault(e.src, []).append(e)
+
     reached: set[int] = set(sources)
-    changed = True
-    while changed:
-        changed = False
-        for e in graph.all_edges:
-            if e.src in reached and e.dst not in reached:
-                src_res = nodes[e.src].resources
-                dst_res = nodes[e.dst].resources
-                if src_res & dst_res:  # 共享同一文件/载体 → 数据从 src 流到 dst
-                    reached.add(e.dst)
-                    changed = True
+    _queue: deque[int] = deque(sources)
+    while _queue:
+        _src = _queue.popleft()
+        for e in _adj.get(_src, ()):
+            if e.dst in reached:
+                continue
+            if nodes[e.src].resources & nodes[e.dst].resources:
+                reached.add(e.dst)
+                _queue.append(e.dst)
 
     witness = graph.witness_idx
     candidates = [witness] if witness is not None else list(range(len(nodes)))

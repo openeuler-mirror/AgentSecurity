@@ -98,7 +98,13 @@ def origin_allowed(origin: str, host_header: str, extra: list[str] | None = None
 
 # ==================== 鉴权 ====================
 
-HEALTH_PATHS = ("/api/v1/health",)
+#: 免鉴权的运维端点：探活 + Prometheus 抓取。
+#:
+#: `/metrics` 放行的理由（2026-11）：Prometheus 的抓取配置里配 bearer token
+#: 需要额外步骤，而指标内容只是**聚合数字**（请求数、耗时分布、池占用），
+#: 不含命令原文/路径/token。内网部署下泄露风险远低于「客户接不上监控」的
+#: 运维代价。需要收紧时可在网关层对这个路径做 IP 白名单。
+HEALTH_PATHS = ("/api/v1/health", "/metrics")
 
 #: 鉴权模式：
 #: - ``auto``（默认）：首次启动自动生成 token 写到 ``<data_root>/auth_token``（0600），

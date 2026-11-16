@@ -66,9 +66,21 @@ class _PooledLimiter:
             else:
                 self._counts[key] = cur - 1
 
+    async def snapshot(self) -> dict[str, int]:
+        """当前各池占用快照（健康检查用）。"""
+        async with self._lock:
+            return dict(self._counts)
+
 
 def _busy(detail: str, status: int = 503) -> JSONResponse:
     """并发超限响应，带 ``Connection: close`` 缩短连接占用。"""
+    try:
+        from ..infra import metrics as _m
+
+        # 503 = 并发池满（服务繁忙），429 = 限流/恶意排队
+        _m.REJECTED_TOTAL.inc(reason="busy" if status == 503 else "rate_limited")
+    except Exception:  # noqa: BLE001
+        pass
     return JSONResponse(
         status_code=status,
         content={"detail": detail},
@@ -227,7 +239,17 @@ def create_app() -> FastAPI:
     async def init_config():
         """Initialize config on startup (triggers config file auto-creation)."""
         from ..infra.config import get_default_config
-        get_default_config()
+        cfg = get_default_config()
+        # ⚠️ 必须显式初始化日志（2026-11 发现）：setup_logger 此前**从未被调用**——
+        # RotatingFileHandler 没挂上（agent_moss.log 一直是空/旧文件），日志级别
+        # 也随 uvicorn 的 root 配置漂移。客户反馈「日志太少」有一部分原因是这个：
+        # 文件日志压根没写。放在配置加载之后，用配置里的 log_level。
+        try:
+            from ..infra.logging import setup_logger
+
+            setup_logger(cfg.log_level)
+        except Exception as exc:  # noqa: BLE001 —— 日志初始化失败不能拖垮服务
+            logging.getLogger(__name__).warning("日志初始化失败: %s", exc)
         # 规则包契约：schema 版本 / 完整性 / 内容指纹。
         # 显式指定了 AGENT_MOSS_RULES_ROOT 且校验失败 → 这里会抛异常，服务拒绝启动
         # （带着残缺规则跑 = 静默放开一批防护）。
@@ -246,6 +268,16 @@ def create_app() -> FastAPI:
         # 这样线程池本身、以及 worker 线程里才会触发的惰性导入也一并热掉。
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _warm_up_engine)
+        # 事件循环延迟探针：同步阻塞最直接的观测指标（见 infra/loop_monitor.py）。
+        from ..infra.loop_monitor import get_loop_monitor
+
+        get_loop_monitor().start()
+
+    @app.on_event("shutdown")
+    async def shutdown_loop_monitor():
+        from ..infra.loop_monitor import get_loop_monitor
+
+        await get_loop_monitor().stop()
 
     # CORS：**不再默认全放行**（2026-10 安全加固）。
     # 为什么收紧是安全的：Console 前端用的是相对路径 fetch（同源），iframe 嵌入时
@@ -291,6 +323,8 @@ def create_app() -> FastAPI:
 
     # ==================== 安全闸门（最外层，先于业务路由） ====================
     _pools = _PooledLimiter()
+    # 暴露给健康检查 / console 观测（只读快照）
+    app.state.pools = _pools
     _limiter = _RateLimiter(sp.rate_limit_qps())
 
     @app.middleware("http")
@@ -399,6 +433,53 @@ def create_app() -> FastAPI:
     app.include_router(router)
     # Policy Console（浏览器策略管控台，挂载在 /console 前缀）
     app.include_router(console_router)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint():
+        """Prometheus 抓取端点（2026-11 新增，见 infra/metrics.py）。
+
+        与 `/api/v1/health` 同级免鉴权（见 ``sp.HEALTH_PATHS``）：指标只是
+        聚合数字，不含命令原文。需要收紧时在网关层做 IP 白名单。
+        """
+        from fastapi.responses import PlainTextResponse
+
+        from ..infra import metrics as metrics_mod
+        from ..infra.loop_monitor import get_loop_monitor
+
+        # 瞬时值在拉取时刷新（Gauge 不适合每次请求都写）
+        try:
+            pools_snap = await _pools.snapshot()
+        except Exception:  # noqa: BLE001
+            pools_snap = {}
+        chain_nodes = None
+        chain_bytes = None
+        try:
+            from ..engine.formal_engine.chain_state import get_chain_state_store
+
+            store = get_chain_state_store()
+            with store._lock:  # noqa: SLF001 —— 同包内只读快照
+                chain_nodes = sum(len(t.nodes) for t in store._trackers.values())  # noqa: SLF001
+            db_path = getattr(store, "db_path", "")
+            if db_path and os.path.exists(db_path):
+                chain_bytes = os.path.getsize(db_path)
+        except Exception:  # noqa: BLE001
+            pass
+        lag = {}
+        try:
+            lag = get_loop_monitor().snapshot()
+        except Exception:  # noqa: BLE001
+            pass
+        metrics_mod.refresh_runtime_gauges(
+            pools=pools_snap,
+            chain_nodes=chain_nodes,
+            chain_db_bytes=chain_bytes,
+            loop_lag_ms=lag.get("loop_lag_ms"),
+            loop_lag_max_ms=lag.get("loop_lag_max_ms"),
+        )
+        return PlainTextResponse(
+            metrics_mod.render_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     return app
 

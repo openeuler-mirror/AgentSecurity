@@ -67,11 +67,17 @@ CASES = [
 
 
 def test_script_content_respects_scenario_and_skips_shebang(tmp_path, caplog):
+    # logging.disable 是**全局**开关：不恢复的话，本文件之后执行的所有测试
+    # （按字母序在后面的 test_trace_log.py 等）日志都会被静默丢弃，表现为
+    # 「日志断言拿不到内容」。必须 try/finally 恢复。
     logging.disable(logging.CRITICAL)
-    results = []
-    for script, scenario, want, desc in CASES:
-        got = _run(tmp_path, script, scenario)
-        mark = "✅" if got == want else "❌"
-        results.append(f"  {mark} {script:12s} scenario={scenario or '(无)':4s} "
-                       f"{got:5s} (期望 {want:5s}) {desc}")
-        assert got == want, "\n".join(results)
+    try:
+        results = []
+        for script, scenario, want, desc in CASES:
+            got = _run(tmp_path, script, scenario)
+            mark = "✅" if got == want else "❌"
+            results.append(f"  {mark} {script:12s} scenario={scenario or '(无)':4s} "
+                           f"{got:5s} (期望 {want:5s}) {desc}")
+            assert got == want, "\n".join(results)
+    finally:
+        logging.disable(logging.NOTSET)
