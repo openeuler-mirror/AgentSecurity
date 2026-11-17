@@ -45,8 +45,9 @@ _PATH_RE = re.compile(r"(?:^|\s|[@=])((?:/|~/)[\w./~-]+)")
 _CARRIER_RE = re.compile(r"(?:/tmp/|/var/tmp/|~/|\./)[\w./-]+\.(?:sh|py|js|rb|pl|php|txt|log|json|db)")
 
 
-def extract_resources(action_detail: str) -> set:
-    """从动作详情提取涉及资源（文件路径 + 载体文件）。"""
+@functools.lru_cache(maxsize=8192)
+def _extract_resources_cached(action_detail: str) -> frozenset:
+    """``extract_resources`` 的缓存内核（不可变返回值才能进 lru_cache）。"""
     resources: set = set()
     text = re.sub(r"'[^']*'|\"[^\"]*\"", "", action_detail)  # 剥引号内容
     for m in _PATH_RE.finditer(text):
@@ -55,7 +56,16 @@ def extract_resources(action_detail: str) -> set:
         if p.startswith("/dev/") or "://" in p:
             continue
         resources.add(p)
-    return resources
+    return frozenset(resources)
+
+
+def extract_resources(action_detail: str) -> set:
+    """从动作详情提取涉及资源（文件路径 + 载体文件）。
+
+    返回新 set；内部走 lru_cache —— 历史里同一命令反复出现，500 条 × 5 session
+    时每请求要提取 3000 次，缓存后只算一次。
+    """
+    return set(_extract_resources_cached(action_detail))
 
 
 @functools.lru_cache(maxsize=8192)

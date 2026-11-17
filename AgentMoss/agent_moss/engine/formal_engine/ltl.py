@@ -25,6 +25,7 @@ witness_idx 对齐）：
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import Any
 
@@ -48,14 +49,14 @@ def _compile_aps(ap_patterns: dict) -> None:
         _AP_RE[name] = [re.compile(p, re.IGNORECASE) for p in pats]
 
 
-def label_event(action_detail: str) -> set[str]:
-    """labelEvent：从动作文本提取命中的原子命题集合（复用 mc_rules ap_patterns）。
+@functools.lru_cache(maxsize=8192)
+def _label_event_cached(action_detail: str) -> frozenset[str]:
+    """``label_event`` 的缓存内核（返回不可变集合，才能进 lru_cache）。
 
-    抗编码绕过（对齐 P1 decode 旁路，见 decode.py）：除原文外，对 action_detail
-    的**解码候选**（base64 字面量 / URL 编码 / 数值八进制 / 反序等）逐个也跑 AP
-    正则，命中即算该 AP。只对"有明显编码痕迹"的文本解码（decode 设计约束，
-    防误报），平凡命令零变化；`echo c3VicHJvY2Vzcw== | base64 -d | bash` 这类
-    编码绕过现在能命中 execute_file，而不是漏检。
+    为什么必须缓存（2026-11 profile）：``check_mc_rules`` 对**整段历史的每个
+    动作**都要调一次 label_event。500 条历史 × 5 个 session = 2501 次/请求，
+    占 verify 总耗时的 **71%**（12505 次调用、67 万次正则 search）。
+    而历史里同一条命令会反复出现（`ls`、`cat` 同一个文件），缓存后只算一次。
     """
     global _AP_RE
     if not _AP_RE:
@@ -75,7 +76,21 @@ def label_event(action_detail: str) -> set[str]:
                     break
             if name in hits:
                 break
-    return hits
+    return frozenset(hits)
+
+
+def label_event(action_detail: str) -> set[str]:
+    """labelEvent：从动作文本提取命中的原子命题集合（复用 mc_rules ap_patterns）。
+
+    抗编码绕过（对齐 P1 decode 旁路，见 decode.py）：除原文外，对 action_detail
+    的**解码候选**（base64 字面量 / URL 编码 / 数值八进制 / 反序等）逐个也跑 AP
+    正则，命中即算该 AP。只对"有明显编码痕迹"的文本解码（decode 设计约束，
+    防误报），平凡命令零变化；`echo c3VicHJvY2Vzcw== | base64 -d | bash` 这类
+    编码绕过现在能命中 execute_file，而不是漏检。
+
+    注意：返回的是**新 set**（调用方可随意修改），内部走 lru_cache 的不可变结果。
+    """
+    return set(_label_event_cached(action_detail))
 
 
 def evaluate_ltl(formula: list, trace: list[set[str]], pos: int) -> bool:

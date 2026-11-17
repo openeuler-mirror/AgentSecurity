@@ -16,6 +16,7 @@ fail-closed：阶段标记/资源提取无法确认时按"已发生"保守处理
 """
 
 import os
+import functools
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -474,6 +475,22 @@ def _contains_privesc(shell: str) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=8192)
+def _is_privesc_detail(action_detail: str) -> bool:
+    """``_is_privesc_node`` 的缓存内核（按动作文本缓存）。
+
+    2026-11 profile：500 条历史 × 5 session 时每请求调用 3001 次，占
+    verify 耗时的 29%（42ms/请求）。同一条命令在历史里反复出现，缓存后只算一次。
+    """
+    shell = strip_string_literals(action_detail)
+    if _contains_privesc(shell):
+        return True
+    for cmd in _extract_inline_shell(shell):
+        if _contains_privesc(cmd):
+            return True
+    return False
+
+
 def _is_privesc_node(n) -> bool:
     """节点是否属提权：以「命令位置判定」为准。
 
@@ -483,13 +500,7 @@ def _is_privesc_node(n) -> bool:
     （见下方），故此处以命令位置判定唯一裁决，免疫该误标，同时兜底 sudo su /
     sudo bash 等被 EXEC 抢占的裸 shell 提权。
     """
-    shell = strip_string_literals(n.action_detail)
-    if _contains_privesc(shell):
-        return True
-    for cmd in _extract_inline_shell(shell):
-        if _contains_privesc(cmd):
-            return True
-    return False
+    return _is_privesc_detail(n.action_detail)
 
 
 def _is_exfil_node(n) -> bool:
