@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -171,13 +172,33 @@ class AgentMossBot:
 
         # ========== 层1: 特征匹配静态检测 ==========
         if heuristic_enabled:
+            _l1_t0 = time.monotonic()
             heuristic_result = self._heuristic_detector.detect(a_next, reason, prompt_session)
+            try:
+                from ..infra import metrics as _m
+
+                _m.LAYER_DURATION.observe(time.monotonic() - _l1_t0, layer="L1")
+            except Exception:  # noqa: BLE001
+                pass
             logger.debug(
                 "特征匹配检测结果: hit=%s, risk_level=%s, reason=%s",
                 heuristic_result.hit,
                 heuristic_result.risk_level,
                 heuristic_result.reason,
             )
+            try:
+                from ..infra.trace_log import trace_summary as _tls
+
+                _tls(
+                    "l1.result",
+                    hit=heuristic_result.hit,
+                    risk_level=heuristic_result.risk_level,
+                    risk_type=heuristic_result.risk_type,
+                    reason=heuristic_result.reason,
+                    matched=heuristic_result.matched_patterns,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             if heuristic_result.hit:
                 # 对内联脚本/文本输出命令，file_access 风险不立即 Deny（交 inline_analyzer 静态判定）
                 skip_inline_file_access = (
@@ -395,16 +416,36 @@ class AgentMossBot:
 
         # ========== 层2: 逻辑规则检测 ==========
         if logic_rules_enabled:
+            _l2_t0 = time.monotonic()
             logic_result = self._logic_rules_checker.check(
                 prompt_session, action_history, a_next, reason, cwd=cwd,
                 prompt_history=prompt_history,
             )
+            try:
+                from ..infra import metrics as _m
+
+                _m.LAYER_DURATION.observe(time.monotonic() - _l2_t0, layer="L2")
+            except Exception:  # noqa: BLE001
+                pass
             logger.debug(
                 "逻辑规则检测结果: hit=%s, risk_level=%s, reason=%s",
                 logic_result.hit,
                 logic_result.risk_level,
                 logic_result.reason,
             )
+            try:
+                from ..infra.trace_log import trace_summary as _tls
+
+                _tls(
+                    "l2.result",
+                    hit=logic_result.hit,
+                    risk_level=logic_result.risk_level,
+                    risk_type=getattr(logic_result, "risk_type", ""),
+                    reason=logic_result.reason,
+                    violated_rule=getattr(logic_result, "violated_rule", ""),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # file_access 命中合并：敏感路径/危险模式现已在 L1（heuristic_result），
             # 间接文件访问仍在 L2（logic_result）。两者任一命中 file_access 都需进入
             # inline/credential 包装判定。优先采用 logic_result（L2 indirect 仍是 L2 职责），

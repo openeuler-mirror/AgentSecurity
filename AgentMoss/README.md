@@ -494,12 +494,19 @@ sudo systemctl enable --now agent_moss
 
 # HTTP 模式验证
 curl http://127.0.0.1:9090/api/v1/health
-# {"status":"healthy","version":"<当前版本，见 pyproject.toml>"}
+# {"status":"healthy","version":"<当前版本，见 pyproject.toml>",
+#  "metrics":{"loop_lag_ms":1.2,"loop_lag_max_ms":18.4,"pools":{"pool:biz":3},
+#             "chain_nodes":20150,"chain_db_bytes":8628736}}
 
 # Socket 模式验证
 curl --unix-socket /var/run/agent_moss/agent_moss.sock \
   http://localhost/api/v1/health
 ```
+
+> `metrics` 是运行态指标（0.17.23 起）：**`loop_lag_ms` 是判断「是否有同步代码
+> 卡住事件循环」最直接的信号**，正常 < 10ms；`pools` 是各并发池当前占用，
+> `pool:biz` 打满意味着新的 analyze 会被 503；`chain_nodes` / `chain_db_bytes`
+> 用于提前发现链状态膨胀。
 
 ### 管理命令
 
@@ -511,6 +518,15 @@ curl --unix-socket /var/run/agent_moss/agent_moss.sock \
 | `systemctl status agent_moss` | 查看状态 |
 | `journalctl -u agent_moss -f` | 查看日志 |
 | `systemctl disable agent_moss` | 取消开机启动 |
+| **`agent-moss doctor`** | **部署自检**：配置 / 规则 / 权限 / 磁盘 / 链状态，一条命令看清 |
+| **`agent-moss state status`** | 链状态库大小、节点数、agent 分桶 |
+| **`agent-moss state backup <file>`** | 一致性备份（服务在跑也能备） |
+| **`agent-moss state restore <file>`** | 从备份恢复（须先停服务） |
+| **`agent-moss verify <file>`** | 批量验证一组命令的判定（规则改动前后对比） |
+| `bash scripts/diagnose.sh` | 一键收集排障信息（环境/配置/日志/指标） |
+| `bash scripts/bench_analyze.py` | 分层压测（L1/L2 找吞吐拐点，L3 找超时拐点） |
+| `bash scripts/soak_test.py` | 长稳压测（验证跑久是否退化） |
+| `bash scripts/audit_deps.sh` | 依赖漏洞扫描（发版前跑） |
 
 #### 多实例（instance 归属）
 
@@ -668,6 +684,9 @@ sudo firewall-cmd --reload
 | `AGENT_MOSS_DISABLE_HEURISTIC` | 设为 `1` 禁用层1 特征匹配 | 未设置 |
 | `AGENT_MOSS_DISABLE_LOGIC_RULES` | 设为 `1` 禁用层2 逻辑规则 | 未设置 |
 | `AGENT_MOSS_LOG_PATH` | 全量 hook 日志 + LLM prompt 日志（bridge 记 HOOK_INPUT/OUTPUT，L3 记 prompt，写同文件；对应 audit_agent `AUDIT_LOG_PATH`）| 未设置（不记录）|
+| `AGENT_MOSS_TRACE_LEVEL` | 分层追踪日志：`off` / `summary`（每层判定+耗时）/ `full`（完整请求体、L1/L2 命中细节、L3 完整 prompt 与完整响应）。落 `<数据目录>/agent_moss_trace.log`，JSON Lines。排障首选 | `off` |
+| `AGENT_MOSS_SLOW_REQUEST_MS` | 单次 analyze 超过该毫秒数打 warning（0=关闭） | `1000` |
+| `AGENT_MOSS_POOL_BIZ` | `/api/v1/analyze` 并发上限，满了直接 503 | `16` |
 | `AGENT_MOSS_CUSTOM_RULES` | 自定义规则 JSON 数组 | `[]` |
 | `AGENT_MOSS_RULES_MODE` | 规则来源模式：`hot`（默认）/ `cold`（冷启动：启动时读规则目录并冻结，runtime/Console 不参与）/ `builtin`（仅内置）。非法值按 builtin fail-safe | 未设置（hot）|
 | `AGENT_MOSS_RULES_BUILTIN_ONLY` | 设为 `1` = builtin（仅内置）| 未设置 |

@@ -143,9 +143,13 @@ def setup_logger(log_level: str | None = None) -> None:
     root = logging.getLogger("agent_moss")
     root.setLevel(level)
 
-    # 幂等：已配置过则只更新级别，避免重复 handler 导致日志重复输出
+    # 幂等：已配置过则只更新级别，避免重复 handler 导致日志重复输出。
+    # 注意 handler 的 level 也要跟着改 —— 否则 root 放开了但 handler 仍按旧级别
+    # 过滤，表现为「调了级别却没日志」（2026-11 动态调整功能踩到）。
     if _CONFIGURED:
         root.setLevel(level)
+        for handler in root.handlers:
+            handler.setLevel(level)
         return
 
     # 清除既有 handler（对应 loguru 的 logger.remove()）
@@ -153,8 +157,18 @@ def setup_logger(log_level: str | None = None) -> None:
         root.removeHandler(h)
 
     # 1. 文件 sink：10MB 轮转，保留 7 个备份（对应 loguru rotation="10 MB", retention="7 days"）
+    # 落**数据目录**而不是进程 CWD：systemd 启动时 CWD 通常是 `/`，
+    # 相对路径会写到根目录（权限失败）或散落在各处，客户根本找不到日志。
+    try:
+        from .paths import get_data_root
+
+        _log_dir = get_data_root()
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _log_file = str(_log_dir / "agent_moss.log")
+    except Exception:  # noqa: BLE001
+        _log_file = "agent_moss.log"
     file_handler = logging.handlers.RotatingFileHandler(
-        filename="agent_moss.log",
+        filename=_log_file,
         maxBytes=10 * 1024 * 1024,
         backupCount=7,
         encoding="utf-8",
@@ -175,6 +189,26 @@ def setup_logger(log_level: str | None = None) -> None:
     root.addHandler(console_handler)
 
     _CONFIGURED = True
+
+
+_VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def set_log_level(level: str) -> str:
+    """运行时调整日志级别（不重启），返回实际生效的级别名。
+
+    排障时临时开 DEBUG、排完改回去 —— 不用重启服务（重启会丢链状态缓存、
+    打断正在进行的分析）。通过 Console 的 ``PUT /console/api/log-level`` 调用。
+    """
+    normalized = str(level or "").strip().upper()
+    if normalized not in _VALID_LEVELS:
+        raise ValueError(f"无效日志级别: {level!r}（可选 {'/'.join(_VALID_LEVELS)}）")
+    setup_logger(normalized)
+    return normalized
+
+
+def current_log_level() -> str:
+    return logging.getLevelName(logging.getLogger("agent_moss").level)
 
 
 class MossLogger:

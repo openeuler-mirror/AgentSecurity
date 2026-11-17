@@ -23,6 +23,7 @@
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,25 +93,50 @@ def record_token_usage(
     )
 
 
+#: 记录缓存：path -> ((mtime_ns, size), records)。
+#: 为什么需要（2026-11 招行）：console 前端每 10 秒轮询一次 token 统计，单轮
+#: 触发 4 次全量 `read_text + json.loads`；记录到 1 万条时每次约 25ms，全部
+#: 跑在事件循环上。加指纹缓存后命中路径只做一次 `stat`。
+_RECORDS_CACHE: dict[str, tuple[tuple[int, int], list[dict]]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
 def _load_all_records(stats_path: Path) -> list[dict]:
-    """加载所有统计记录"""
-    if not stats_path.exists():
+    """加载所有统计记录（带 mtime/size 指纹缓存）。
+
+    返回**浅拷贝**：调用方可以 append 而不会污染缓存里的列表。
+    """
+    key = str(stats_path)
+    try:
+        st = stats_path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
         return []
+    except OSError:
+        return []
+    with _CACHE_LOCK:
+        cached = _RECORDS_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            return list(cached[1])
     try:
         data = json.loads(stats_path.read_text(encoding="utf-8"))
         # 兼容两种格式：纯列表 或 {"records": [...]} 包装
         if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "records" in data:
-            return data["records"]
-        return []
+            records = data
+        elif isinstance(data, dict) and "records" in data:
+            records = data["records"]
+        else:
+            records = []
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Token stats file %s read error: %s", stats_path, e)
         return []
+    with _CACHE_LOCK:
+        _RECORDS_CACHE[key] = (sig, records)
+    return list(records)
 
 
 def _save_records(stats_path: Path, records: list[dict]) -> None:
-    """保存统计记录到文件"""
+    """保存统计记录到文件，并同步刷新缓存指纹。"""
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         from . import security_policy as sp
@@ -119,6 +145,17 @@ def _save_records(stats_path: Path, records: list[dict]) -> None:
             json.dumps(records, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        # 写后同步缓存：避免下一次查询再读一遍刚落盘的同一份内容
+        try:
+            st = stats_path.stat()
+            with _CACHE_LOCK:
+                _RECORDS_CACHE[str(stats_path)] = (
+                    (st.st_mtime_ns, st.st_size),
+                    list(records),
+                )
+        except OSError:
+            with _CACHE_LOCK:
+                _RECORDS_CACHE.pop(str(stats_path), None)
     except OSError as e:
         logger.warning("Token stats file %s write error: %s", stats_path, e)
 

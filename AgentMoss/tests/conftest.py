@@ -394,6 +394,32 @@ _DL_WRITE_RE = re.compile(
 )
 
 
+#: 允许 `_prep_file_state` 增删文件的根目录。**必须是测试沙箱**。
+#:
+#: 2026-11 事故：用例 `echo agentmoss-probe > AM_YOUR_HOME/.profile` 里的
+#: AM_YOUR_HOME 展开成真实 `/home/hkl`，`_prep_file_state` 为了让「写新建」
+#: 判定可复现，对该目标执行了 `os.remove()` —— **每跑一次
+#: tests/test_all_cases.py 就删一次用户的真实 ~/.profile**（11:37 现场 inotify
+#: 抓到 ATTRIB → DELETE_SELF → DELETE）。测试绝不能碰真实家目录/系统目录。
+_PREP_SAFE_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/", tempfile.gettempdir() + "/")
+
+
+def _is_safe_prep_target(target: str) -> bool:
+    """目标是否位于测试沙箱内（真实家目录 / 系统目录一律拒绝）。"""
+    try:
+        real = os.path.realpath(target)
+        # 显式黑名单：真实家目录无论在哪都不碰（/home/xxx、/root）
+        home = os.path.realpath(os.path.expanduser("~"))
+        if real == home or real.startswith(home + os.sep):
+            return False
+        for root in _PREP_SAFE_ROOTS:
+            if real.startswith(os.path.realpath(root)):
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def _prep_file_state(case: dict, profile) -> None:
     """执行 analyze 前对齐 write 目标文件的可复现状态（删新建 / 建已有）。
 
@@ -401,6 +427,9 @@ def _prep_file_state(case: dict, profile) -> None:
       读命令的读目标（cat/grep/wget -O- 等的文件）应已由 prep.sh 建好。
     对「写新建」用例删除目标文件是关键——否则磁盘残留会让 read_before_write
     判「写已有未读」→ 预期 Allow 的新建用例误判 Deny（如 allow-65/66/78、llm-06）。
+
+    ⚠️ **只在测试沙箱内操作**（``_is_safe_prep_target``）：真实家目录 / 系统
+    目录下的路径一律跳过。2026-11 事故就是这里删了用户的 ~/.profile。
     """
     a_next = case.get("input", {}).get("a_next", {})
     action_type = str(a_next.get("action_type") or "").lower()
@@ -431,6 +460,9 @@ def _prep_file_state(case: dict, profile) -> None:
     write_targets = list(dict.fromkeys(p for p in write_targets if p and p.startswith("/")))
 
     for target in write_targets:
+        # 安全闸门：绝不在真实家目录 / 系统目录里增删文件（2026-11 事故）
+        if not _is_safe_prep_target(target):
+            continue
         is_read_before = any(
             target == rp or target.startswith(rp) or rp.startswith(target)
             for rp in history_read

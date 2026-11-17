@@ -426,6 +426,15 @@ def main():
 
     status_parser = subparsers.add_parser("status", help="Show service status, port and Console URL")
 
+    # 部署自检（2026-11）：配置/规则/权限/磁盘/链状态，一条命令看清
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="部署自检：配置 / 规则 / 权限 / 磁盘 / 链状态"
+    )
+    doctor_parser.add_argument(
+        "--llm", action="store_true",
+        help="额外测试 LLM 连通性（会真实发一次请求，默认不测）",
+    )
+
     # rules 子命令（规则目录自查 / 生成模板；2026-10 客户要"够简单"）
     rules_parser = subparsers.add_parser(
         "rules", help="规则目录（extra.json / override.json）：自查与生成模板"
@@ -439,6 +448,32 @@ def main():
     rules_init.add_argument("--force", action="store_true", help="覆盖已存在的模板文件")
     rules_init.add_argument("--with-builtin", action="store_true",
                             help="override.json 写成内置 L1 规则全量拷贝（就地把内置某条删/改时用）")
+
+    # verify 子命令（批量验证一组命令的判定，用于规则变更前后对比）
+    verify_parser = subparsers.add_parser(
+        "verify", help="批量验证一组命令的判定（规则改动前后对比用）"
+    )
+    verify_parser.add_argument("file", help="命令清单文件，每行一条；空行和 # 忽略")
+    verify_parser.add_argument(
+        "--no-llm", action="store_true", help="禁用 L3（只跑 L1/L2，快且可复现）"
+    )
+    verify_parser.add_argument("--json", action="store_true", help="输出 JSON（便于 diff/CI）")
+
+    # state 子命令（链状态库：查看 / 备份 / 恢复 / 重置）
+    state_parser = subparsers.add_parser(
+        "state", help="链状态库：状态 / 备份 / 恢复 / 重置"
+    )
+    state_sub = state_parser.add_subparsers(dest="state_command")
+    state_sub.add_parser("status", help="查看状态库大小、节点数、agent 分桶")
+    state_backup = state_sub.add_parser("backup", help="一致性备份（服务在跑也能备）")
+    state_backup.add_argument("output", help="备份文件路径，如 /tmp/chains.bak")
+    state_backup.add_argument("--force", action="store_true", help="覆盖已存在的目标文件")
+    state_restore = state_sub.add_parser("restore", help="从备份恢复（必须先停服务）")
+    state_restore.add_argument("input", help="备份文件路径")
+    state_restore.add_argument("--port", type=int, default=9090, help="用于探测服务是否在跑")
+    state_reset = state_sub.add_parser("reset", help="清空状态库（必须先停服务）")
+    state_reset.add_argument("--yes", action="store_true", help="确认删除")
+    state_reset.add_argument("--port", type=int, default=9090, help="用于探测服务是否在跑")
 
     # brain 子命令（contribute = 提交本地沉淀为 MR；中心化上传接口在此预留）
     from agent_moss.brain.contributor import add_contribute_parser
@@ -456,6 +491,18 @@ def main():
         sys.exit(cmd_install(args))
     elif args.command == "status":
         sys.exit(cmd_status(args))
+    elif args.command == "doctor":
+        from .doctor import cmd_doctor
+
+        sys.exit(cmd_doctor(args))
+    elif args.command == "state":
+        from .state_tool import cmd_state
+
+        sys.exit(cmd_state(args))
+    elif args.command == "verify":
+        from .verify_tool import cmd_verify
+
+        sys.exit(cmd_verify(args))
     elif args.command == "rules":
         if not getattr(args, "rules_command", None):
             print("rules 子命令：status（自查规则目录）/ init（生成模板）")
