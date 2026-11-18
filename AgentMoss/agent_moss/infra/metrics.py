@@ -159,6 +159,20 @@ ANALYZE_DURATION = Histogram(
     "End-to-end analyze duration in seconds.",
     labelnames=("decision",),
 )
+#: 排队等待时长（进入路由 → 真正开始在 executor 里执行）。
+#: 与 ``ANALYZE_DURATION`` 对比就能区分「算得慢」还是「排不上队」——
+#: 客户 TPS < 1 时这两个值是最直接的判据（2026-11）。
+ANALYZE_QUEUE_WAIT = Histogram(
+    "agent_moss_analyze_queue_wait_seconds",
+    "Time an analyze request waited before an executor thread picked it up.",
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+#: 纯计算时长（不含排队）。= ANALYZE_DURATION - 排队 - 响应序列化等开销。
+ANALYZE_WORK_DURATION = Histogram(
+    "agent_moss_analyze_work_seconds",
+    "Pure analysis work duration (excludes queueing and response serialization).",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
 LAYER_HIT_TOTAL = Counter(
     "agent_moss_layer_hit_total",
     "Number of requests where a given defense layer produced the final verdict.",
@@ -229,6 +243,8 @@ def render_prometheus() -> str:
     for metric in (
         ANALYZE_TOTAL,
         ANALYZE_DURATION,
+        ANALYZE_QUEUE_WAIT,
+        ANALYZE_WORK_DURATION,
         LAYER_HIT_TOTAL,
         LAYER_DURATION,
         REJECTED_TOTAL,
@@ -295,6 +311,8 @@ def reset_for_tests() -> None:
         for metric in (
             ANALYZE_TOTAL,
             ANALYZE_DURATION,
+            ANALYZE_QUEUE_WAIT,
+            ANALYZE_WORK_DURATION,
             LAYER_HIT_TOTAL,
             LAYER_DURATION,
             REJECTED_TOTAL,

@@ -37,6 +37,21 @@ def _is_public_page(path: str) -> bool:
     return False
 
 
+#: 分析线程池引用（启动时写入，health/metrics 读取队列深度）
+_ANALYSIS_EXECUTOR: list = [None]
+
+
+def _executor_queue_depth() -> int | None:
+    """当前线程池排队任务数（取不到返回 None）。"""
+    ex = _ANALYSIS_EXECUTOR[0] if _ANALYSIS_EXECUTOR else None
+    if ex is None:
+        return None
+    try:
+        return ex._work_queue.qsize()  # noqa: SLF001 —— 标准库没有公开 API
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class _PooledLimiter:
     """分层并发闸门：未认证全局 → 未认证单 IP → agent → 路径池。
 
@@ -250,6 +265,52 @@ def create_app() -> FastAPI:
             setup_logger(cfg.log_level)
         except Exception as exc:  # noqa: BLE001 —— 日志初始化失败不能拖垮服务
             logging.getLogger(__name__).warning("日志初始化失败: %s", exc)
+
+        # ⚠️ 显式设置分析线程池大小（2026-11，客户 TPS < 1 的根因之一）：
+        # `/api/v1/analyze` 通过 `loop.run_in_executor(None, ...)` 执行，而 `None`
+        # 用的是 Python 默认线程池 `min(32, cpu+4)` —— **8 核机器只有 12 个**。
+        # 于是 `AGENT_MOSS_POOL_BIZ` 调到 512 也没用：实际能同时分析的永远是 12 个，
+        # TPS = 12 / 单请求耗时。开 L3 时单请求几十秒，TPS 就掉到 1 以下。
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _cpu = os.cpu_count() or 4
+            _default = max(32, _cpu * 8)
+            try:
+                _workers = int(os.getenv("AGENT_MOSS_EXECUTOR_WORKERS", str(_default)) or _default)
+            except ValueError:
+                _workers = _default
+            if _workers > 0:
+                _executor = ThreadPoolExecutor(
+                    max_workers=_workers, thread_name_prefix="am-analysis"
+                )
+                asyncio.get_running_loop().set_default_executor(_executor)
+                # 保存引用供 health 读取队列深度（TPS 低时区分"算得慢"还是"排不上队"）
+                _ANALYSIS_EXECUTOR[0] = _executor
+                logger.info(
+                    "分析线程池: %d 线程（CPU %d，可用 AGENT_MOSS_EXECUTOR_WORKERS 调整）",
+                    _workers, _cpu,
+                )
+        except Exception as exc:  # noqa: BLE001 —— 设置失败退回默认线程池
+            logging.getLogger(__name__).warning("设置分析线程池失败（用默认值）: %s", exc)
+
+        # 多进程模式（2026-11）：AGENT_MOSS_WORKERS>1 或显式 AGENT_MOSS_MULTI_PROCESS=1
+        # 时，链状态改为「每请求增量同步 + 立即落盘 + 跨进程文件锁」，否则各 worker
+        # 的内存缓存互相看不见（实测 4 worker 各 200 请求只记 59 个节点）。
+        try:
+            _workers_env = int(os.getenv("AGENT_MOSS_WORKERS", "1") or "1")
+        except ValueError:
+            _workers_env = 1
+        if os.getenv("AGENT_MOSS_MULTI_PROCESS", "").strip() in ("1", "true", "yes", "on") or _workers_env > 1:
+            try:
+                from ..engine.formal_engine.chain_state import get_chain_state_store
+
+                get_chain_state_store().enable_multi_process()
+                logger.info(
+                    "链状态多进程模式：已启用（每请求增量同步 + 文件锁）"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("启用链状态多进程模式失败: %s", exc)
         # 规则包契约：schema 版本 / 完整性 / 内容指纹。
         # 显式指定了 AGENT_MOSS_RULES_ROOT 且校验失败 → 这里会抛异常，服务拒绝启动
         # （带着残缺规则跑 = 静默放开一批防护）。
@@ -582,6 +643,7 @@ def run_server(
     port: int = 9090,
     mode: str = "http",
     socket_path: str = "/var/run/agent_moss/agent_moss.sock",
+    workers: int = 1,
 ) -> None:
     """
     Start AgentMoss server in the specified mode.
@@ -598,12 +660,20 @@ def run_server(
     else:
         import uvicorn
         actual_port = _find_free_port(port, host)
-        app = create_app()
-        logger.info("Starting AgentMoss HTTP server on %s:%d", host, actual_port)
-        uvicorn.run(
-            app, host=host, port=actual_port, log_level="info",
+        logger.info("Starting AgentMoss HTTP server on %s:%d (workers=%d)", host, actual_port, workers)
+        _common = dict(
+            host=host, port=actual_port, log_level="info",
             # 连接层防护（2026-10）：限并发连接 + 空闲连接超时，
             # 挡住"只占连接不发完整请求"的慢速攻击。
             limit_concurrency=sp.max_connections(),
             timeout_keep_alive=sp.keep_alive_sec(),
         )
+        if workers and workers > 1:
+            # 多进程必须用 import string（uvicorn 要求），不能传 app 对象。
+            # 每个 worker 是独立进程、独立 GIL —— 这是突破 Python GIL 的唯一
+            # 办法（实测 1→4 进程 TPS 10.3→23.6）。链状态由 multi_process
+            # 模式保证跨进程一致（见 create_app 的 enable_multi_process）。
+            os.environ["AGENT_MOSS_WORKERS"] = str(workers)
+            uvicorn.run("agent_moss.server.app:create_app", factory=True, workers=workers, **_common)
+        else:
+            uvicorn.run(create_app(), **_common)

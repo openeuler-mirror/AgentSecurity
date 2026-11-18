@@ -343,6 +343,16 @@ async def health(request: Request):
         metrics["llm_circuit"] = get_breaker().snapshot()
     except Exception:  # noqa: BLE001
         pass
+    # 线程池队列深度（2026-11）：TPS 低时区分「算得慢」还是「排不上队」。
+    # 持续 > 0 说明现有线程数不够；持续为 0 但 TPS 低说明单请求太慢。
+    try:
+        from .app import _executor_queue_depth
+
+        _q = _executor_queue_depth()
+        if _q is not None:
+            metrics["executor_queue"] = _q
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from ..engine.formal_engine.chain_state import get_chain_state_store
 
@@ -525,6 +535,8 @@ async def analyze(req: AnalyzeRequest, request: Request):
 
         # 请求 ID：一次 analyze 的所有追踪事件共享，便于 grep 串起全过程
         _req_id = uuid.uuid4().hex[:12]
+        # 排队时长（由 executor 线程回填，供慢请求日志做「排队 + 计算」分解）
+        _queue_info = {"queued_ms": 0.0}
         try:
             from ..infra.trace_log import set_request_id
 
@@ -593,14 +605,44 @@ async def analyze(req: AnalyzeRequest, request: Request):
 
             ``run_in_executor`` 的线程**不继承** contextvars，不恢复的话
             引擎层的 L1/L2/L3 trace 事件都没有 req_id，串不起一次请求。
+
+            同时记录**排队时长**（2026-11）：从请求进入路由到真正开始执行
+            在 executor 里等了多久。客户 TPS < 1 时，这个数字能直接区分
+            "算得慢" 还是 "排不上队"。
             """
+            _t_start_exec = time.monotonic()
+            self_queued_ms = (_t_start_exec - start) * 1000
+            _queue_info["queued_ms"] = self_queued_ms
             try:
                 from ..infra.trace_log import set_request_id
 
                 set_request_id(_kwargs.pop("_req_id", ""))
             except Exception:  # noqa: BLE001
                 pass
-            return run_analysis(**_kwargs)
+            try:
+                from ..infra import metrics as _m
+
+                _m.ANALYZE_QUEUE_WAIT.observe(max(0.0, self_queued_ms / 1000.0))
+            except Exception:  # noqa: BLE001
+                pass
+            # 排队超过 1 秒就单独记一条：说明线程池/事件循环是瓶颈，不是计算
+            if self_queued_ms >= 1000:
+                logger.warning(
+                    "分析请求排队 %.0fms（线程池可能已满，检查 AGENT_MOSS_EXECUTOR_WORKERS）",
+                    self_queued_ms,
+                )
+            try:
+                return run_analysis(**_kwargs)
+            finally:
+                # 记录"纯计算耗时"（不含排队），与总耗时对比
+                try:
+                    from ..infra import metrics as _m
+
+                    _m.ANALYZE_WORK_DURATION.observe(
+                        max(0.0, time.monotonic() - _t_start_exec)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         result = await loop.run_in_executor(
             None,
@@ -664,13 +706,28 @@ async def analyze(req: AnalyzeRequest, request: Request):
         except ValueError:
             _slow_ms = 1000.0
         if _slow_ms > 0 and duration_ms >= _slow_ms:
+            # 分解：排队（等线程）+ 计算（引擎）。客户 TPS 低时这两个数字决定
+            # 是加线程池还是优化算法。
+            _queued_ms = _queue_info["queued_ms"]
+            _work_ms = max(0.0, duration_ms - _queued_ms)
+            _qdepth = None
+            try:
+                from .app import _executor_queue_depth
+
+                _qdepth = _executor_queue_depth()
+            except Exception:  # noqa: BLE001
+                pass
             logger.warning(
-                "慢请求: %.0fms（阈值 %.0fms） action_type=%s agent=%s decision=%s",
+                "慢请求: 总 %.0fms = 排队 %.0fms + 计算 %.0fms（阈值 %.0fms）"
+                " action_type=%s agent=%s decision=%s 线程池队列=%s",
                 duration_ms,
+                _queued_ms,
+                _work_ms,
                 _slow_ms,
                 a_next.get("action_type", ""),
                 agent_id or "-",
                 result.get("decision", ""),
+                _qdepth if _qdepth is not None else "?",
             )
 
         # Report enforcement event to AcTrail（fire-and-forget）。

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 
@@ -259,6 +260,47 @@ def _describe_response(response) -> str:
         return f"<无法解析响应结构: {e}>"
 
 
+#: LLM 客户端缓存：key = (base_url, api_key, headers, timeout) → OpenAI。
+#:
+#: 为什么缓存（2026-11，客户 TPS < 1）：原先每次 call_llm 都 `OpenAI(...)` 新建
+#: 客户端 —— 每次都新建 httpx 连接池，**TCP + TLS 握手开销**在高并发下非常可观
+#: （几十毫秒 × 每秒数百次）。复用后连接池保持存活，二次请求直接走已有连接。
+_CLIENT_CACHE: dict[tuple, object] = {}
+_CLIENT_LOCK = threading.Lock()
+
+
+def _get_shared_client(base_url: str, api_key: str, extra_headers: dict, timeout: float):
+    """按 (base_url, api_key, headers, timeout) 复用 OpenAI 客户端。
+
+    注意：超时时间不同的调用（prompt1 40s / prompt2 20s）会各自缓存一份，
+    避免用错超时。缓存无上限但 key 组合极少（通常 1-2 个）。
+    """
+    key = (
+        base_url,
+        api_key,
+        tuple(sorted((extra_headers or {}).items())),
+        float(timeout),
+    )
+    with _CLIENT_LOCK:
+        client = _CLIENT_CACHE.get(key)
+        if client is None:
+            OpenAI = _get_openai_client_class()
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=timeout,
+                default_headers=extra_headers if extra_headers else None,
+            )
+            _CLIENT_CACHE[key] = client
+        return client
+
+
+def reset_client_cache_for_tests() -> None:
+    """测试隔离：清空客户端缓存（避免测试间串配置）。"""
+    with _CLIENT_LOCK:
+        _CLIENT_CACHE.clear()
+
+
 def _record_llm_metrics(result: str, elapsed: float) -> None:
     """记录一次 LLM 调用的结果与耗时（Prometheus 指标，失败静默）。"""
     try:
@@ -345,13 +387,7 @@ def call_llm(
     extra_headers = get_provider_headers(provider)
     api_key = _resolve_api_key(config)
 
-    OpenAI = _get_openai_client_class()
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=timeout,
-        default_headers=extra_headers if extra_headers else None,
-    )
+    client = _get_shared_client(base_url, api_key, extra_headers, timeout)
 
     # 熔断（2026-11）：模型服务挂掉时，不让每个请求都等满超时把池占死。
     from .circuit_breaker import get_breaker

@@ -155,12 +155,14 @@ def cmd_server(args):
 
     # --port 0 表示"自动从 9090 开始找空闲端口"，不是字面端口 0
     port = args.port if args.port != 0 else 9090
+    workers = int(getattr(args, "workers", 1) or 1)
 
     run_server(
         host=args.host,
         port=port,
         mode=args.mode,
         socket_path=args.socket,
+        workers=workers,
     )
     return 0
 
@@ -419,6 +421,11 @@ def main():
         "--socket", "-s",
         default="/var/run/agent_moss/agent_moss.sock",
         help="Unix socket path (socket mode)",
+    )
+    server_parser.add_argument(
+        "--workers", type=int, default=1,
+        help="多进程 worker 数（默认 1）。>1 可突破 Python GIL 提升 CPU 吞吐；"
+             "链状态会自动切换为跨进程一致模式",
     )
 
     install_parser = subparsers.add_parser("install", help="Install systemd service for AgentMoss")
