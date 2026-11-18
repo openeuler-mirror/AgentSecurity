@@ -1,6 +1,8 @@
-"""安全策略看护 —— 断言 `tests/fixtures/security_policy_cases.json` 金标准。
+"""安全策略的双端一致性看护 —— 与 TS 读**同一份**金标准。
 
-`tests/fixtures/security_policy_cases.json` 是数据源：逐条断言默认值与判定口径。
+`tests/fixtures/security_policy_cases.json` 是共享数据源：Python 与 TS 都逐条断言。
+任何一端改了默认值或判定口径，另一端不会跟着变 → 这里和
+`ts/src/__tests__/security-policy-parity.test.ts` 会同时或至少一端报红。
 """
 from __future__ import annotations
 

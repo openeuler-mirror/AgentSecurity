@@ -8,6 +8,7 @@
 **没搬的**：`decode._STAGE_PRIORITY` —— 它表达「多阶段同时命中时报哪个」的仲裁顺序，
 是逻辑而非可增删的规则。
 
+TS 对照：`ts/src/__tests__/formal-rules-sync.test.ts`。
 """
 from __future__ import annotations
 

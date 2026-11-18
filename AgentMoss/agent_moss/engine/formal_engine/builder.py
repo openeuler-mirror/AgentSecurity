@@ -44,6 +44,14 @@ _PATH_RE = re.compile(r"(?:^|\s|[@=])((?:/|~/)[\w./~-]+)")
 # 常见临时文件/脚本载体（跨会话传播的关键通道）
 _CARRIER_RE = re.compile(r"(?:/tmp/|/var/tmp/|~/|\./)[\w./-]+\.(?:sh|py|js|rb|pl|php|txt|log|json|db)")
 
+#: 公共目录不是「数据载体」：所有命令都共享 /tmp 等目录，把它当资源会把
+#: 无关动作连成一条数据链。2026-11 鸿蒙实测：历史里 `npm install`（低完整性源）
+#: 与后续 `npm view` 因都提到 `/tmp`（cd 进入）被「低完整性多跳可达」判 critical。
+#: 真实载体是**具体文件**（/tmp/x.sh），仍保留。
+_COMMON_DIR_RESOURCES = frozenset(
+    {"/", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root", "/usr", "/etc", "/var", "/data", "/storage"}
+)
+
 
 @functools.lru_cache(maxsize=8192)
 def _extract_resources_cached(action_detail: str) -> frozenset:
@@ -54,6 +62,9 @@ def _extract_resources_cached(action_detail: str) -> frozenset:
         p = m.group(1)
         # 过滤明显非文件路径（/dev/ 设备、URL 内路径）
         if p.startswith("/dev/") or "://" in p:
+            continue
+        # 公共目录（含尾部 / 的目录写法）不是具体载体文件：不参与数据链共享。
+        if p in _COMMON_DIR_RESOURCES or p.endswith("/"):
             continue
         resources.add(p)
     return frozenset(resources)

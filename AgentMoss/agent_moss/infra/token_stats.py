@@ -23,7 +23,9 @@
 import json
 import logging
 import os
+import tempfile
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,17 +82,55 @@ def record_token_usage(
         "total_tokens": total_tokens,
     }
 
-    records = _load_all_records(stats_path)
-    records.append(record)
+    with _stats_write_lock(stats_path):
+        records = _load_all_records(stats_path)
+        records.append(record)
 
-    if len(records) > MAX_RECORDS:
-        records = records[-MAX_RECORDS:]
+        if len(records) > MAX_RECORDS:
+            records = records[-MAX_RECORDS:]
 
-    _save_records(stats_path, records)
+        _save_records(stats_path, records)
     logger.debug(
         "Token usage recorded: step=%s, model=%s, total_tokens=%d",
         step, model, total_tokens,
     )
+
+
+_WRITE_LOCK = threading.RLock()
+
+
+@contextmanager
+def _stats_write_lock(stats_path: Path):
+    """跨线程 + 跨进程串行化「读-改-写」。
+
+    服务进程和 SDK 进程可能同时记录用量；无锁的 read-modify-write 会互相
+    覆盖（后写者拿旧快照，前者的记录丢失）。Windows 用 msvcrt，POSIX 用 flock。
+    """
+    with _WRITE_LOCK:
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(stats_path) + ".lock", flags, 0o600)
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            if locked:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 #: 记录缓存：path -> ((mtime_ns, size), records)。
@@ -136,15 +176,25 @@ def _load_all_records(stats_path: Path) -> list[dict]:
 
 
 def _save_records(stats_path: Path, records: list[dict]) -> None:
-    """保存统计记录到文件，并同步刷新缓存指纹。"""
+    """**原子**保存统计记录（临时文件 + os.replace），并同步刷新缓存指纹。
+
+    直接 O_TRUNC 覆盖写在进程崩溃时会留下半截 JSON（下次读取整份丢弃）。
+    原子替换保证读者要么看到旧文件、要么看到完整新文件；权限保持 0600。
+    """
     stats_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
     try:
-        from . import security_policy as sp
-        sp.write_private_text(
-            stats_path,
-            json.dumps(records, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        fd, tmp_name = tempfile.mkstemp(prefix=stats_path.name + ".", dir=stats_path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            pass  # Windows 不支持 fchmod；mkstemp 已是私有文件
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(records, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, stats_path)
+        tmp_name = None
         # 写后同步缓存：避免下一次查询再读一遍刚落盘的同一份内容
         try:
             st = stats_path.stat()
@@ -158,6 +208,9 @@ def _save_records(stats_path: Path, records: list[dict]) -> None:
                 _RECORDS_CACHE.pop(str(stats_path), None)
     except OSError as e:
         logger.warning("Token stats file %s write error: %s", stats_path, e)
+    finally:
+        if tmp_name is not None:
+            Path(tmp_name).unlink(missing_ok=True)
 
 
 def _filter_records_by_date(

@@ -7,6 +7,7 @@
 2. **显式收紧**：配了 Origin 白名单 / token / 路径白名单后，越界一律拒绝。
 
 真实攻击面的复现（任意网页关掉 L1、跨会话历史泄露）见 ``tests/test_security_hardening.py``。
+TS 对照：``ts/src/__tests__/security-policy.test.ts``。
 """
 from __future__ import annotations
 

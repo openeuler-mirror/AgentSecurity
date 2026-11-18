@@ -9,6 +9,7 @@ Deny/Allow，退出码供 shell 判断，避免「先写 input.json、再读结�
 - 文件模式行为不变（回归保护）
 - 路径写错（.json 结尾但不存在）/ 目录 / 空输入 → 明确报错，而非被当成命令分析
 
+镜像 TS `ts/src/__tests__/cli-analyze.test.ts`。
 """
 
 from __future__ import annotations

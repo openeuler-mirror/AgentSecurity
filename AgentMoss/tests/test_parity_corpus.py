@@ -14,7 +14,7 @@ L2 字面量判定条件不一致、"按工具名免检"只有 Python 有），�
 
 - 改了规则、两端一起变了 → 跑 ``python3 scripts/gen_parity_corpus.py`` 重新生成，
   git diff 就是本次改动的行为影响面；
-- 只改了一端 → 这个测试会红。
+- 只改了一端 → 这个测试和 ``ts/src/__tests__/parity-corpus.test.ts`` 都会红。
 
 生成器会先跑两端并断言一致才写入，所以不会把某一端的错误行为固化成"标准答案"。
 """
@@ -34,11 +34,11 @@ def _load_cases() -> list[dict]:
 
 
 def _decide(case: dict, index: int) -> tuple[str, str, str]:
-    """保持与 parity 语料一致的调用形状。"""
+    """与 ts/src/__tests__/parity-corpus.test.ts::decide 保持完全一致的调用形状。"""
     result = analyze(
         # session_id 固定且唯一：避开 AgentMoss 的决策缓存把不同输入串味
         session_id=f"parity-{index}",
-        prompt_session="",
+        prompt_session=case.get("prompt_session", ""),
         # 与 TS 侧同一份 snake_case 输入（含 output —— consent 类规则看的就是它）
         action_history=case.get("action_history", []),
         a_next={

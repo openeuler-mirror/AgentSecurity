@@ -36,5 +36,48 @@
     "/run",
     "/dev/shm"
   ],
-  "_temp_dirs_comment": "临时目录（批量删除豁免）。L1 的 _check_dangerous_patterns 与 L2 的 read_before_write 共用这一份；调用方按需拼尾随斜杠做 startswith。"
+  "_temp_dirs_comment": "临时目录（批量删除豁免）。L1 的 _check_dangerous_patterns 与 L2 的 read_before_write 共用这一份；调用方按需拼尾随斜杠做 startswith。",
+  "write_content_analysis": {
+    "_comment": "写入内容的按语言静态分析（writeFile/editFile）。文档/数据不做命令执行检测；shell/python 按语言解析后只扫危险片段；预筛 + 片段/大小/时间预算控制性能。",
+    "data_exts": [
+      ".md",
+      ".markdown",
+      ".txt",
+      ".rst",
+      ".html",
+      ".htm",
+      ".json",
+      ".jsonl",
+      ".yaml",
+      ".yml",
+      ".xml",
+      ".csv",
+      ".tsv",
+      ".css",
+      ".scss",
+      ".ini",
+      ".conf",
+      ".cfg",
+      ".log",
+      ".toml",
+      ".properties",
+      ".sql"
+    ],
+    "shell_exts": [
+      ".sh",
+      ".bash",
+      ".zsh",
+      ".ksh",
+      ".dash"
+    ],
+    "python_exts": [
+      ".py",
+      ".pyw"
+    ],
+    "shell_precheck": "\\$\\(|`|\\b(?:rm|rmdir|unlink|shred|curl|wget|nc|ncat|socat|chmod|chown|dd|tee|truncate|mkfs|fdisk|parted|bash|sh|zsh|dash|python[0-9.]*|perl|ruby|node|php|lua|eval|exec|base64|sudo|su)\\b",
+    "python_precheck": "os\\.(?:system|popen|remove|unlink|rmdir|chmod|chown|kill)|subprocess|pty\\.|ctypes|eval\\s*\\(|exec\\s*\\(|__import__|compile\\s*\\(|open\\s*\\(|shutil\\.(?:rmtree|move|copy)|socket|urllib|requests\\.",
+    "max_content_bytes": 262144,
+    "max_scan_bytes": 65536,
+    "max_scan_ms": 100
+  }
 }

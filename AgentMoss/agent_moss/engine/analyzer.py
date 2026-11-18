@@ -22,13 +22,14 @@ if TYPE_CHECKING:
     from ..profiles.base import OSProfile
 
 from ..infra.config import Config, get_agent_moss_setting, get_default_config, is_policy_gen_enabled
-from ..infra.llm_client import call_llm
+from ..infra.llm_client import LLMResponseError, call_llm
 from ..infra.parsers import parse_policy_from_llm
 from ..infra.policy_cache import PolicyCache, get_default_cache
 from ..infra.prompt_templates import get_prompt1
 from ..infra.logging import MossLogger
 from ..profiles import get_profile
 from .coordinator import judge_security
+from .types import derive_l3_outcome
 
 # Policy 临时文件输出目录
 POLICY_OUTPUT_DIR = Path(tempfile.gettempdir()) / "agent_moss"
@@ -113,6 +114,23 @@ def analyze(
 
     moss_log.log_input(prompt_session, action_history, a_next, reason)
 
+    # 本次判定成功算出时才有值；未算出的异常路径保持 None。
+    judgment = None
+
+    def _finalize(res: dict) -> dict:
+        """统一补上 ``source`` / ``l3_outcome``（2026-11 可观测性）。
+
+        ``l3_outcome`` 是对外稳定枚举（见 ``engine.types.L3_OUTCOMES``），
+        让调用方不必读日志就能判断「这条 Allow 是 L3 判过的还是 L3 挂了放的」。
+        放在最终出口统一补，避免 8 处 result 构造各自漏填。
+        """
+        if judgment is not None:
+            res.setdefault("source", judgment.source)
+            res.setdefault("l3_outcome", derive_l3_outcome(judgment))
+        else:
+            res.setdefault("l3_outcome", "")
+        return res
+
     try:
         # ==================== Step 1: AgentMoss Security Agent 安全判断 ====================
         moss_log.start_step("step1_security_judge")
@@ -137,7 +155,11 @@ def analyze(
             layers_str = ", ".join(judgment.violated_layers) if judgment.violated_layers else judgment.source
             moss_log.end_step(
                 "step1_security_judge",
-                detail=f"allowed=False, risk_level={judgment.risk_level}, violated_layers=[{layers_str}]",
+                detail=(
+                    f"allowed=False, risk_level={judgment.risk_level}, "
+                    f"violated_layers=[{layers_str}], source={judgment.source}, "
+                    f"l3_outcome={derive_l3_outcome(judgment)}"
+                ),
             )
             result = {
                 "decision": "Deny",
@@ -153,11 +175,14 @@ def analyze(
                 "violation_chain": judgment.violation_chain,
             }
             moss_log.log_result("Deny", result["reason"])
-            return result
+            return _finalize(result)
 
         moss_log.end_step(
             "step1_security_judge",
-            detail=f"allowed=True, risk_level={judgment.risk_level}, source={judgment.source}",
+            detail=(
+                f"allowed=True, risk_level={judgment.risk_level}, "
+                f"source={judgment.source}, l3_outcome={derive_l3_outcome(judgment)}"
+            ),
         )
 
         # ==================== Step 2: Allow → 查缓存 / 生成 policy ====================
@@ -189,7 +214,7 @@ def analyze(
                 "confidence": judgment.confidence,
             }
             moss_log.log_result("Allow", result["reason"], policy_a_next)
-            return result
+            return _finalize(result)
         else:
             moss_log.end_step("step2_cache_lookup", detail="缓存未命中，启用 LLM 生成")
 
@@ -210,7 +235,7 @@ def analyze(
                     "confidence": judgment.confidence,
                 }
                 moss_log.log_result("Allow", result["reason"], policy_a_next)
-                return result
+                return _finalize(result)
 
             if cfg.timeout.step_interval > 0:
                 time.sleep(cfg.timeout.step_interval)
@@ -252,6 +277,15 @@ def analyze(
                     step2_error = None
                     break
                 except (TimeoutError, ValueError, Exception) as e:
+                    if isinstance(e, LLMResponseError) and e.result is not None:
+                        try:
+                            from ..infra.token_stats import record_token_usage
+                            record_token_usage(
+                                session_id=session_id, step="step2_policy_gen",
+                                **e.result.to_usage_dict(),
+                            )
+                        except Exception:
+                            pass  # 统计故障不能覆盖原始模型错误
                     step2_error = e
                     if attempt < max_retries:
                         moss_log.log_error("step2_generate_policy", e)
@@ -299,7 +333,7 @@ def analyze(
                         "violated_policy": "无法生成策略：LLM 服务异常",
                     }
                 moss_log.log_result("Deny", result["reason"])
-                return result
+                return _finalize(result)
 
         result = {
             "decision": "Allow",
@@ -312,7 +346,7 @@ def analyze(
             "confidence": judgment.confidence,
         }
         moss_log.log_result("Allow", result["reason"], policy_a_next)
-        return result
+        return _finalize(result)
 
     except Exception as e:
         moss_log.log_error("unknown", e)
@@ -323,7 +357,7 @@ def analyze(
             "violated_policy": "未知异常",
         }
         moss_log.log_result("Deny", result["reason"])
-        return result
+        return _finalize(result)
 
 
 def _save_policy_to_file(session_id: str, policy_toml: str) -> Path | None:

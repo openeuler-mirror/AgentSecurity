@@ -6,6 +6,7 @@
 一条都不跑，**所有路径都放行**，而服务启动没有任何提示。这类「静默失效」是安全产品
 最不该有的，故启动时必须把「场景规则是否启用」喊出来。
 
+对应 TS `ts/src/__tests__/deployment-selfcheck.test.ts`。
 """
 
 import logging

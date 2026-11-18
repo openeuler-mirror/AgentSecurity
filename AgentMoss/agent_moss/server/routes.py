@@ -391,7 +391,7 @@ async def health(request: Request):
                 "**L2.2 组合链检测已失效**（跨会话组合攻击可能漏判），L1/L2.1/L3 正常。"
                 "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
                 "→ agent-moss state reset --yes → systemctl start agent_moss；"
-                "或调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
+                "或调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。详见 docs/UPGRADE_GUIDE.md"
             )
         elif _pct >= 90:
             degraded.append(
@@ -401,6 +401,7 @@ async def health(request: Request):
                 "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
                 "→ 停服 → agent-moss state reset --yes → 起服；"
                 "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
+                "详见 docs/PERFORMANCE_TUNING.md 第 5 节"
             )
     _circuit = metrics.get("llm_circuit") or {}
     if isinstance(_circuit, dict) and _circuit.get("state") == "open":
@@ -411,13 +412,15 @@ async def health(request: Request):
             "（fail_open 放行 / fail_closed 拒绝），L1/L2 正常。"
             f"处理：检查模型服务是否存活、网络是否通、api_key 是否有效；"
             f"修复后冷却 {_circuit.get('cooldown_sec')} 秒会自动放试探请求恢复，"
-            "无需重启。"
+            "无需重启。排查步骤见 docs/LLM_TROUBLESHOOTING.md"
         )
     return HealthResponse(
         status="degraded" if degraded else "healthy",
         degraded=degraded,
         version=__version__,
         instance=os.getenv("AGENT_MOSS_INSTANCE", ""),
+        # 实际监听端口（端口被占用自动漂移后，调用方靠它发现新端口）
+        port=int(os.getenv("AGENT_MOSS_ACTUAL_PORT") or 0),
         metrics=metrics,
     )
 
@@ -465,16 +468,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
         # session_history: 多 session 历史动作（可选），每项 {"session_id",
         # "action_history": [{action_type, action_detail}]}。供 L2.2 形式化引擎
         # 跨会话组合链/敏感数据传播验证；由调用方（含 agentgate）提供。
-        session_history = [
-            {
-                "session_id": s.get("session_id", ""),
-                "action_history": [
-                    {"action_type": a.get("action_type", ""), "action_detail": a.get("action_detail", "")}
-                    for a in s.get("action_history", [])
-                ],
-            }
-            for s in req.session_history
-        ]
+        session_history = [s.model_dump() for s in req.session_history]
 
         # agent_id 透传：用于加载三方 agent 定制化规则（agent_moss/agents/<id>/rules.json）
         # 优先顶层 agent_id；为空时兜底从 metadata.agent_type 取（AgentGate V1
@@ -668,6 +662,37 @@ async def analyze(req: AnalyzeRequest, request: Request):
         )
         duration_ms = (time.monotonic() - start) * 1000
 
+        # ========== L3 结局 → 能力说明（2026-11）==========
+        # 客户看板只显示 decision/reason 时，分不清「L3 认真判过的 Allow」和
+        # 「L3 挂了按 fail_open 放的 Allow」。这里把 L3 结局翻译成 degraded 说明，
+        # 复用客户已有的 degraded 展示，不改他们的前端。
+        _l3_outcome = str(result.get("l3_outcome", "") or "")
+        _l3_fail_msg = str(result.get("reason", "") or "")[:160]
+        if _l3_outcome == "reasoning_fallback":
+            _degraded.append(
+                "【提示】本次 L3 判定取自模型的 reasoning 字段（content 为空）："
+                "**判定结果有效**，但说明模型没把答案写进 content。"
+                "频繁出现时请在 config.json 的 llm.extra_body 配置关思考参数根治。"
+            )
+        elif _l3_outcome == "fail_open":
+            _degraded.append(
+                f"【已降级】L3 语义分析未完成（{_l3_fail_msg}），本次按 fail_open 放行："
+                "**仅 L1/L2 生效，未做语义层检查**。调用方可据此收紧业务权限。"
+            )
+        elif _l3_outcome == "fail_closed":
+            _degraded.append(
+                f"【已降级】L3 语义分析未完成（{_l3_fail_msg}），本次按 fail_closed 拒绝："
+                "拦截原因是「分析不可用」而非「确认有风险」。修复模型服务后重试可能放行。"
+            )
+        elif _l3_outcome == "circuit_open":
+            _degraded.append(
+                f"【已降级】LLM 熔断器打开，本次**未发起 L3 请求**（{_l3_fail_msg}）："
+                "L1/L2 正常，语义层缺失。检查模型服务与网络，冷却后自动试探恢复。"
+            )
+        # 注意：``skipped``（L3 未启用）**不**写 degraded —— 那是部署方的既有
+        # 选择，每条响应都提示会变成噪音；需要时读 l3_outcome 字段即可。
+        # ``not_reached`` / ``ok`` / ``failed_but_blocked`` 同理，判定本身完整。
+
         # 追踪日志：最终判定 + 总耗时
         try:
             from ..infra.trace_log import trace_summary as _ts
@@ -681,6 +706,8 @@ async def analyze(req: AnalyzeRequest, request: Request):
                 reason=result.get("reason", ""),
                 violated_layers=result.get("violated_layers", []),
                 duration_ms=round(duration_ms, 1),
+                # 2026-11：L3 结局（区分「L3 判过」与「L3 挂了放的」）
+                l3_outcome=result.get("l3_outcome", ""),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -691,7 +718,13 @@ async def analyze(req: AnalyzeRequest, request: Request):
 
             _decision = str(result.get("decision", "") or "")
             _risk = str(result.get("risk_level", "") or "")
-            _m.ANALYZE_TOTAL.inc(decision=_decision, risk_level=_risk)
+            # l3_outcome 标签（2026-11）：Grafana 可直接拉「降级放行占比」
+            # = rate(analyze_total{l3_outcome=~"fail_open|circuit_open"}) / rate(analyze_total)
+            _m.ANALYZE_TOTAL.inc(
+                decision=_decision,
+                risk_level=_risk,
+                l3_outcome=str(result.get("l3_outcome", "") or ""),
+            )
             _m.ANALYZE_DURATION.observe(max(0.0, duration_ms / 1000.0), decision=_decision)
             for _layer in result.get("violated_layers", []) or []:
                 # "L2.2-stateful" -> "L2.2"；便于按层聚合
@@ -798,6 +831,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
                         "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
                         "→ agent-moss state reset --yes → systemctl start agent_moss；"
                         "或调大 AGENT_MOSS_CHAIN_MAX_NODES 并重启。"
+                        "详见 docs/UPGRADE_GUIDE.md"
                     )
                 elif _pct >= 90:
                     _degraded.append(
@@ -808,6 +842,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
                         "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
                         "→ 停服 → agent-moss state reset --yes → 起服；"
                         "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
+                        "详见 docs/PERFORMANCE_TUNING.md 第 5 节"
                     )
                 if inc["should_block"]:
                     j = inc["matched"] or (inc["exfil"][0] if inc["exfil"] else None)
@@ -851,6 +886,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
             violation_chain=result.get("violation_chain", []) or [],
             violation_graph=sp.redact_graph(result.get("violation_graph"), instance_id, session_id),
             degraded=_degraded,
+            l3_outcome=str(result.get("l3_outcome", "") or ""),
         )
     except HTTPException:
         raise  # 鉴权/越界等显式状态码不能被兜底 500 覆盖

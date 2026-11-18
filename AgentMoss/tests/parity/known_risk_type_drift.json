@@ -1,7 +1,7 @@
 {
   "_comment": [
     "用例声明了 expected_risk_type，但至少一端实际判定与声明不符的**已知**偏差。",
-    "tests/test_case_metadata.py 比对 python 字段。",
+    "tests/test_case_metadata.py 比对 python 字段；ts/src/__tests__/json-cases.test.ts 比对 typescript 字段。",
     "偏差集合必须与清单**完全一致** —— 多一个（新漂移）或少一个（清单过期）都会失败。",
     "python != typescript 的条目 = **双端 risk_type 分叉**：decision 与 risk_level 一致（拦截行为相同），",
     "只是「命中哪条规则的分类标签」不同 —— 多规则同时命中时的优先级差异（典型：TS 先命中敏感路径 → file_access）。",

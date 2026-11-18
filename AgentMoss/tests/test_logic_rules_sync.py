@@ -6,6 +6,7 @@ open 2）原先内联在 `_check_indirect_file_access` 函数体里，TS 侧同�
 目录遍历词表**不另存一份**，复用 `inline_rules.json` 的 `dir_traversal_keywords`
 （两处原本就逐字相同）。
 
+TS 对照：`ts/src/__tests__/logic-rules-sync.test.ts`。
 """
 from __future__ import annotations
 

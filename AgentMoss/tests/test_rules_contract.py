@@ -9,6 +9,7 @@
 2. 缺文件 / 缺顶层键 → 报出来；
 3. 有内容指纹，启动打印，客户报问题时可据此确认跑的是哪份规则。
 
+TS 对照：`ts/src/__tests__/rules-contract.test.ts`。
 """
 from __future__ import annotations
 

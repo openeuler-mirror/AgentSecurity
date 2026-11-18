@@ -15,10 +15,27 @@ def setup_function():
 
 
 def test_counter_and_labels():
-    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low")
-    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low")
+    # 2026-11：analyze_total 新增 l3_outcome 标签（区分 L3 是否降级放行）
+    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low", l3_outcome="ok")
+    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low", l3_outcome="ok")
     out = metrics.render_prometheus()
-    assert 'agent_moss_analyze_total{decision="Allow",risk_level="low"} 2.0' in out
+    # 标签按字母序渲染（_format_labels 会排序）
+    assert (
+        'agent_moss_analyze_total{decision="Allow",l3_outcome="ok",risk_level="low"} 2.0'
+        in out
+    )
+
+
+def test_counter_l3_outcome_dimension():
+    """运维核心诉求：Grafana 拉「降级放行占比」要能区分 fail_open / circuit_open。"""
+    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low", l3_outcome="ok")
+    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low", l3_outcome="fail_open")
+    metrics.ANALYZE_TOTAL.inc(decision="Allow", risk_level="low", l3_outcome="circuit_open")
+    out = metrics.render_prometheus()
+    # 标签按字母序渲染，故只断言标签对本身（不假定它在末尾）
+    assert 'l3_outcome="ok"' in out
+    assert 'l3_outcome="fail_open"' in out
+    assert 'l3_outcome="circuit_open"' in out
 
 
 def test_histogram_buckets():

@@ -21,6 +21,7 @@
 | ``AGENT_MOSS_LLM_HOST_ALLOWLIST`` | 空 | ``metadata.llm_config.baseUrl`` 允许的主机；空 = 不限主机（协议仍校验） |
 | ``AGENT_MOSS_TRUST_PRIVATE_LLM`` | ``1`` | 是否允许 baseUrl 指向内网/回环（本地模型常见，默认允许） |
 
+⚠️ 双端对称：TS 侧为 ``ts/src/infra/security-policy.ts``，变量名与默认值必须一致。
 """
 from __future__ import annotations
 
@@ -484,13 +485,13 @@ def open_private_append(path: Path):
     return io.TextIOWrapper(io.FileIO(fd, "a", closefd=True), encoding="utf-8")
 
 
-def write_private_text(path: Path, text: str) -> None:
+def write_private_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """以 0600 + ``O_NOFOLLOW`` 覆盖写。"""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(str(path), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    with os.fdopen(fd, "w", encoding=encoding) as f:
         f.write(text)
 
 

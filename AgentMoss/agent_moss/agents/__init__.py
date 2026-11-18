@@ -3,8 +3,9 @@
 按 `agent_id` 加载该 agent 的专属规则集（JSON 单一事实源）。
 规则文件位置：`agent_moss/agents/<agent_id>/rules.json`
 
-规则存放于 rules.json：
+Python 与 TypeScript 两端共享同一份 rules.json：
 - py: agent_moss/agents/__init__.py:get_agent_extensions
+- ts: ts/src/agents/index.ts:getAgentExtensions
 
 使用：
     from agent_moss.agents import get_agent_extensions

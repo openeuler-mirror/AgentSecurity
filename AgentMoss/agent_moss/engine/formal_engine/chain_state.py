@@ -8,7 +8,8 @@ taint + 存活资源），并暴露增量的"种子/推进"入口。服务重启
 表：
 - chain_state(agent_id PRIMARY KEY, state_json, updated_at)
 
-JSON 文件形态，对应无 sqlite 环境；AgentGate 侧逻辑一致）。
+双端镜像：TS 端 ts/src/engine/formal-engine/chain_state.ts（JSON 文件形态，对应
+无 sqlite 环境；AgentGate 侧逻辑一致）。
 """
 
 from __future__ import annotations

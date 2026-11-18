@@ -241,6 +241,9 @@ def _l2_intent_patterns_to_rules(profile) -> list[dict]:
             "intent_keywords": pat.intent_keywords,
             "dangerous_actions": pat.dangerous_actions,
             "reason": pat.reason,
+            # 旧 runtime 里没有这个字段：缺省 False，但 _get_intent_patterns 会按
+            # reason 回填 profile 默认值，避免旧配置让新豁免失效。
+            "allow_if_write_intent": getattr(pat, "allow_if_write_intent", False),
             "skip_l3_on_disabled": True,
             "enabled": True,
             "builtin": True,
@@ -361,6 +364,12 @@ def _agent_rules_to_defaults() -> dict:
             "category_desc": "agent 专属敏感路径（L1 末尾追加）",
             "rules": [{**sp, "enabled": True, "builtin": True}
                       for sp in data.get("extra_sensitive_paths", [])],
+        }
+        cats["extra_single_file_write_tools"] = {
+            "category_enabled": True,
+            "category_desc": "agent 专属单文件写工具（read_before_write 只取声明路径）",
+            "rules": [{"value": v, "enabled": True, "builtin": True}
+                      for v in data.get("extra_single_file_write_tools", [])],
         }
         out[agent_id] = cats
     return out
@@ -1699,6 +1708,11 @@ def get_enabled_agent_extensions(runtime: dict, agent_id: str):
         for sp in _agent_category_enabled_rules(cats.get("extra_sensitive_paths", {}))
         if "path" in sp
     ]
+    single_file_write_tools = [
+        str(t["value"]).lower()
+        for t in _agent_category_enabled_rules(cats.get("extra_single_file_write_tools", {}))
+        if "value" in t
+    ]
     return AgentExtensions(
         agent_id=agent_id,
         description="",
@@ -1707,6 +1721,7 @@ def get_enabled_agent_extensions(runtime: dict, agent_id: str):
         extra_sensitive_paths=sensitive_paths,
         builtin_safe_skills=[s["value"] for s in safe_skills if "value" in s],
         builtin_safe_action_types=[a["value"] for a in safe_action if "value" in a],
+        extra_single_file_write_tools=single_file_write_tools,
         extra_skills=[],
     )
 

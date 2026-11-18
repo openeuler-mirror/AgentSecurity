@@ -365,6 +365,7 @@ read_before_write 判定 `os.path.exists()`/`fs.existsSync()` 依赖磁盘：
 
 已全量扫描确认只有 4 个用例存在性敏感（`allow-65` / `allow-66` / `allow-78` / `llm-06`），全部是"写新建 + 预期 Allow"。双端测试基建已内置：
 - Python：`tests/conftest.py::_prep_file_state`（`test_all_cases._run_case` 调用）
+- TS：`ts/src/__tests__/json-cases.test.ts::prepFileState`（`runAnalysis` 前调用）
 
 prep.sh 与测试基建的分工：**prep.sh 建「读目标」（命令要跑得动），测试基建删/建「写目标」（判定要可复现）**。两者互补，不能互相替代——prep 若预建写目标，会让 allow 新建用例翻判 Deny。
 

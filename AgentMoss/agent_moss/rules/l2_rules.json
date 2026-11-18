@@ -1,4 +1,68 @@
 {
+  "_intent_matrix_comment": "意图一致性判定矩阵（2026-11 重构）：从当前 prompt 提取意图类别（读/写/删，可多选），从当前动作提取动作类别（读/新建/追加/覆盖/删除），按矩阵判定。规则：覆盖动作只在意图含 write 时放行；删除动作只在意图含 delete 时放行；读/新建/追加永远放行；意图提取不到 → 不判（交 L3）。指代前文（继续/看上一句/根据之前说的办）回退到最近 3 条历史 prompt，回退必须唯一，否则视为意图不明。",
+  "intent_matrix": {
+    "categories": {
+      "read": [
+        "读取",
+        "查看",
+        "分析",
+        "列出",
+        "搜索",
+        "查询",
+        "read",
+        "analyze",
+        "view",
+        "list",
+        "search",
+        "query",
+        "find"
+      ],
+      "write": [
+        "写入",
+        "写文件",
+        "写进",
+        "保存",
+        "生成文件",
+        "导出",
+        "输出到",
+        "创建文件",
+        "append",
+        "write",
+        "save",
+        "export",
+        "generate"
+      ],
+      "delete": [
+        "删除",
+        "移除",
+        "清理",
+        "清空",
+        "remove",
+        "delete",
+        "rm",
+        "rmdir"
+      ]
+    },
+    "delete_action_words": [
+      "删除",
+      "remove",
+      "delete",
+      "del",
+      "rm",
+      "rmdir",
+      "unlink",
+      "shred",
+      "truncate",
+      "format",
+      "erase"
+    ],
+    "reasons": {
+      "read->overwrite": "原始意图为读取/分析，但执行了修改操作",
+      "read->delete": "原始意图为读取/分析，但执行了删除操作",
+      "write->delete": "原始意图为写入/保存，但执行了删除操作",
+      "delete->overwrite": "原始意图为删除，但执行了修改操作"
+    }
+  },
   "intent_consistency": [
     {
       "intent_keywords": [
@@ -36,7 +100,8 @@
         "写入",
         "alter"
       ],
-      "reason": "原始意图为查询/搜索，但执行了修改操作"
+      "reason": "原始意图为查询/搜索，但执行了修改操作",
+      "allow_if_write_intent": true
     },
     {
       "intent_keywords": [
@@ -78,7 +143,8 @@
         "reg delete"
       ],
       "reason": "原始意图为查询/搜索，但执行了修改操作",
-      "os": "windows"
+      "os": "windows",
+      "allow_if_write_intent": true
     }
   ],
   "password_modify_consent": [

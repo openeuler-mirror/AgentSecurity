@@ -26,8 +26,8 @@ from ..rules_loader import load_inline
 
 logger = logging.getLogger(__name__)
 
-# ── 识别词表：单一事实源 rules/inline_rules.json ────────────────────────────
-# 词表原先硬编码在本文件。迁进 JSON 后
+# ── 识别词表：单一事实源 rules/inline_rules.json（Python / TS 共用）────────────
+# 词表原先硬编码在本文件与 ts/src/engine/inline-analyzer.ts 各一份。迁进 JSON 后
 # 只在导入时读一次 —— 与迁移前的模块级常量行为一致（进程内不变，改 JSON 需重启）。
 # ⚠️ 文件缺失/损坏 → 词表为空，内联脚本里的敏感路径会退回"文本字面量"放行（更松），
 #    故此处必须报错，不能安静地降级。

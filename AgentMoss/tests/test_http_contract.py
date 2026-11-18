@@ -4,6 +4,7 @@
 **响应契约本身**：字段名、类型、必需项都不能变，否则 opendesk / xiaoO / AgentGate
 这些调用方会在升级后解析失败。
 
+与 `docs/INTEGRATION_GUIDE.md` 的字段表一一对应。
 """
 from __future__ import annotations
 
@@ -100,7 +101,7 @@ def test_console_rules_schema(client):
 
 
 def test_documented_integration_payload(client):
-    """完整示例必须原样可用。
+    """`docs/INTEGRATION_GUIDE.md` §3.1 的完整示例必须原样可用。
 
     这是三个集成（openDesk / xiaoO / AgentGate）最可能照着写的形状：
     显式 os_type、prompt_history、metadata.llm_config / llm_log_path 都在。

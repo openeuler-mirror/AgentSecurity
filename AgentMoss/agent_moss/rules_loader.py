@@ -28,9 +28,10 @@ CommandPattern / SensitivePath / IntentDeviationPattern 等结构。
    注入 L1 正则，最轻量但只能进 L1 且规则要塞在环境变量值里。
 
 ⚠️ 历史坑：通道 1 的注释一直写着"数据根目录优先（允许部署侧覆盖）"，但代码
-写的是**包内优先**（只有包内文件缺失才看数据目录）—— 注释与实现相反。
-即「把自有规则丢进 <data_root>/rules/」曾静默不生效，而客户用的是 Python 版。
-2026-09 修正为**数据根目录优先**。
+写的是**包内优先**（只有包内文件缺失才看数据目录）—— 注释与实现相反，且
+TS 端（``ts/src/infra/rules-loader.ts`` 的 ``RULES_DIR_CANDS`` 首项）是真覆盖。
+即「把自有规则丢进 <data_root>/rules/」在 **TS 生效、Python 静默不生效**，
+而客户用的是 Python 版。2026-09 修正为两端一致：**数据根目录优先**。
 """
 from __future__ import annotations
 
@@ -317,7 +318,8 @@ def load_inline() -> dict[str, Any]:
     （目录遍历词，子串匹配）、``write_exec_chain_patterns``（写入+执行绕过链，正则）、
     ``redirect_sensitive_paths``（重定向写敏感路径的清单）。
 
-    这批词表原先**硬编码**在 ``engine/inline_analyzer.py`` 中 —— 迁进 JSON 后单一事实源，
+    这批词表原先**硬编码**在 ``engine/inline_analyzer.py`` 与
+    ``ts/src/engine/inline-analyzer.ts`` 各一份 —— 迁进 JSON 后双端同源，
     是规则仓剥离的前置工作。
 
     与 ``platform_traits`` 一样**不参与 runtime 合并、也不读规则目录**（override/extra）：
@@ -358,7 +360,7 @@ def load_logic_rules() -> dict[str, Any]:
 def load_heuristic_rules() -> dict[str, Any]:
     """返回 L1 特征检测的小型名单（``rules/heuristic_rules.json``）。
 
-    原先硬编码在 ``engine/heuristic.py``：
+    原先硬编码在 ``engine/heuristic.py`` 与 ``ts/src/engine/heuristic.ts``：
     敏感路径检测排除前缀、搜索类工具前缀/精确名、回环地址名单。
 
     与其它 ``*_rules.json`` 一样不参与 runtime 合并；文件缺失/损坏 → ``{}``，
@@ -370,8 +372,9 @@ def load_heuristic_rules() -> dict[str, Any]:
 def load_script_rules() -> dict[str, Any]:
     """返回脚本内容分析的高风险词表（``rules/script_rules.json``）。
 
-    原先**两份**副本硬编码在 ``engine/script_content_analyzer.py``、
-    ``engine/script_analyzer.py``。迁进 JSON 后只有一份。
+    原先**四份**副本硬编码在 ``engine/script_content_analyzer.py``、
+    ``engine/script_analyzer.py``、``ts/src/engine/script-content-analyzer.ts``、
+    ``ts/src/engine/script-analyzer.ts``。迁进 JSON 后只有一份。
 
     键：``keyword_sets``（可被组合规则以 ``$name`` 引用的词集）、
     ``suspicious_patterns``（18 条高风险关键词正则）、
@@ -387,7 +390,7 @@ def load_script_rules() -> dict[str, Any]:
 
 
 #: 平台特征的字段清单 —— 与 ``rules/platform_traits.json`` 的平台对象键一一对应。
-#: 字段语义见 ``rules/platform_traits.json`` 的 ``_comment``。
+#: 字段语义见 `ts/src/engine/platform-traits.ts` 的 ``PlatformTraits``（双端同构）。
 TRAITS_FIELDS: tuple[str, ...] = (
     "write_keywords",
     "read_keywords",
@@ -411,7 +414,7 @@ def load_platform_traits(os_name: str = "") -> dict[str, Any]:
     """返回某平台**已解析继承**的平台特征：``{字段: 值}``（键见 ``TRAITS_FIELDS``）。
 
     背景：这些"放行/豁免边界"（只读白名单、写命令正则、意图关键词……）原先**硬编码**在各
-    ``profiles/*.py`` 里，还有重复副本。
+    ``profiles/*.py`` 与 ``ts/src/engine/platform-traits.ts`` 里，双端各一份、还有重复副本。
     迁到 ``rules/platform_traits.json`` 后，双端读同一份，后续规则仓才能整体剥离。
 
     - ``macos`` / ``harmony`` 在 JSON 里写 ``{"inherits": "linux"}``，此处解析成 linux

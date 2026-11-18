@@ -714,6 +714,7 @@ def get_full_config():
     #   打开 Console（GET /api/config）→ 点**第一次**开关 200（但已写坏文件）
     #   → 点**第二次**开关 500。
     # 写路径的 `_with_l2_2_view` 早已做了同样的浅拷贝（见其注释），读路径此前漏了。
+    # 看护：`tests/test_console_config_pollution.py`、`ts/src/__tests__/console-routes.test.ts`。
     cfg = dict(_runtime_for_view())
     cfg["L2_2"] = _get_l2_2_view()
     cfg["builtin_only"] = is_builtin_only()

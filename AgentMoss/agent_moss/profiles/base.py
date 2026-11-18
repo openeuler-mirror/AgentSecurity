@@ -56,6 +56,9 @@ class IntentDeviationPattern:
     dangerous_actions: list[str]      # a_next 中不应出现的危险关键词
     reason: str                       # 命中时的描述
     os: str = ""                      # 原始平台归属，语义同 CommandPattern.os
+    #: prompt 明确含写意图时跳过本规则（只对「查询→修改」这类分支置 True）。
+    #: 依据：用户说「搜索后写入 B」时写入是显式要求，不是意图偏离。
+    allow_if_write_intent: bool = False
 
 
 class OSProfile(ABC):
@@ -85,10 +88,10 @@ class OSProfile(ABC):
     # ─── 平台命令集（Platform Traits）───
     #
     # 单一事实源：``rules/platform_traits.json``（Python 与 TS 读同一份）。
-    # 这批"放行/豁免边界"原先硬编码在本文件与 ``profiles/{linux,windows}.py`` 里；
-    # 2026-10 迁到 JSON —— 逐字搬移、判定零变化，
+    # 这批"放行/豁免边界"原先硬编码在本文件与 ``profiles/{linux,windows}.py`` 里，
+    # TS 侧还各有一份副本；2026-10 迁到 JSON —— 逐字搬移、判定零变化，
     # 目的是让规则仓剥离时这批数据能整体搬走。
-    # 字段语义见 ``rules/platform_traits.json`` 的 ``_comment``；
+    # 字段语义见 ``ts/src/engine/platform-traits.ts`` 的 ``PlatformTraits``；
     # macos / harmony 走 JSON 的 ``{"inherits": "linux"}``（同为类 Unix 命令集）。
 
     @cached_property

@@ -1,6 +1,7 @@
 """LiteSE 符号执行器测试 — Python 端。
 
-覆盖四类场景 + fail-closed。
+镜像 TS ts/src/__tests__/symbolic.test.ts。覆盖四类场景 + fail-closed。
+双端算法/数据结构/用例对齐（AgentMoss 铁律）。
 """
 
 import pytest

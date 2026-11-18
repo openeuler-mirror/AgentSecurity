@@ -3,7 +3,7 @@
 observe 模式：命中违规只记录不拦截，violated_layers 带 "L2.2"（灰度观察 FP 率用）。
 witness 语义：实时判定只当**当前动作（a_next）补全链/触发后置外传**才判违规——
 历史中已随机出现的完整链不再误伤后续良性动作（修复"历史全局匹配 → 永久拒绝锁定"FP，
-对齐站点 L2.2"仅当当前事件属于 violation witness"）。
+见 docs/DETECTION_METHODS.md 六.3；对齐站点 L2.2"仅当当前事件属于 violation witness"）。
 """
 import os
 

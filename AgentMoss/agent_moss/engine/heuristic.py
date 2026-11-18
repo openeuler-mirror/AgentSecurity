@@ -8,9 +8,11 @@
 三者由 HeuristicDetector 统一协调，按优先级依次执行，支持短路返回。
 """
 
+import ast
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,6 +31,12 @@ from .logic_rules import _is_write_operation, _SensitivePathMatcher, _is_directo
 from .logic_rules import has_exec_bypass_chain, ALL_QUOTES_RE
 # 引号感知命令段切分同样下沉 logic_rules（NEW-FN-M 起含单管道切分），单一事实源：
 from .logic_rules import _SEPARATOR_SEGMENTS, _split_shell_segments
+# 写文件/编辑的 content 按目标语言分析（文档不跑命令执行检测；脚本只扫危险片段）。
+from .written_content_analyzer import (
+    is_file_write_action,
+    analyze_written_content,
+    strip_shell_docs_only,
+)
 
 # 默认用户规则文件路径（随包内置；builtin 模式下唯一允许读取的 user_rules.json）
 # 用户自定义规则文件（随规则目录走）。函数而非常量：AGENT_MOSS_RULES_ROOT 改了立即生效。
@@ -373,7 +381,9 @@ class DangerousPatternChecker:
         # NEW-FP-2: 临时目录豁免扩充相对 var/tmp 前缀——rm -rf var/tmp/* 清理本地 venv
         # 的临时目录（相对路径），旧豁免只认绝对 /tmp 等 4 个，相对 var/tmp/* 漏过 →
         # 通配符+删除误报。相对 var/tmp（无前导 /）也是标准临时目录名，一并豁免。
-        _scan = _strip_heredoc_content(action_detail)
+        # NEW-FP（2026-11 鸿蒙压测）：检索命令的引号内容是搜索模式/glob——
+        # `rg "remove|delete" --glob "*.py"` 是只读检索，不是批量误删。
+        _scan = strip_search_pattern_literals(_strip_heredoc_content(action_detail))
         _TEMP_DIRS = _HEURISTIC_TEMP_DIRS
         # NEW-FP-2 审核：相对 var/tmp（无前导 /）& 深层绝对路径（/opt/app/var/tmp）——
         # 裸露的 (?:^|[\s/])td(?:[\s/]|$) 会把「以 var/tmp 结尾的深层子路径」误当临时目录
@@ -1153,6 +1163,45 @@ def _split_command_segments(action_detail: str) -> list[str]:
     return segments
 
 
+#: 文本检索命令：引号内是搜索模式 / glob 过滤，是数据不是被执行的命令 token。
+_TEXT_SEARCH_COMMANDS = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "ack", "ack-grep"})
+
+#: 命令前缀词：`sudo rg ...` / `time rg ...` 的实际命令词在后面。
+_COMMAND_PREFIX_WORDS = frozenset({"sudo", "command", "nohup", "time"})
+
+#: 引号内容（单/双引号，保持与 _strip_literal_text_segments 相同的简化语义）。
+_QUOTED_CONTENT_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def strip_search_pattern_literals(action_detail: str) -> str:
+    """剥离文本检索命令段里的引号内容（搜索模式/glob 是数据，不是命令）。
+
+    NEW-FP（2026-11 鸿蒙压测）：`rg -n -c "remove|delete" --glob "*.py" x`
+    被「通配符+删除」判成批量误删——`*.py` 的 `*` 与引号内 `remove|delete`
+    距离 <40 字符命中正则；实际是一次纯只读检索。引号内的删除词是搜索模式，
+    `--glob "*.py"` 是文件过滤条件，都不构成删除动作。
+
+    只剥检索命令段：`rm -rf "*"` 这类删除命令的引号参数原样保留（Windows
+    `del "*.txt"` 的引号通配符由命令自身展开，不能当字面量）。
+    `rg --pre <cmd>` 的预处理器参数是会被执行的命令，出现时不剥离（保守）。
+
+    对应原则 L1-4「危险规则只匹配真实命令 token」。
+    """
+    parts: list[str] = []
+    for seg in _split_command_segments(action_detail):
+        low = seg.strip().lower()
+        words = low.split()
+        idx = 0
+        while idx < len(words) and words[idx] in _COMMAND_PREFIX_WORDS:
+            idx += 1
+        is_search = idx < len(words) and words[idx] in _TEXT_SEARCH_COMMANDS
+        if is_search and "--pre" not in low:
+            parts.append(_QUOTED_CONTENT_RE.sub(" ", seg))
+        else:
+            parts.append(seg)
+    return "".join(parts)
+
+
 class CommandPatternScanner:
     """子检测器：关键命令正则扫描（从 OSProfile 获取模式）
 
@@ -1223,7 +1272,12 @@ class CommandPatternScanner:
         # 的重定向仍被检测，echo pass | passwd 的管道后 passwd 仍被匹配）。非 echo/printf
         # 段（rm -rf /tmp; echo done 的 rm 段）不剥，真实危险命令不漏报。
         # NORM-PATH: 再折叠路径混淆段（//、/./），堵路径穿越变体（cat /etc//shadow 漏检）。
-        scan_text = _normalize_path_segments(_strip_literal_text_segments(action_detail))
+        # NEW-FP（2026-11）：先剥「不会执行的 shell 区域」（quoted heredoc/注释/
+        # 文本段字面量，保留 $(...) 与管道给解释器），再做原有 echo/printf 字面量
+        # 处理。`cat <<'EOF'` 里的 rm 是文档正文；`echo "$(rm ...)"` 的命令替换保留。
+        scan_text = _normalize_path_segments(
+            _strip_literal_text_segments(strip_shell_docs_only(action_detail))
+        )
         # WIN-SEP: 同 SensitivePathChecker —— Windows 下追加分隔符归一化变体，
         # 让 `type C:/Windows/.../SAM` 这类正斜杠写法也能命中按反斜杠书写的规则。
         # 原文保留，故 `net user /add`、`https://` 等含 / 的命令模式不受影响。
@@ -1264,6 +1318,63 @@ class CommandPatternScanner:
             reason="; ".join(p["reason"] for p in hits),
             risk_type=top["risk_type"],
         )
+
+
+def _only_python_walk_onerror_keywords(command: str) -> bool:
+    """证明命中的 onerror= 全是 Python os.walk 的命名回调参数。
+
+    仅供注入关键词匹配使用，不修改执行命令或其他规则的输入。
+    无法确认 shell/Python 结构时保留原检查；字符串和注释中的同名文本不豁免。
+    """
+    occurrences = command.lower().count("onerror=")
+    if not occurrences or len(command) > 128 * 1024 or "$" in command or "`" in command:
+        return False
+    try:
+        parts = shlex.split(command)
+        if len(parts) not in (3, 4) or (len(parts) == 4 and parts[3] != "2>&1"):
+            return False
+        if not re.fullmatch(r"python(?:3(?:\.\d+)?)?", parts[0]) or parts[1] != "-c":
+            return False
+        code = parts[2]
+        # Both spellings must agree: shell quote concatenation must not let a
+        # reconstructed keyword cancel a different literal occurrence.
+        if code.lower().count("onerror=") != occurrences:
+            return False
+        tree = ast.parse(code)  # Preserve case: OS.walk and OnError are not os.walk/onerror.
+        # Python 3.14 template strings retain expression source for later use.
+        # Older interpreters already reject this syntax during ast.parse.
+        if any(type(node).__name__ == "TemplateStr" for node in ast.walk(tree)):
+            return False
+        # Debug f-strings also turn expression source into a string constant.
+        # A keyword used there is output payload as well as Python syntax.
+        if any(
+            isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and "onerror=" in node.value.lower()
+            for node in ast.walk(tree)
+        ):
+            return False
+        lines = code.encode("utf-8").splitlines()
+        confirmed = 0
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "walk"
+            ):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "onerror" or not isinstance(keyword.value, ast.Name):
+                    continue
+                # AST columns are UTF-8 byte offsets. Count the exact rule text,
+                # so `onerror = callback` cannot cancel `onerror=` inside a string.
+                start = keyword.col_offset
+                if lines[keyword.lineno - 1][start:start + 8] == b"onerror=":
+                    confirmed += 1
+        return confirmed == occurrences
+    except (ValueError, SyntaxError, RecursionError, UnicodeError):
+        return False
 
 
 class InjectionKeywordChecker:
@@ -1312,9 +1423,13 @@ class InjectionKeywordChecker:
             pass
         return self._keywords + self._agent_extra_keywords
 
-    def check(self, text: str) -> HeuristicResult:
+    def check(self, text: str, *, python_walk_onerror_only: bool = False) -> HeuristicResult:
         keywords = self._get_active_keywords()
-        hits = [p for p in keywords if p["keyword"].lower() in text]
+        hits = [
+            p for p in keywords
+            if p["keyword"].lower() in text
+            and not (python_walk_onerror_only and p["keyword"].lower() == "onerror=")
+        ]
         if not hits:
             return HeuristicResult(hit=False)
 
@@ -1386,7 +1501,8 @@ def _split_shell_commands(command: str) -> list[str]:
     ⚠️ 不要再写一个叫 `_split_command_segments` 的函数：与已有同名函数冲突时
     Python 以**后定义者**为准，会静默改掉剥离函数的分段行为 —— 曾因此把
     `df -h && rm -rf /` 拼成 `df -hrm -rf /`，危险模式 `\\brm\\s+-...` 匹配不上，
-    任意复合命令里的危险命令全部漏检。命名冲突已有「剥离函数保持结构」用例守住。
+    任意复合命令里的危险命令全部漏检。命名冲突已用 tests/test_whitelist_readonly_commands.py
+    里的「剥离函数保持结构」用例守住。
     """
     return _split_shell_segments(command)
 
@@ -1621,7 +1737,8 @@ class HeuristicDetector:
             HeuristicResult: 检测结果
         """
         action_type = a_next.get("action_type", "").lower()
-        action_detail = a_next.get("action_detail", "").lower()
+        action_detail_raw = a_next.get("action_detail", "")
+        action_detail = action_detail_raw.lower()
         # 注入关键词检测**用原文 action_detail**（不过字面量剥离）：echo 引号内的
         # "ignore previous instructions" 是**载荷本体**——echo 输出会进入下游 LLM
         # 上下文，构成间接 prompt injection 通道（deny-08/177/232、agent-xiaoo-03
@@ -1636,7 +1753,8 @@ class HeuristicDetector:
         # no_high_risk=True → 工具名白名单放行：
         #     {"action_type": "glob", "action_detail": "rm -rf /"}  → Allow
         # **action_type 是调用方声明的，不能当免检依据。** 而且这套"按工具名免检"
-        # 只有 Python 有，本身就是一处实现分叉（穷举语料一照就现形）。
+        # 只有 Python 有、TS 没有，本身就是一处双端分叉（穷举语料
+        # tests/parity/corpus.json 一照就现形）。
         #
         # 去掉后不影响正当用法：`glob "*.txt"`、`list_dir /var/log`、
         # `ask_user_question "要重启吗？"` 的 detail 不含危险模式，照样 Allow；
@@ -1655,16 +1773,41 @@ class HeuristicDetector:
             return result
 
         # 2. 关键命令正则
-        best: HeuristicResult = self._command_scanner.scan(action_detail)
+        from .written_content_analyzer import handles_written_content
+
+        handled_write = handles_written_content(action_type, action_detail_raw)
+        if handled_write:
+            # 写文件/编辑：content 不是「本次执行的命令」。按目标语言分析：
+            # 文档/数据不跑命令执行检测；shell/python 用对应解析器只扫危险片段。
+            # 用原始 action_detail（保留路径/内容大小写）。
+            best: HeuristicResult = (
+                analyze_written_content(
+                    action_type,
+                    action_detail_raw,
+                    self._command_scanner,
+                    literal_stripper=_strip_literal_text_segments,
+                )
+                or HeuristicResult(hit=False)
+            )
+        else:
+            best = self._command_scanner.scan(action_detail)
 
         # 3. Prompt 注入
         # 搜索/查询类工具（search-WebSearch 等）的 action_detail 是查询参数（数据载荷），
         # 不是指令。注入检测只针对指令性文本（用户 prompt / reason / 命令），
         # 排除搜索工具的 action_detail，避免 "搜索 jailbreak" 等被误判为注入攻击。
         injection_text = combined_text
+        python_walk_onerror_only = False
         if _is_search_action_type(action_type):
             injection_text = f"{action_type} {reason} {prompt_session}".lower()
-        result = self._injection_checker.check(injection_text)
+        elif (
+            action_type in ("bash", "executebash", "terminal-executebash")
+            and "onerror=" not in f"{reason} {prompt_session}".lower()
+        ):
+            python_walk_onerror_only = _only_python_walk_onerror_keywords(a_next.get("action_detail", ""))
+        result = self._injection_checker.check(
+            injection_text, python_walk_onerror_only=python_walk_onerror_only,
+        )
         if result.hit:
             best = _merge_heuristic_hit(best, result)
 
@@ -1677,18 +1820,21 @@ class HeuristicDetector:
             best = _merge_heuristic_hit(best, result)
 
         # 5. 危险操作模式检测（从 L2 搬入）：通配符+删除、重定向覆盖关键目录
-        result = self._dangerous_pattern_checker.check(a_next)
-        if result.hit:
-            best = _merge_heuristic_hit(best, result)
+        # 已按内容语言处理的写工具调用跳过（content 里的 rm/*/重定向是数据）；
+        # 未走内容分析的（如 `write echo ... >> /etc/hosts`）保持原检查。
+        if not handled_write:
+            result = self._dangerous_pattern_checker.check(a_next)
+            if result.hit:
+                best = _merge_heuristic_hit(best, result)
 
-        # 5b. 主目录删除/写改检测（NEW-FN）：rm -rf ~ / $HOME / 变量间接删主目录
-        result = self._home_deletion_checker.check(a_next)
-        if result.hit:
-            best = _merge_heuristic_hit(best, result)
+            # 5b. 主目录删除/写改检测（NEW-FN）：rm -rf ~ / $HOME / 变量间接删主目录
+            result = self._home_deletion_checker.check(a_next)
+            if result.hit:
+                best = _merge_heuristic_hit(best, result)
 
-        # 6. 横向移动检测（从 L2 搬入，原死代码启用）：ssh/scp/rsync 到非本机
-        result = self._lateral_movement_checker.check(a_next)
-        if result.hit:
-            best = _merge_heuristic_hit(best, result)
+            # 6. 横向移动检测（从 L2 搬入，原死代码启用）：ssh/scp/rsync 到非本机
+            result = self._lateral_movement_checker.check(a_next)
+            if result.hit:
+                best = _merge_heuristic_hit(best, result)
 
         return best

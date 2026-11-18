@@ -20,6 +20,7 @@
 3. 种子包含全部 51 条（否则 Windows 又静默少检）；
 4. 端到端：Windows 独有关键词在 Windows 上真能拦住、在 Linux 上不误拦。
 
+TS 对照：`ts/src/__tests__/injection-os-scope.test.ts`。
 """
 from __future__ import annotations
 

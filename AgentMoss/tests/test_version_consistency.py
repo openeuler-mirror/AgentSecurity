@@ -1,7 +1,7 @@
-"""版本号一致性看护：pyproject.toml / agent_moss/__version__.py。
+"""版本号一致性看护：pyproject.toml / agent_moss/__version__.py / ts/package.json。
 
-2026-11 事故：0.17.20 发版只改了 ``pyproject.toml``，漏改
-``agent_moss/__version__.py`` —— wheel 的发行元数据是 0.17.20，但
+2026-11 事故：0.17.20 发版只改了 ``pyproject.toml`` 与 ``ts/package.json``，
+漏改 ``agent_moss/__version__.py`` —— wheel 的发行元数据是 0.17.20，但
 ``from agent_moss import __version__`` 仍是 0.17.19。安装脚本据此判定
 「已装 0.17.19 → 需升级 0.17.20」，而 pip 查元数据说已满足，于是每次安装
 都重复"升级"却永远升不上去（无限循环）。
@@ -9,6 +9,7 @@
 本测试在 CI 阶段直接拦住这类漏改。
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -29,6 +30,16 @@ def _module_version() -> str:
     return m.group(1)
 
 
+def _ts_package_version() -> str:
+    data = json.loads((ROOT / "ts" / "package.json").read_text(encoding="utf-8"))
+    return str(data["version"])
+
+
 def test_module_version_matches_pyproject():
     """模块内 __version__ 必须与打包版本一致（0.17.20 事故的直接看护）。"""
     assert _module_version() == _pyproject_version()
+
+
+def test_ts_package_version_matches_pyproject():
+    """npm 包版本必须与 Python 包版本一致（双端发版同号）。"""
+    assert _ts_package_version() == _pyproject_version()

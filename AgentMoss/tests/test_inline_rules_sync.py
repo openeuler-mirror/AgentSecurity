@@ -1,7 +1,7 @@
 """内联脚本判定词表的单一事实源看护（2026-10 从代码搬进 JSON）。
 
 `rules/inline_rules.json` 里的四组数据原先**硬编码**在
-`agent_moss/engine/inline_analyzer.py`：
+`agent_moss/engine/inline_analyzer.py` 与 `ts/src/engine/inline-analyzer.ts` 各一份：
 
 - `read_write_keywords`（66 条）：内联脚本里出现即视为真实读写
 - `dir_traversal_keywords`（10 条）：目录遍历函数（配合读写词判"动态发现文件"）
@@ -14,6 +14,7 @@
    `echo x > f && bash f\n` 这类跨行绕过漏网）；
 3. 兜底路径清单与迁移前逐字一致。
 
+TS 对照：`ts/src/__tests__/inline-rules-sync.test.ts`。
 """
 from __future__ import annotations
 

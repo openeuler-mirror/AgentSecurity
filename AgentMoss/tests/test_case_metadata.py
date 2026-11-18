@@ -20,6 +20,7 @@
   - 清单条目的内容变了（expected/actual 任一变化）→ 失败
 清理历史债时，从清单删掉对应条目即可。
 
+双端对应：TS 侧 `ts/src/__tests__/case-metadata.test.ts`（读同一份清单）。
 """
 
 import json

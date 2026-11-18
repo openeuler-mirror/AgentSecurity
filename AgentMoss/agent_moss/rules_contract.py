@@ -17,7 +17,8 @@
 - 未设（用包内自带规则）→ 只记 error 日志、照常启动（包坏了是打包事故，但把已经
   装好的引擎直接弄挂更糟；日志里能看见）。
 
-与规则文件格式有关的只有"规则文件长什么样"，此模块本身是 Python 侧的实现。
+与 Python/TS 两端都有关的只有"规则文件长什么样"，此模块本身是 Python 侧的实现；
+TS 侧对应 `ts/src/infra/rules-contract.ts`，两边要求清单必须一致。
 """
 from __future__ import annotations
 

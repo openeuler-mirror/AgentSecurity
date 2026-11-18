@@ -145,7 +145,7 @@ def check_cross_session_chain(graph: MultiSessionGraph) -> list[PropertyViolatio
     witness 语义（graph.witness_idx 非 None，实时判定）：
       只当**当前动作（a_next = 图末节点）补全链的最后阶段**时才判违规——
       历史中已随机出现的完整链不再影响后续良性动作（修复"历史全局匹配 →
-      永久拒绝锁定"FP，对齐站点 L2.2
+      永久拒绝锁定"FP，见 docs/DETECTION_METHODS.md 六.3；对齐站点 L2.2
       "仅当当前事件属于 violation witness 时才返回 block"）。
     witness_idx 为 None（低频回顾 /api/v1/review 全量历史）时保留原行为：
       报告历史中已形成的任何完整链。

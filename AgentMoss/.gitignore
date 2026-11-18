@@ -73,6 +73,7 @@ tests/cases_exec/*/.last_run_agentmoss.txt
 
 # ===== 兜底：根目录所有隐藏文件/目录，仅保留 .gitignore =====
 # 覆盖 .claude/ .atomcode/ .opendesk/ .mimocode/ .pytest_cache/ 等工具本地缓存
-# 前导 / 限定根目录，不影响子目录
+# 前导 / 限定根目录，不影响子目录如 ts/.gitignore
 /.*
 !/.gitignore
+node_modules/

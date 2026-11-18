@@ -1,7 +1,7 @@
 """Pydantic models for AgentMoss API requests and responses."""
 
 from typing import Optional
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..__version__ import __version__
 
@@ -13,6 +13,21 @@ class ActionItem(BaseModel):
     #: 动作真实发生时间（调用方上报）。可选 —— 供 P4「提权→外传」时间窗口
     #: 判定；缺省时该性质退回不设窗口的旧行为。
     called_at: str = Field(default="", description="Action timestamp (optional)")
+
+    @field_validator("action_type")
+    @classmethod
+    def _validate_action_type(cls, value: str) -> str:
+        # 自定义工具名称保持开放；空白或控制字符无法标识有效动作。
+        if not value.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+            raise ValueError("action_type must be nonempty and contain no control characters")
+        return value
+
+    @field_validator("action_detail")
+    @classmethod
+    def _reject_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("action_detail must not contain NUL characters")
+        return value
 
     class Config:
         extra = "allow"
@@ -34,13 +49,23 @@ class PromptTurn(BaseModel):
         extra = "allow"
 
 
+class SessionHistoryItem(BaseModel):
+    """Validate nested actions while preserving caller-provided context."""
+
+    session_id: str = ""
+    action_history: list[ActionItem] = Field(default_factory=list)
+
+    class Config:
+        extra = "allow"
+
+
 class AnalyzeRequest(BaseModel):
     """Security analysis request (v2: added os_type, cwd; v3: added agent_id; v4: added prompt_history; v5: added session_history; v6: added stateful incremental)."""
     session_id: str = Field(..., description="Session / agent unique identifier")
     prompt_session: str = Field(default="", description="User / upstream original prompt or task description (most recent user message; kept for backward compat)")
     prompt_history: list[PromptTurn] = Field(default_factory=list, description="Full interleaved prompt history (ordered turns, each with its triggered actions). Optional; empty = fall back to prompt_session only.")
     action_history: list[ActionItem] = Field(default_factory=list, description="Historical action sequence")
-    session_history: list[dict] = Field(default_factory=list, description="Multi-session historical actions (optional): [{session_id, action_history: [{action_type, action_detail}]}] for L2.2 formal engine cross-session verification. Provided by caller (incl. agentgate).")
+    session_history: list[SessionHistoryItem] = Field(default_factory=list, description="Multi-session historical actions (optional): [{session_id, action_history: [{action_type, action_detail}]}] for L2.2 formal engine cross-session verification. Provided by caller (incl. agentgate).")
     a_next: ActionItem = Field(..., description="Next action to be executed")
     reason: str = Field(default="", description="Reason for executing this action")
     os_type: str = Field(default="", description="OS type: 'linux', 'windows', or empty for auto-detect")
@@ -153,6 +178,16 @@ class AnalyzeResponse(BaseModel):
         default_factory=list,
         description="Capability degradation notes for this analysis (empty when fully evaluated)",
     )
+    #: 本次 **L3（LLM 语义分析）** 的实际结局（2026-11，稳定枚举）。
+    #: 让调用方在**不读日志**的情况下就能区分「这条 Allow 是 L3 认真判过的」
+    #: 还是「L3 挂了按 fail_open 放的」。取值见 ``engine.types.L3_OUTCOMES``：
+    #: ok / reasoning_fallback / not_reached / skipped /
+    #: fail_open / fail_closed / failed_but_blocked / circuit_open。
+    l3_outcome: str = Field(
+        default="",
+        description="L3 outcome: ok|reasoning_fallback|not_reached|skipped|"
+                    "fail_open|fail_closed|failed_but_blocked|circuit_open",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -171,6 +206,8 @@ class HealthResponse(BaseModel):
         description="Reasons the service is degraded (empty when healthy)",
     )
     version: str = Field(default=__version__, description="Service version")
+    #: 实际监听端口（2026-11）。端口被占用自动漂移后，调用方从这里/health 得知新端口。
+    port: int = Field(default=0, description="Actual listening port (0 = unknown/not reported)")
     # 归属实例标识：值来自 env AGENT_MOSS_INSTANCE（spawn/systemd 注入），默认空串。
     # 多个 agentmoss 同机并存时，调用方按 instance 过滤避免连到别人的进程。
     # 空=未配置（独立部署或旧版），调用方可选择兼容或严格过滤。

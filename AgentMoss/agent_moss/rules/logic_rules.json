@@ -69,5 +69,77 @@
     "rsync"
   ],
   "_source_arg_commands_comment": "第一个位置参数是「源文件」的命令：源在敏感目录 → 视为读取。",
-  "_reused": "不重复存的两组：① 写/删命令词边界正则 = platform_traits.json 的 write_command_res（逐字相同）；② 工具排除前缀 = heuristic_rules.json 的 sensitive_excluded_prefixes（逐字相同）；③ 临时目录名单 = heuristic_rules.json 的 temp_dirs（L1/L2 共用一份）。"
+  "single_file_write_tools": [
+    "write",
+    "file_write",
+    "writefile",
+    "edit",
+    "file_edit",
+    "editfile",
+    "searchreplace"
+  ],
+  "_single_file_write_tools_comment": "单文件写工具（action_type 已转小写）：语义是「把声明的内容写到声明的一个路径」。read_before_write 对它们只取工具声明的路径（command 第一个路径 / JSON 的 file_path|filePath|path），不扫 content —— 否则内容正文里的路径会被误当成写目标。bash 类工具不走这条（重定向目标可能不在第一个）。",
+  "precise_edit_write_tools": [
+    "edit",
+    "file_edit",
+    "editfile",
+    "searchreplace",
+    "search_replace"
+  ],
+  "_precise_edit_write_tools_comment": "精确编辑工具（action_type 按后缀匹配）：只替换 oldString/局部片段，不重写整个文件。read_before_write 对它们只要求「读过」（部分读也算），不要求读到文件末尾 —— 模型读到 oldString 所在片段就能精确编辑；按整文件覆盖的标准要求全量读会误报（2026-11 鸿蒙实测：readFile 带 offset/limit 读一段后 editFile 被拦）。整文件覆盖工具（writefile）仍要求全量读。",
+  "_reused": "不重复存的两组：① 写/删命令词边界正则 = platform_traits.json 的 write_command_res（逐字相同）；② 工具排除前缀 = heuristic_rules.json 的 sensitive_excluded_prefixes（逐字相同）；③ 临时目录名单 = heuristic_rules.json 的 temp_dirs（L1/L2 共用一份）。",
+  "protected_write_prefixes": [
+    "/etc/",
+    "/usr/",
+    "/bin/",
+    "/sbin/",
+    "/lib/",
+    "/lib64/",
+    "/boot/",
+    "/opt/",
+    "/root/",
+    "/var/",
+    "/srv/",
+    "/sys/",
+    "/proc/",
+    "/dev/",
+    "/run/"
+  ],
+  "_protected_write_prefixes_comment": "追加豁免的例外：系统目录里的追加仍要求先读（>> /etc/hosts 是典型后门）。普通工作区/临时目录的追加不要求先读。",
+  "protected_home_entries": [
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config",
+    ".kube",
+    ".docker",
+    ".npmrc",
+    ".netrc",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_history",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".gitconfig",
+    ".git-credentials",
+    ".vimrc",
+    ".wgetrc",
+    ".curlrc"
+  ],
+  "_protected_home_entries_comment": "家目录下第一层条目的追加豁免例外（~/.ssh/authorized_keys、~/.bashrc 等写后门高发位置）。",
+  "write_intent_keywords": [
+    "写入",
+    "写文件",
+    "写进",
+    "保存",
+    "生成文件",
+    "导出",
+    "输出到",
+    "append",
+    "write",
+    "save",
+    "export",
+    "generate"
+  ]
 }
