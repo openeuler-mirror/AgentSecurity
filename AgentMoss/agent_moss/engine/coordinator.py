@@ -258,12 +258,15 @@ class AgentMossBot:
             script_chain_result = analyze_script_content(
                 _l15_action_type, _l15_action_detail, command_scanner=_scanner,
                 cwd=cwd,
+                # L1 关闭时继续追踪子脚本（不因 critical 短路），线索留给 L2/L3。
+                stop_on_critical=heuristic_enabled,
             )
             # ⚠️ 「脚本存在但内容读不了」（超过大小上限 / 权限）**不能当安全放行**：
             # 否则把恶意脚本用注释撑到 2MB 就能让整个内容扫描静默跳过（实测
             # `bash huge2mb.sh`（末尾 rm -rf /）→ Deny 变 Allow）。这与「脚本不存在」
             # 本质不同：后者跑也跑不起来。客户可用 AGENT_MOSS_SCRIPT_MAX_FILE_SIZE 放宽。
-            if script_chain_result and script_chain_result.nodes:
+            # 关闭 L1 时仅关闭本层拒绝，脚本内容与风险线索仍供 L2/L3 使用。
+            if heuristic_enabled and script_chain_result and script_chain_result.nodes:
                 for node in script_chain_result.nodes:
                     if getattr(node, "unanalyzable", False):
                         violated_layers.append("L1.2")
@@ -736,6 +739,14 @@ class AgentMossBot:
                 )
             except Exception as e:
                 logger.warning("LLM 分析异常: %s", e)
+                # 熔断打开 ≠ 调用失败：前者连请求都没发（上游早就判定不可用），
+                # 后者是真去调了但失败。两者对运维的含义不同，source 分开。
+                from ..infra.llm_client import LLMCircuitOpenError
+                _l3_fail_source = (
+                    "llm_circuit_open"
+                    if isinstance(e, LLMCircuitOpenError)
+                    else "llm_failure_fallback"
+                )
                 # 前两层已拦截 → 无论 fail_mode 都 Deny
                 if violated_layers:
                     return SecurityJudgment(
@@ -758,7 +769,7 @@ class AgentMossBot:
                         allowed=True,
                         reason=f"LLM 分析失败（warn-allow，fail_open）: {e}",
                         risk_level="low",
-                        source="llm_failure_fallback",
+                        source=_l3_fail_source,
                         action_desc=a_next.get("action_detail", ""),
                         violated_layers=violated_layers,
                     )
@@ -766,7 +777,7 @@ class AgentMossBot:
                     allowed=False,
                     reason=f"LLM 分析失败，因无法完成深度语义分析，按 fail-closed 原则拒绝: {e}",
                     risk_level="medium",
-                    source="llm_failure_fallback",
+                    source=_l3_fail_source,
                     action_desc=a_next.get("action_detail", ""),
                 )
             if not llm_judgment.allowed:

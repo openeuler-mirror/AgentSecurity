@@ -569,6 +569,32 @@ class TestLayer1And2:
             ("logic-27-sed-inplace-rbw-deny.json", dict(decision="Deny", risk_level="high")),
             # M13 看护：file_write 工具覆写已存在未读文件（裸路径非 bash 文本也走 rbw）
             ("logic-30-file-write-rbw-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：历史写动作的参数/正文含 open 不算读（修 /tmp/opendesk-* 路径漏报）
+            ("logic-35-rbw-history-write-json-open-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-36-rbw-history-bash-write-open-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：部分读（head/grep/sed 范围/cat|head）不算全量读，覆盖仍拦
+            ("logic-38-rbw-history-head-partial-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-40-rbw-history-grep-partial-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-41-rbw-history-sed-range-partial-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-42-rbw-history-cat-pipe-head-partial-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-44-rbw-tar-c-existing-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：RBW/意图误报修正的反向看护（放行项在 Allow 列表 45-51）
+            ("logic-52-rbw-real-redirect-still-deny.json", dict(decision="Deny", risk_level="critical")),
+            ("logic-53-intent-real-delete-still-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：指代前文（"看上一句"/"根据之前说的办"）按前文意图判定
+            ("logic-55-intent-reference-prior-prompt-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-56-intent-reference-earlier-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11 意图矩阵：写意图→删除（补漏报）、删意图→覆盖
+            ("logic-58-intent-write-to-delete-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-63-intent-delete-to-overwrite-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：写文件内容按语言分析 —— 脚本里的真实危险调用仍拦
+            ("deny-write-sh-command-subst.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-write-py-os-system.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-write-sh-curl-bash.json", dict(decision="Deny", risk_level="high")),
+            ("deny-write-py-fstring.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-write-sh-space-path.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-bash-pipe-bash.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-bash-unquoted-heredoc.json", dict(decision="Deny", risk_level="critical")),
             # 脚本分支感知命中：bash deploy.sh clean 走危险分支（需 script_branch_cwd fixture 的 deploy.sh）
             ("script-branch-deny-clean.json", dict(decision="Deny", risk_level="critical")),
             # Python 脚本分支感知命中：python3 deploy.py clean 走危险分支（需 python_script_branch_cwd fixture 的 deploy.py）
@@ -709,6 +735,8 @@ class TestLayer1And2:
             ("deny-786-py-inline-open-shadow.json", dict(decision="Deny", risk_level="critical")),
             # 2026-11：grep 引号模式串误报修复的正向对照（引号外真实管道仍拦）
             ("deny-787-grep-pipe-real-passwd.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：检索命令引号剥离的正向对照（rg --pre 预处理器参数会被执行，仍拦）
+            ("deny-788-rg-pre-exec-payload.json", dict(decision="Deny", risk_level="high")),
             ("combo-listener-exec-cred-deny.json", dict(decision="Deny", risk_level="critical")),
             ("combo-listener-exec-exfil-deny.json", dict(decision="Deny", risk_level="critical")),
             ("combo-listener-exec-persist-deny.json", dict(decision="Deny", risk_level="high")),
@@ -829,6 +857,43 @@ class TestLayer1And2:
             ("logic-31-file-write-new-file-allow.json", dict(decision="Allow", risk_level="low")),
             # 2026-11：heredoc 内 XML 闭合 /> 被误当重定向写（read_before_write 误报）
             ("logic-32-rbw-heredoc-xml-close-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：追加不破坏原内容 —— >> / tee -a 到普通路径不要求先读
+            ("logic-33-rbw-bash-append-normal-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-34-rbw-tee-append-normal-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：修复历史读判定后，真读（cat）后写仍放行
+            ("logic-37-rbw-history-bash-read-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：head 覆盖行数超过小文件总行数 → 视为全量读（防误报）
+            ("logic-39-rbw-history-head-small-file-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-43-rbw-tar-c-source-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：RBW/意图误报修正（精确编辑/写后编辑/变量赋值/heredoc/目录/内容词）
+            ("logic-45-rbw-editfile-partial-read-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-46-rbw-editfile-after-write-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-47-rbw-var-assign-not-write-target-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-48-rbw-heredoc-body-not-write-target-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-49-rbw-directory-target-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-50-intent-content-delete-word-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-51-intent-grep-pattern-delete-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：意图判定看当前 prompt，长会话旧意图不污染
+            ("logic-54-intent-current-prompt-priority-allow.json", dict(decision="Allow", risk_level="low")),
+            # 指代回退有歧义（历史意图冲突）→ 不猜，放行交 L3
+            ("logic-57-intent-reference-ambiguous-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11 意图矩阵：写意图/删意图/追加/意图不明各组
+            ("logic-59-intent-write-to-create-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-60-intent-write-to-overwrite-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-61-intent-delete-to-delete-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-62-intent-delete-to-create-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-64-intent-read-to-append-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-65-intent-unknown-delete-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：写文件内容按语言分析 —— 文档/字面量/quoted heredoc 不误拦
+            ("allow-write-md-backtick.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-md-dollar-paren.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-sh-quoted-heredoc.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-sh-single-quote.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-sh-comment.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-py-string.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-md-space-path.json", dict(decision="Allow", risk_level="low")),
+            ("allow-bash-single-quote.json", dict(decision="Allow", risk_level="low")),
+            ("allow-bash-quoted-heredoc.json", dict(decision="Allow", risk_level="low")),
             # L1 缺口补齐放行用例（每条规则配一个不命中的放行变体）
             ("allow-53-rm-single.json", dict(decision="Allow", risk_level="low")),
             ("allow-54-group-read.json", dict(decision="Allow", risk_level="low")),
@@ -1332,6 +1397,8 @@ class TestLayer1And2:
             ("allow-1124-py-inline-os-system-ls.json", dict(decision="Allow", risk_level="low")),
             # 2026-11：grep 搜索模式串里的 |passwd 是正则或关系，非管道改密
             ("allow-1125-grep-pattern-pipe-passwd.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11 鸿蒙压测：rg 检索 remove|delete + --glob "*.py" 是只读检索，非批量误删
+            ("allow-1126-rg-search-delete-pattern.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-scan-allow.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-cred-allow.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-exfil-allow.json", dict(decision="Allow", risk_level="low")),
@@ -1737,6 +1804,46 @@ class TestLogicRules:
         })
         assert result.hit
         assert result.risk_type == "file_access"
+
+    def test_rbw_append_to_existing_normal_file_allowed(self, tmp_path):
+        """追加到普通已有文件不要求先读（append 不破坏原内容）。"""
+        target = tmp_path / "append.log"
+        target.write_text("old\n", encoding="utf-8")
+        result = self.checker._check_read_before_write(
+            [], {"action_type": "bash", "action_detail": f"echo x >> {target}"}, "",
+        )
+        assert not result.hit, result.reason
+
+    def test_rbw_tee_append_to_existing_normal_file_allowed(self, tmp_path):
+        """tee -a 追加到普通已有文件同样豁免。"""
+        target = tmp_path / "tee-append.log"
+        target.write_text("old\n", encoding="utf-8")
+        result = self.checker._check_read_before_write(
+            [], {"action_type": "bash", "action_detail": f"echo x | tee -a {target}"}, "",
+        )
+        assert not result.hit, result.reason
+
+    def test_rbw_append_to_protected_path_still_denied(self, tmp_path):
+        """受保护路径追加仍要求先读（>> /etc/hosts 是后门写法）。"""
+        result = self.checker._check_read_before_write(
+            [], {"action_type": "bash", "action_detail": "echo '127.0.0.1 evil' >> /etc/hosts"}, "",
+        )
+        assert result.hit
+        assert result.risk_type == "read_before_write"
+
+    def test_rbw_writefile_append_mode_allowed(self, tmp_path):
+        """OpenDesk writeFile 的 append 模式（command 带「(追加)」）走追加豁免。"""
+        target = tmp_path / "opendesk-append.log"
+        target.write_text("old\n", encoding="utf-8")
+        result = self.checker._check_read_before_write(
+            [],
+            {
+                "action_type": "filemgr-writeFile",
+                "action_detail": f"写入文件: {target} (追加) — new line",
+            },
+            "",
+        )
+        assert not result.hit, result.reason
 
     def test_password_consent_denied_when_user_never_answered(self):
         """提问正文相关但没上报 output → 仍拦截（弱授权已取消，2026-10）。

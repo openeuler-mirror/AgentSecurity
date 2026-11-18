@@ -1,6 +1,7 @@
 """L1 小型名单的单一事实源看护（2026-10 从代码搬进 JSON）。
 
-`rules/heuristic_rules.json` 里的三组名单原先硬编码在 `engine/heuristic.py`：
+`rules/heuristic_rules.json` 里的三组名单原先硬编码在 `engine/heuristic.py` 与
+`ts/src/engine/heuristic.ts`：
 
 - `sensitive_excluded_prefixes`（5）：敏感路径检测跳过的非文件工具前缀
 - `search_action_prefixes`（6）+ `search_action_exact`（4）：搜索类工具（其
@@ -9,6 +10,7 @@
 
 搬家原则是**判定零变化**，故这里守计数、内容，以及三处判定的实际结果。
 
+TS 对照：`ts/src/__tests__/heuristic-rules-sync.test.ts`。
 """
 from __future__ import annotations
 

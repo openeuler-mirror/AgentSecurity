@@ -10,6 +10,7 @@
 4. **任意文件写**：`metadata.llm_log_path` 指向任意路径 → 修复后被拒绝。
 5. **缓存投毒**：`/tmp` 下的缓存目录被换成符号链接 → 修复后回退私有目录。
 
+TS 对照：``ts/src/__tests__/security-hardening.test.ts``（1、2、3）。
 """
 from __future__ import annotations
 

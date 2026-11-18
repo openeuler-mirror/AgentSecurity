@@ -1,7 +1,8 @@
 """脚本分析词表的单一事实源看护（2026-10 从代码搬进 JSON）。
 
-`rules/script_rules.json` 里的数据原先**两份**副本硬编码在
-`engine/script_content_analyzer.py`、`engine/script_analyzer.py`。
+`rules/script_rules.json` 里的数据原先**四份**副本硬编码在
+`engine/script_content_analyzer.py`、`engine/script_analyzer.py` 与
+`ts/src/engine/script-content-analyzer.ts`、`ts/src/engine/script-analyzer.ts`。
 搬家原则是**判定零变化**，故这里守：
 
 1. 计数与内容稳定；
@@ -10,6 +11,7 @@
    后者只认 .sh）—— 换错会直接改变脚本路径提取；
 4. 组合规则里 `$network_post` 这类引用能正确展开。
 
+TS 对照：`ts/src/__tests__/script-rules-sync.test.ts`。
 """
 from __future__ import annotations
 

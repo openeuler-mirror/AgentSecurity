@@ -2,6 +2,7 @@
   "_comment": [
     "平台行为特征（Platform Traits）—— 双端共用的单一事实源。",
     "Python: agent_moss/profiles/*.py  ← rules_loader.load_platform_traits()",
+    "TS:     ts/src/engine/platform-traits.ts ← rules-loader.loadPlatformTraits()",
     "",
     "这些不是『检测规则』而是『放行/豁免的边界』，直接决定判定的宽严，改动务必谨慎：",
     "  fully_safe_commands            首段命令命中 → 跳过 L2 + L3",
@@ -14,7 +15,8 @@
     "",
     "macos / harmony 继承 linux（同为类 Unix 命令集），只写 inherits 即可。",
     "列表类字段保持顺序（与源码一致）；集合类字段（read_only_commands / safe_action_types /",
-    "readonly_sensitive_action_types）已按字典序排列 —— 仅做成员判断，顺序无语义。"
+    "readonly_sensitive_action_types）已按字典序排列 —— 仅做成员判断，顺序无语义。",
+    "改动后自查：python3 -m pytest tests/test_platform_traits.py"
   ],
   "_schema": 1,
   "linux": {

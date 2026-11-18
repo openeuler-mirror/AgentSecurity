@@ -359,6 +359,7 @@ def read_script_content(
 def scan_script_chain_with_l1(
     chain_result: ScriptChainAnalysisResult,
     command_scanner,
+    stop_on_critical: bool = True,
 ) -> ScriptChainAnalysisResult:
     """对脚本调用链中每个节点的预处理内容做 L1 CommandPatternScanner 扫描。
 
@@ -383,8 +384,10 @@ def scan_script_chain_with_l1(
 
             if l1_result.risk_level == "critical":
                 chain_result.has_critical = True
-                chain_result.first_hit_node = node
-                break
+                if chain_result.first_hit_node is None:
+                    chain_result.first_hit_node = node
+                if stop_on_critical:
+                    break
 
     return chain_result
 
@@ -407,8 +410,8 @@ def scan_script_chain_with_l2(
     for node in chain_result.nodes:
         if node.error or not node.preprocessed_content:
             continue
-        if node.l1_risk_level == "critical":
-            break
+        # L1 关闭时其扫描信号仍会保留，不能据此跳过独立启用的 L2。
+        # L1 已拒绝的动作由 coordinator 提前返回，不会进入这里。
 
         virtual_a_next = {
             "action_type": "bash",
@@ -517,6 +520,7 @@ def analyze_script_content(
     action_detail: str,
     command_scanner=None,
     cwd: str = "",
+    stop_on_critical: bool = True,
 ) -> ScriptChainAnalysisResult:
     """分析脚本内容（递归追踪 + 预处理 + L1/L2 扫描）。
 
@@ -534,6 +538,7 @@ def analyze_script_content(
         action_detail: 动作详情（命令）
         command_scanner: CommandPatternScanner 实例（AgentMoss 中 OS Profile 驱动，
             由 coordinator 注入）。为 None 时跳过 L1 扫描（仅做关键词扫描）。
+        stop_on_critical: L1 是否会直接拒绝；关闭时继续追踪子脚本供 L2/L3 分析。
 
     Returns:
         ScriptChainAnalysisResult: 调用链完整分析结果
@@ -557,7 +562,9 @@ def analyze_script_content(
     # RecursiveTracker 消费 ShellBackend 的 IR：case/if 控制流切片 + 子脚本
     # 调用参数传递（修复子调用参数丢失 + 深层链漏追踪）。
     from .script_engine.tracker import RecursiveTracker
-    tracker = RecursiveTracker(command_scanner=command_scanner)
+    tracker = RecursiveTracker(
+        command_scanner=command_scanner, stop_on_critical=stop_on_critical,
+    )
     chain_result = tracker.track(
         entry_path=script_path,
         entry_args=None if is_inline else script_args,
@@ -569,7 +576,7 @@ def analyze_script_content(
 
     # L1 兜底扫描：递归过程中已内联扫描的命中节点（l1_hit）跳过，其余补扫
     if command_scanner is not None:
-        scan_script_chain_with_l1(chain_result, command_scanner)
+        scan_script_chain_with_l1(chain_result, command_scanner, stop_on_critical)
 
     # 关键词扫描（兼容 L3）
     scan_script_chain_keywords(chain_result)
@@ -583,27 +590,47 @@ def analyze_script_content(
 def format_script_chain_for_prompt(chain_result: ScriptChainAnalysisResult) -> str:
     """将脚本调用链分析结果格式化为 LLM prompt 可用的文本。
 
-    - L1/L2 已命中的节点不会走到 L3（在 coordinator 中直接 Deny），不在此展示。
+    - 静态层关闭或未据此拒绝时，保留已命中的规则线索供 L3 判断。
     - 有可疑信号（关键词命中但 L1/L2 未拦截）的节点：输出可疑内容供 L3 深度判断。
-    - 全部节点均无危险/可疑信号（即"安全脚本"）：输出"已分析、未发现危险"明确结论
-      + 内容预览，给 LLM 一个判 Allow 的依据。
+    - 读取失败的节点逐项保留路径与原因，提示调用链分析不完整。
+    - 全部节点成功读取且均无危险/可疑信号时，输出未命中结论与内容预览。
     """
     if not chain_result.nodes:
         return ""
 
+    budget_warning = ""
+    if chain_result.max_depth_reached:
+        budget_warning += "⚠️ 注意：递归追踪触达深度上限，可能存在更深层的脚本调用未被扫描。\n"
+    if chain_result.max_size_reached:
+        budget_warning += "⚠️ 注意：累计文件大小触达上限，部分脚本可能未被完整读取。\n"
+
     error_nodes = [n for n in chain_result.nodes if n.error]
-    if error_nodes and len(chain_result.nodes) == 1:
-        return f"⚠️ 脚本内容分析失败: {error_nodes[0].error}"
+    error_warning = ""
+    if error_nodes:
+        error_parts = [
+            "⚠️ 脚本调用链分析不完整，无法确认整个调用链的安全性；"
+            "以下脚本内容未被扫描："
+        ]
+        for node in error_nodes:
+            error_parts.append(
+                f"   脚本路径: {node.script_path}（递归深度 {node.depth}）\n"
+                f"   失败原因: {node.error}"
+            )
+        error_warning = "\n".join(error_parts) + "\n"
 
     suspicious_nodes = [
         n for n in chain_result.nodes
-        if n.is_suspicious and not n.l1_hit and not n.l2_hit
+        if not n.error and (n.is_suspicious or n.l1_hit or n.l2_hit)
     ]
     if not suspicious_nodes:
         safe_nodes = [n for n in chain_result.nodes if not n.error]
         if not safe_nodes:
-            return ""
-        parts = ["✓ 脚本内容已分析，未发现危险/可疑操作（L1/L2/关键词扫描均未命中）："]
+            return budget_warning + error_warning
+        parts = [
+            "已读取的脚本内容未命中危险/可疑规则（仅覆盖成功读取的节点）："
+            if error_nodes else
+            "✓ 脚本内容已分析，未发现危险/可疑操作（L1/L2/关键词扫描均未命中）："
+        ]
         for node in safe_nodes:
             preview = (node.preprocessed_content or "")[:600]
             if len(node.preprocessed_content or "") > 600:
@@ -613,16 +640,28 @@ def format_script_chain_for_prompt(chain_result: ScriptChainAnalysisResult) -> s
                 f"   脚本路径: {node.script_path}（递归深度 {node.depth}，{node.line_count} 行）"
                 f"\n   内容（预处理后）:\n```\n{preview}\n```"
             )
-        return "\n".join(parts)
+        # 已扫描部分没有疑点，并不表示被预算跳过的脚本也安全。
+        return budget_warning + error_warning + "\n".join(parts)
 
     parts = []
     for node in suspicious_nodes:
         keywords_str = ", ".join(node.matched_keywords)
+        signal_label = "可疑信号" if node.l1_hit or node.l2_hit else "可疑关键词"
 
         risk_hint = ""
+        static_hints = []
+        if node.l1_hit:
+            static_hints.append(f"L1 规则线索（{node.l1_risk_level}）: {node.l1_reason}")
+        if node.l2_hit:
+            static_hints.append(f"L2 规则线索（{node.l2_risk_level}）: {node.l2_reason}")
+        if static_hints:
+            risk_hint = (
+                "\n\n⚠️ 脚本静态分析发现以下线索（不表示对应层已执行拒绝）：\n"
+                + "\n".join(static_hints)
+            )
         if node.keyword_risk_level and node.keyword_risk_reason:
             risk_level_upper = node.keyword_risk_level.upper()
-            risk_hint = (
+            risk_hint += (
                 f"\n\n🔴 **风险评估**: {risk_level_upper} 级别\n"
                 f"**风险原因**: {node.keyword_risk_reason}\n"
                 f"**建议**: 此脚本应被拒绝（Deny），除非有明确的业务需求且已确认目标服务器可信。"
@@ -633,7 +672,7 @@ def format_script_chain_for_prompt(chain_result: ScriptChainAnalysisResult) -> s
             content_preview += "\n... (截断，完整内容 {} 字符)".format(len(node.preprocessed_content))
 
         parts.append(
-            f"⚠️ 脚本内容包含可疑关键词:\n"
+            f"⚠️ 脚本内容包含{signal_label}:\n"
             f"   脚本路径: {node.script_path}\n"
             f"   递归深度: {node.depth}\n"
             f"   可疑关键词: {keywords_str}\n"
@@ -642,17 +681,16 @@ def format_script_chain_for_prompt(chain_result: ScriptChainAnalysisResult) -> s
             f"### 脚本内容（预处理后）###\n```\n{content_preview}\n```\n"
         )
 
+    signal_label = (
+        "可疑信号" if any(n.l1_hit or n.l2_hit for n in suspicious_nodes)
+        else "可疑关键词"
+    )
     header = (
         f"⚠️ 检测到脚本执行链（共 {len(chain_result.nodes)} 个脚本），"
-        f"其中 {len(suspicious_nodes)} 个包含可疑关键词:\n"
+        f"其中 {len(suspicious_nodes)} 个包含{signal_label}:\n"
     )
 
-    if chain_result.max_depth_reached:
-        header += "⚠️ 注意：递归追踪触达深度上限，可能存在更深层的脚本调用未被扫描。\n"
-    if chain_result.max_size_reached:
-        header += "⚠️ 注意：累计文件大小触达上限，部分脚本可能未被完整读取。\n"
-
-    return header + "\n---\n\n".join(parts)
+    return header + budget_warning + error_warning + "\n---\n\n".join(parts)
 
 
 # ==================== 向后兼容（deprecated） ====================

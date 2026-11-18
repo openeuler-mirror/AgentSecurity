@@ -5,7 +5,10 @@
 - /api/v1/review seed 后返回前序链；
 - analyze 走 metadata[stateful_incremental]=true 时，若当前动作补全
   历史前序链 → 补充 Deny（risk_type=formal_verification）；未启用 → 零回归。
-本文件测 Python 侧入口行为（含 `/review` 回退用状态库累积节点、violations 带 path）。
+双端镜像：TS 也有 HTTP 服务（`ts/src/routes.ts` 的 `reviewRoute` / analyze 的
+`metadata.stateful_incremental`），本文件测 Python 侧；TS 侧入口行为由
+`ts/src/__tests__/http-entrypoint-parity.test.ts` 覆盖（含 `/review` 回退用状态库
+累积节点、violations 带 path），引擎语义一致性由 `formal-stateful.test.ts` 覆盖。
 """
 
 import pytest

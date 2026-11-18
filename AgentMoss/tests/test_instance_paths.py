@@ -1,6 +1,6 @@
 """instance 数据目录隔离 + 数据归属用户 的单元测试。
 
-验证：
+对齐 TS ts/src/infra/paths.test.ts。验证：
 - 无 instance → <data_root>/agent_moss_token_stats.json
 - 有 instance → <data_root>/<instance>/agent_moss_token_stats.json
 - AGENT_MOSS_DATA_DIR 覆盖数据根（root 服务写当前用户目录）

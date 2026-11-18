@@ -1,8 +1,10 @@
 """FastAPI application entry point for AgentMoss HTTP API server."""
 
 import asyncio
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -622,9 +624,11 @@ def _find_free_port(start_port: int, host: str = "127.0.0.1", scan: int = 100) -
     端口，配合 bridge.py 探测兜底，保证服务总能起来且消费方能连上。
     """
     import socket
+    # IPv6 地址（含冒号，如 ::1/::）必须用 AF_INET6 探测，否则永远 bind 失败。
+    family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
     for candidate in range(start_port, start_port + scan):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((host, candidate))
                 if candidate != start_port:
@@ -636,6 +640,30 @@ def _find_free_port(start_port: int, host: str = "127.0.0.1", scan: int = 100) -
             # 端口被占，试下一个
             continue
     return start_port
+
+
+def _write_port_file(port: int) -> None:
+    """把**实际监听端口**写到数据目录，供调用方发现。
+
+    端口被占用自动漂移后，调用方（agent/bridge）必须知道新端口，否则连不上。
+    文件内容为 JSON：``{"port": <实际端口>, "pid": <进程号>, "started_at": <UTC>}``。
+    写失败只记日志（调用方仍可用配置端口或 health 探测）。
+    """
+    try:
+        from ..infra.paths import get_data_root
+        path = get_data_root() / "agent_moss_server.port.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "port": port,
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        logger.info("端口文件已写入: %s (port=%d)", path, port)
+    except Exception:  # noqa: BLE001 — 端口发现是附加能力，失败不影响服务
+        logger.warning("写端口文件失败（调用方需自行配置端口）", exc_info=True)
 
 
 def run_server(
@@ -660,6 +688,9 @@ def run_server(
     else:
         import uvicorn
         actual_port = _find_free_port(port, host)
+        # health 接口通过环境变量回报实际端口（多 worker 各自进程也能读到）。
+        os.environ["AGENT_MOSS_ACTUAL_PORT"] = str(actual_port)
+        _write_port_file(actual_port)
         logger.info("Starting AgentMoss HTTP server on %s:%d (workers=%d)", host, actual_port, workers)
         _common = dict(
             host=host, port=actual_port, log_level="info",

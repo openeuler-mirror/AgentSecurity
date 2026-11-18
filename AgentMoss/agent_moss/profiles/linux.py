@@ -107,6 +107,7 @@ class LinuxProfile(OSProfile):
                 dangerous_actions=p["dangerous_actions"],
                 reason=p["reason"],
                 os=str(p.get("os") or "linux").lower(),
+                allow_if_write_intent=bool(p.get("allow_if_write_intent")),
             )
             for p in pats
             if str(p.get("os") or "linux").lower() in self.accepted_os

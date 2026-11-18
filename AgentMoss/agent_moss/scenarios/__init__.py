@@ -23,8 +23,9 @@ extra_sensitive_paths / builtin_safe_skills / builtin_safe_action_types），
         # 把 ext.extra_command_patterns 追加到 agent_ext/通用规则之后
         ...
 
-规则存放于 rules.json：
+Python 与 TypeScript 两端共享同一份 rules.json：
 - py: agent_moss/scenarios/__init__.py:get_scenario_extensions
+- ts: ts/src/scenarios/index.ts:getScenarioExtensions
 
 无 scenario_id 或 rules.json 不存在时返回 None（通用模式）。
 """

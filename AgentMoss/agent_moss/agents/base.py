@@ -1,7 +1,8 @@
 """三方 agent 定制化扩展 — 数据载体
 
 `AgentExtensions` 描述某个宿主 agent（xiaoO / opencode / opendesk）在通用安全规则
-之上需要追加的专属规则。规则以 JSON 单一事实源存储（agent_moss/agents/<id>/rules.json）。
+之上需要追加的专属规则。规则以 JSON 单一事实源存储（agent_moss/agents/<id>/rules.json），
+Python 与 TypeScript 两端共享同一份文件。
 
 设计原则：
 - 所有字段以 `extra_` 为前缀，表示"追加到通用规则之后"，不覆盖通用规则。
@@ -53,8 +54,13 @@ class AgentExtensions:
     extra_sensitive_paths: list[SensitivePath] = field(default_factory=list)
     builtin_safe_skills: list[str] = field(default_factory=list)
     # agent 专属"完全安全操作"白名单（精确名或前缀，前缀以 '-' 结尾）→ 跳过 L2+L3。
-    # 前缀匹配（如 "memory-"）走 startswith，精确名走 ==。
+    # 对齐 TS ts/src/agents/types.ts。前缀匹配（如 "memory-"）走 startswith，精确名走 ==。
     builtin_safe_action_types: list[str] = field(default_factory=list)
+    # agent 专属「单文件写工具」名（小写，精确匹配 action_type）。这些工具的语义是
+    # 「把声明的内容写到声明的一个路径」，read_before_write 只取声明路径、不扫 content。
+    # 通用名单在 rules/logic_rules.json 的 single_file_write_tools；这里只放宿主独占的工具名
+    # （如 OpenDesk 的 filemgr-writeFile），避免把宿主专属命名写进通用规则。
+    extra_single_file_write_tools: list[str] = field(default_factory=list)
     extra_skills: list[dict] = field(default_factory=list)
 
     @classmethod
@@ -85,6 +91,9 @@ class AgentExtensions:
             ],
             builtin_safe_action_types=[
                 t for e in non_null for t in e.builtin_safe_action_types
+            ],
+            extra_single_file_write_tools=[
+                t for e in non_null for t in e.extra_single_file_write_tools
             ],
             extra_skills=[
                 sk for e in non_null for sk in e.extra_skills
@@ -153,5 +162,8 @@ class AgentExtensions:
             extra_sensitive_paths=extra_sensitive_paths,
             builtin_safe_skills=data.get("builtin_safe_skills", []),
             builtin_safe_action_types=data.get("builtin_safe_action_types", []),
+            extra_single_file_write_tools=[
+                str(t).lower() for t in data.get("extra_single_file_write_tools", [])
+            ],
             extra_skills=data.get("extra_skills", []),
         )

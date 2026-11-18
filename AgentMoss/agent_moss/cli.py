@@ -109,7 +109,7 @@ def cmd_analyze(args):
     os_type = data.get("os_type", "")
     profile = get_profile(os_type)
 
-    # ⚠️ agent_id / scenario_id / cwd 必须透传。
+    # ⚠️ agent_id / scenario_id / cwd 必须透传 —— 与 TS CLI（ts/src/cli.ts）对齐。
     # 历史 bug：Python CLI 只传 5 个参数，于是**同一个输入文件两端判定不同**：
     #   - agent_id 缺失  → agent 专属规则（xiaoo/opendesk 的 extra_command_patterns）不加载
     #   - scenario_id 缺失 → 场景定制规则（bank 沙箱边界）不加载
@@ -391,7 +391,7 @@ def main():
 
     init_parser = subparsers.add_parser("init", help="Generate input.json template")
     init_parser.add_argument("--output", "-o", help="Output file path", default=None)
-    # 位置参数形式也接受（`agent-moss init x.json` 的写法），两种都能用
+    # 位置参数形式也接受（TS 侧 `agent-moss init x.json` 的写法），双端两种都能用
     init_parser.add_argument("output_pos", nargs="?", default=None, help="Output file path（同 --output）")
 
     analyze_parser = subparsers.add_parser(

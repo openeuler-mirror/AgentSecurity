@@ -642,7 +642,7 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
 
         if isinstance(s, AssignStmt):
             # 变量表上限：脚本可以是自动生成/拼接的，几万个变量赋值会把
-            # 环境表一路撑大（超限返回 None 回退全文匹配）。
+            # 环境表一路撑大（TS 侧同款保护，超限返回 None 回退全文匹配）。
             if len(env) >= MAX_VARS:
                 return None
             # 赋值：右值求值写入 env

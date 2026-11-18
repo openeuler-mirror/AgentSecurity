@@ -5,6 +5,11 @@
   "extra_injection_keywords": [],
   "extra_sensitive_paths": [],
   "builtin_safe_skills": [],
+  "extra_single_file_write_tools": [
+    "filemgr-writefile",
+    "filemgr-editfile",
+    "filemgr-searchreplace"
+  ],
   "builtin_safe_action_types": [
     "memory-",
     "todomgr-",

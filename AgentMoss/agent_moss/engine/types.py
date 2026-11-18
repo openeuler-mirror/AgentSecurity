@@ -23,6 +23,44 @@ class SecurityJudgment:
     violation_chain: list = field(default_factory=list)
 
 
+#: L3（LLM 语义分析）本次的实际结局。对客户暴露的稳定枚举 ——
+#: 内部 ``source`` 有十几种取值且会随实现演进，不适合直接给调用方判断。
+L3_OUTCOMES = (
+    "ok",                   # L3 正常返回并被采纳
+    "reasoning_fallback",   # content 为空、判定取自 reasoning 类字段（判定仍有效）
+    "not_reached",          # L1/L2 已给出结论（拦截或白名单放行），未调用 L3
+    "skipped",              # L3 未启用（无 key / 层级开关关闭）
+    "fail_open",            # L3 调用失败，按 fail_open 放行（**能力降级**）
+    "fail_closed",          # L3 调用失败，按 fail_closed 拒绝（**能力降级**）
+    "failed_but_blocked",   # L3 调用失败，但前序层已拦截（结论不受影响）
+    "circuit_open",         # LLM 熔断器打开，未发起请求（**能力降级**）
+)
+
+
+def derive_l3_outcome(judgment: "SecurityJudgment") -> str:
+    """由 ``source`` / ``allowed`` 推导本次 L3 结局（供响应与指标使用）。
+
+    放在引擎侧而不是 server 侧：TS 与 Python 各自实现同一映射，两端口径一致
+    （对拍见 ``tests/parity`` 与 `dual-parity` 测试）。
+    """
+    src = (judgment.source or "").lower()
+    if src in ("llm", "llm_extracted"):
+        return "ok"
+    if src == "llm_reasoning_fallback":
+        return "reasoning_fallback"
+    if src == "llm_failure_fallback":
+        return "fail_open" if judgment.allowed else "fail_closed"
+    if src == "llm_circuit_open":
+        return "circuit_open"
+    if src == "llm_failure_with_violation":
+        return "failed_but_blocked"
+    if src in ("heuristic_and_logic_only", "disabled"):
+        return "skipped"
+    # whitelist_bypass / heuristic* / logic_rule* / formal_engine / brain_rule …
+    # 都是「前两层已给出结论，没轮到 L3」。
+    return "not_reached"
+
+
 @dataclass
 class HeuristicResult:
     """特征匹配检测结果"""

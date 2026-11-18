@@ -17,6 +17,7 @@
 - **设了** → **只认** `<root>/...`，缺文件就让各加载器报错，**绝不静默回退**到包内副本
   （否则客户以为在跑自家规则，实际跑的是内置那份）。
 
+TS 对照：`ts/src/__tests__/rules-root-gate.test.ts`。
 """
 from __future__ import annotations
 

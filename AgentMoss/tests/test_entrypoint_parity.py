@@ -4,7 +4,8 @@
 背景：双端在**引擎内部**判定一致（有 `tests/parity/corpus.json` 1401 条 +
 `tests/cases/**` 用例看护），但在**入口层**曾经各自丢字段或返回不同结构 ——
 引擎单测/parity 语料都照不到，因为它们是直接调 `analyze()` / `runAnalysis()`，
-绕过了路由映射。本文件守 Python 侧的入口层。
+绕过了路由映射。本文件守 Python 侧的入口层；TS 侧对应
+`ts/src/__tests__/http-entrypoint-parity.test.ts` 与 `console-routes.test.ts`。
 
 已修正并在此看护的分叉：
   1. Python HTTP ``/api/v1/analyze`` 丢 ``action_history[].output``

@@ -5,7 +5,8 @@
 > （`platform-traits.test.ts` 行为 / `platform-traits-sync.test.ts` 迁移看护）。
 
 **背景**：这批"放行/豁免边界"（只读白名单、写命令正则、意图关键词……）原先**硬编码**在
-`agent_moss/profiles/*.py`（Python）里，共 325 条、还有多处重复副本。
+`agent_moss/profiles/*.py`（Python）与 `ts/src/engine/platform-traits.ts` /
+`logic-rules.ts` / `coordinator.ts`（TS，散在三处）里，共 325 条、还有多处重复副本。
 2026-10 迁到 `rules/platform_traits.json`，为规则仓剥离铺路。
 
 **本文件守两件事**：

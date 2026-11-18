@@ -20,7 +20,7 @@ OpenDesk / 鸿蒙用的是 TS 版，等于场景约束在脚本里可绕。
 为什么用专门的测试而不是 `tests/cases/scenario/bank/*.json`：那批用例由
 `TestScenarioCases` 自动扫目录执行，**没有逐 case 注入 cwd 的机制**，脚本类用例
 （`bash x.sh`）找不到脚本 → 恒 Allow，等于没有看护。这里用显式 cwd 建临时脚本，
-断言逐条对齐。
+两端各一份、断言逐条对齐（TS 见 `ts/src/__tests__/script-scenario-ext.test.ts`）。
 """
 
 import logging

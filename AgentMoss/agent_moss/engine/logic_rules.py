@@ -18,17 +18,20 @@ _check_dangerous_patterns / _check_lateral_movement），供 script_content_anal
 """
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..profiles.base import OSProfile
     from ..agents.base import AgentExtensions
 
 from ..rules_loader import (
-    load_heuristic_rules, load_inline, load_logic_rules, load_platform_traits,
+    load_heuristic_rules, load_inline, load_l2, load_logic_rules, load_platform_traits,
 )
 from .types import LogicRuleResult
 
@@ -54,6 +57,446 @@ _NON_WRITE_TOOL_PREFIXES: tuple[str, ...] = tuple(
 _WRITE_CMDS: frozenset[str] = frozenset(_LOGIC_RULES.get("write_commands") or ())
 #: 首个位置参数是源文件的命令（源在敏感目录 → 视为读取）。
 _SOURCE_ARG_CMDS: frozenset[str] = frozenset(_LOGIC_RULES.get("source_arg_commands") or ())
+#: 单文件写工具（action_type 已转小写）：语义是「把声明的内容写到声明的一个路径」。
+#: read_before_write 对它们只取工具声明的路径，不扫 content —— 否则内容正文里的
+#: 路径（邮件正文 / 搜索结果 / 代码片段）会被误当成写目标（OpenDesk 实测误报根因）。
+_SINGLE_FILE_WRITE_TOOLS: frozenset[str] = frozenset(
+    _LOGIC_RULES.get("single_file_write_tools") or ()
+)
+#: 精确编辑工具（action_type 按后缀匹配）：只替换 oldString/局部片段，不重写整个
+#: 文件。read_before_write 对它们只要求「读过」（部分读也算），不要求读到文件末尾
+#: —— 模型读到 oldString 所在片段就能精确编辑；按整文件覆盖的标准要求全量读会误报
+#: （2026-11 鸿蒙实测：readFile 带 offset/limit 读一段后 editFile 被拦）。
+_PRECISE_EDIT_TOOLS: frozenset[str] = frozenset(
+    _LOGIC_RULES.get("precise_edit_write_tools") or ()
+)
+#: 解释器 heredoc 提示：`bash <<EOF` / `python <<'EOF'` 的正文会作为脚本执行，
+#: 不能按「数据」剥掉（与 written_content_analyzer.strip_shell_docs_only 一致）。
+_INTERP_HEREDOC_HINT_RE = re.compile(
+    r"(?:^|[\s;|&])(?:bash|sh|zsh|dash|python[0-9.]*|perl|ruby|node|php|lua)"
+    r"\s+(?:-\S*\s+)?<<-?\s*['\"]?[A-Za-z_]",
+    re.IGNORECASE,
+)
+#: quoted/普通 heredoc（非解释器）：`cat > f <<'PY' ... PY`。正文是数据，不参与
+#: 写目标/段解析 —— 否则正文里的变量赋值/路径被当成命令写目标。
+_HEREDOC_BODY_RE = re.compile(
+    r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n.*?\n\s*\2\s*(?:\n|$)",
+    re.DOTALL,
+)
+#: shell 变量赋值段：`VAR=/path`、`export VAR=/path`。值是数据/后续命令输入，
+#: 不是写操作；其路径不能当写目标（2026-11 鸿蒙实测：`SRC=/storage/.../Download`
+#: 被当成「写文件 Download」）。
+_SHELL_ASSIGN_RE = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _is_precise_edit_tool(
+    action_type: str, extra_tools: frozenset[str] = frozenset()  # noqa: ARG001 — 保留签名对称
+) -> bool:
+    """action_type 是否为精确编辑工具（editFile / searchReplace 等）。
+
+    只按通用精确编辑清单（`precise_edit_write_tools`）匹配，**不能**把
+    `extra_single_file_write_tools` 整体算进来 —— 那份清单同时含 writeFile
+    （整文件覆盖），算进来会让覆盖写也被当作精确编辑 → 部分读漏报
+    （2026-11 回归用例 logic-38/40/41/42 抓到）。宿主 agent 的 editFile 类工具
+    靠后缀（`-editfile`/`-searchreplace`）命中。
+    """
+    at = (action_type or "").lower()
+    return at in _PRECISE_EDIT_TOOLS or any(at.endswith(s) for s in _PRECISE_EDIT_TOOLS)
+
+
+def _is_full_overwrite_tool(
+    action_type: str, extra_tools: frozenset[str] = frozenset()
+) -> bool:
+    """action_type 是否为「整文件覆盖」写工具（write/writeFile，排除精确编辑）。"""
+    at = (action_type or "").lower()
+    tools = _SINGLE_FILE_WRITE_TOOLS | extra_tools
+    if not (at in tools or any(at.endswith(s) for s in tools)):
+        return False
+    return not _is_precise_edit_tool(at)
+
+
+def _strip_heredoc_body(text: str) -> str:
+    """剥掉非解释器 heredoc 的正文（保留命令头）。
+
+    解释器 heredoc（`bash <<EOF`）正文会执行，不剥。
+    """
+    if not text or _INTERP_HEREDOC_HINT_RE.search(text):
+        return text
+    return _HEREDOC_BODY_RE.sub("<<heredoc>>\n", text)
+
+
+def _is_directory_target(path: str) -> bool:
+    """写目标是否是目录：以 / 结尾，或磁盘上确实是目录。
+
+    `cp -r a b/`、`mkdir -p dir` 这类目标不是「覆盖文件内容」，不适用
+    read_before_write（2026-11 鸿蒙实测：`cp -p src dst/json/` 被要求先读目录）。
+    """
+    if not path:
+        return False
+    if path.endswith("/"):
+        return True
+    try:
+        return os.path.isdir(path)
+    except OSError:
+        return False
+#: 调用方没给出写目标时的占位写法（OpenDesk 旧版 hook 取错参数名，command 退化成
+#: `写入文件: ? — <content>`）。此时引擎无法得知真实写目标，绝不能拿 content 里的
+#: 路径凑数 —— 宁可不做本规则判定。
+_MISSING_WRITE_PATH_RE = re.compile(r"(?:写入文件|编辑文件|写入|编辑)\s*[:：]\s*\?")
+#: 声明路径的文本格式（OpenDesk filemgr command）：`写入文件: <path> — ...`
+_DECLARED_WRITE_PATH_RE = re.compile(
+    r"(?:写入文件|编辑文件|应用补丁|写入|编辑)\s*[:：]\s*([~./][^\s—|,;]+)"
+)
+#: JSON 参数里的路径键（调用方直接透传 args JSON 时）
+_DECLARED_WRITE_PATH_JSON_RE = re.compile(
+    r'"(?:file_path|filePath|path)"\s*:\s*"([^"]+)"'
+)
+#: 用户 prompt 里的「明确写意图」词。意图一致性规则的「查询→修改」分支在命中
+#: 这些词时跳过：用户原话「从 A 搜索，结果写入 B」本身就要求写，不是意图偏离。
+#: 只影响标注 allow_if_write_intent 的规则；「读取→删除」等分支不豁免。
+_WRITE_INTENT_KEYWORDS: tuple[str, ...] = tuple(
+    _LOGIC_RULES.get("write_intent_keywords") or ()
+)
+#: 「指代前文」的表达：当前这句本身没有独立意图，要按上一句/之前的话判断。
+#: 覆盖"继续/好的/嗯"（logic-21）、"你看下上一句"、"根据之前说的办"、"按刚才的来"
+#: 等所有要求参照前文的说法。匹配到才回退；有实质内容的新指令（如"执行自测指令.md"）
+#: 不匹配 → 不回退，避免被几小时前的旧意图污染（2026-11 鸿蒙实测误报）。
+_REFERENCE_PRIOR_RE = re.compile(
+    r"(?:继续|接着|好的?|可以|嗯+|ok|okay|go\s+on|continue|yes"
+    r"|看(?:一下|下)?上(?:一)?(?:句|条|段|轮|个|步)"
+    r"|根据(?:之前|刚才|上面|上一|前面)"
+    r"|按(?:之前|刚才|上面|上一|前面)"
+    r"|照(?:之前|刚才|上面|上一|前面)"
+    r"|如上|同上|同上一条|保持原样|照旧)",
+    re.IGNORECASE,
+)
+#: 指代前文时，最多回溯的历史 prompt 条数（覆盖"好的"→"根据之前"这类链，
+#: 又不至于翻到几小时前的旧任务）。
+_REFERENCE_LOOKBACK = 3
+#: 「执行外部指令」的表达：动作定义在文件/上一段里，prompt 本身看不出读/写/删。
+#: 含这类表达且没有明确删除意图时，视为意图不明（交 L3），不能因为顺带提了
+#: "读取 xxx 文件"就把意图判成只读（2026-11 鸿蒙实测：读自测指令→写周报被拦）。
+_EXEC_REFERENCE_RE = re.compile(
+    r"(?:执行|按要求|按指令|按文档|按这个文件|按上面的要求|照做|照着做)",
+    re.IGNORECASE,
+)
+
+#: 意图一致性判定矩阵（2026-11 重构，配置见 l2_rules.json::intent_matrix）。
+#: 意图类别（读/写/删，可多选）× 动作类别（读/新建/追加/覆盖/删除）：
+#: - 覆盖动作：意图含 write 才放行（读→覆盖、删→覆盖 都拦）；
+#: - 删除动作：意图含 delete 才放行（读→删、写→删 都拦）；
+#: - 读/新建/追加：永远放行（新建和追加不破坏任何已有内容）；
+#: - 意图提取不到：不判，放行交 L3。
+_L2_DATA = load_l2()
+_INTENT_MATRIX = (_L2_DATA.get("intent_matrix") or {})
+_INTENT_CATEGORIES: dict[str, tuple[str, ...]] = {
+    cat: tuple(kws or ())
+    for cat, kws in (_INTENT_MATRIX.get("categories") or {}).items()
+}
+_INTENT_REASONS: dict[str, str] = _INTENT_MATRIX.get("reasons") or {}
+_DELETE_ACTION_WORDS: tuple[str, ...] = tuple(_INTENT_MATRIX.get("delete_action_words") or ())
+_ALL_INTENT_KEYWORDS: tuple[str, ...] = tuple(
+    kw for kws in _INTENT_CATEGORIES.values() for kw in kws
+)
+
+
+def _intent_categories(text: str) -> set[str]:
+    """从 prompt 文本提取意图类别（read/write/delete，可多选）。"""
+    t = (text or "").lower()
+    out: set[str] = set()
+    for cat, kws in _INTENT_CATEGORIES.items():
+        if any(kw.lower() in t for kw in kws):
+            out.add(cat)
+    return out
+
+
+def _declared_write_paths(action_detail_raw: str, profile: "OSProfile") -> list[str]:
+    """单文件写工具：只返回工具声明的那一个写目标路径。
+
+    优先级：OpenDesk 文本格式（`写入文件: <path>`）> JSON 参数键
+    （file_path/filePath/path）> 第一个可提取路径（裸路径 / `write /path`）。
+    content 正文里出现的其他路径一律不返回。
+    """
+    m = _DECLARED_WRITE_PATH_RE.search(action_detail_raw)
+    if m:
+        return [m.group(1)]
+    m = _DECLARED_WRITE_PATH_JSON_RE.search(action_detail_raw)
+    if m:
+        return [m.group(1)]
+    return profile.extract_file_paths(action_detail_raw)[:1]
+
+
+def _normalize_path_for_compare(path: str, cwd: str) -> str:
+    """把路径归一化成可比较的绝对路径。
+
+    - `~` 展开；
+    - 相对路径按**调用方 cwd** 解析（不能用引擎进程 cwd：OpenDesk 的 filemgr
+      路径相对 workspace，AgentMoss 进程的 cwd 与它无关）；
+    - 折叠 `//` 与 `/./`（normpath）；
+    - **保留大小写**：Linux 大小写敏感，调用方误传小写路径不能当真实路径
+      （历史 bug：整段 action_detail 先 lower 再 os.path.exists，大写文件永远
+      被判成「不存在 = 新建」→ read_before_write 对大写路径完全失效）。
+    """
+    if not path:
+        return path
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded) and cwd:
+        expanded = os.path.join(cwd, expanded)
+    return os.path.normpath(expanded)
+
+
+def _path_is_same_or_under(path: str, base: str) -> bool:
+    """路径相同或位于 base 目录之下（带目录分隔符边界，避免 /tmp/a 匹配 /tmp/ab）。"""
+    if not path or not base:
+        return False
+    if path == base:
+        return True
+    return path.startswith(base.rstrip(os.sep) + os.sep)
+
+
+#: 追加豁免的例外：系统目录 / 家目录隐藏配置里的追加仍要求先读。
+#: 依据：普通文件追加不破坏原内容（业界 append 通常不要求先读），但
+#: `>> /etc/hosts`、`>> ~/.bashrc` 是典型后门写法，不能一起放。
+_PROTECTED_WRITE_PREFIXES: tuple[str, ...] = tuple(
+    _LOGIC_RULES.get("protected_write_prefixes") or ()
+)
+_PROTECTED_HOME_ENTRIES: frozenset[str] = frozenset(
+    _LOGIC_RULES.get("protected_home_entries") or ()
+)
+#: 追加重定向 `>>` 的目标（区别于 `>` 覆盖；排除 `>>>` 与 `>&`）。
+_APPEND_REDIRECT_RE = re.compile(
+    r"(?<!>)>{2}(?!>)\s*(?!&)(?:'([^']+)'|\"([^\"]+)\"|([^\s;|&><'\"]+))"
+)
+#: OpenDesk writeFile append 模式在 command 里的标记 / JSON 参数。
+_APPEND_MODE_RE = re.compile(
+    r"\(\s*追加\s*\)|（\s*追加\s*）|\"mode\"\s*:\s*\"append\"", re.IGNORECASE
+)
+
+
+def _is_protected_write_path(path: str) -> bool:
+    """受保护写入位置：系统目录 / 家目录隐藏配置。追加到这些位置仍要求先读。"""
+    if not path:
+        return False
+    if any(path.startswith(p) for p in _PROTECTED_WRITE_PREFIXES):
+        return True
+    home = os.path.expanduser("~")
+    if home and home != "~" and (path == home or path.startswith(home + os.sep)):
+        rel = path[len(home):].lstrip(os.sep)
+        first = rel.split(os.sep)[0] if rel else ""
+        return first in _PROTECTED_HOME_ENTRIES
+    return False
+
+
+def _history_command_text(hist_detail_raw: str) -> str:
+    """历史动作的「命令文本」：JSON 参数取 command/cmd 字段，否则原样。
+
+    OpenDesk 的 action_history 把工具参数以 args JSON 落库（`{"command": "..."}`），
+    直接把整段 JSON 当 shell 命令做段首词判断会永远不命中。
+    """
+    text = hist_detail_raw.strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                for key in ("command", "cmd"):
+                    value = obj.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value
+        except Exception:  # noqa: BLE001 — 非法 JSON 按原文处理
+            pass
+    return hist_detail_raw
+
+
+#: 历史读命令的覆盖度分类（read_before_write 的「已读」证据强度）：
+#: - FULL：命令输出/读取了全文（cat/less/more/view/open/load，且输出没被管道截断）；
+#: - PARTIAL：只看到一部分（head/tail/grep/sed -n 范围/awk，或 cat 被管道截断）。
+_SHELL_FULL_READ_CMDS = ("cat", "less", "more", "view", "open", "load")
+_SHELL_PARTIAL_READ_CMDS = ("head", "tail", "grep", "egrep", "fgrep", "rg", "awk")
+#: 这些命令出现在管道里会截断左侧命令的输出（`cat f | head` 实际只看到前 N 行）。
+_SHELL_TRUNCATING_CMDS = frozenset(_SHELL_PARTIAL_READ_CMDS)
+_HEAD_TAIL_LIMIT_RE = re.compile(r"(?:-n\s*|-\s*)(\d+)")
+_SED_RANGE_RE = re.compile(r"-n\s+['\"]?(\d+)\s*,\s*(\d+|\$)\s*p")
+#: 读文件行数做「部分读是否实际覆盖全文」判断时的成本上限：超过这个行数一律
+#: 视为部分读（不为了判定去扫一个超大文件）。
+_PARTIAL_COVER_CHECK_MAX_LINES = 100_000
+
+
+def _parse_head_tail_limit(seg: str) -> int | None:
+    """解析 head/tail 的行数：`-n 5` / `-5` / 默认 10。tail -f 等返回 None。"""
+    first_word = seg.strip().split()[0].lower() if seg.strip() else ""
+    if first_word not in ("head", "tail"):
+        return None
+    m = _HEAD_TAIL_LIMIT_RE.search(seg)
+    return int(m.group(1)) if m else 10
+
+
+def _history_read_coverage(
+    hist_name: str, hist_detail_raw: str, read_keywords, profile: "OSProfile"
+) -> tuple[set[str], dict[str, int | None]]:
+    """历史动作的读覆盖度：返回 (全文读路径集合, 部分读路径→已读到第几行|None)。
+
+    **不能**用整段 action_detail 的关键词子串判断：写工具的 JSON 参数/内容里出现
+    "open"/"read" 等词（如路径 `/tmp/opendesk-...`）会被误判为读，其**写目标**被
+    当成「已读路径」→ read_before_write 漏报（2026-11 实测）。
+
+    覆盖度规则：
+    1. 工具名含写关键词（write/edit/replace/...）→ 不是读，参数内容是数据；
+    2. shell：按命令段首词分类——cat/less/more/view/open/load 全文读；head/tail/
+       grep/awk 只读到一部分；`cat f | head` 这类管道截断，cat 也只算部分读；
+       sed 默认输出全文算全量，`sed -n '1,10p'` 算部分，`sed -i` 是写不算读；
+    3. 非 shell：read 类工具解析 args JSON 的 offset/limit（有则部分读，无则全量）；
+       grep/search 类算部分读；glob/list 不算读内容。
+    """
+    full: set[str] = set()
+    partial: dict[str, int | None] = {}
+
+    def add_partial(paths, upto: int | None) -> None:
+        for p in paths:
+            if p in partial:
+                old = partial[p]
+                if old is None or upto is None:
+                    partial[p] = None
+                else:
+                    partial[p] = max(old, upto)
+            else:
+                partial[p] = upto
+
+    # 1) 写工具：参数内容是数据，不是读动作
+    if any(kw in hist_name for kw in profile.write_keywords):
+        return full, partial
+
+    # 2) shell 命令
+    if hist_name in ("bash", "executebash", "terminal-executebash"):
+        segments = _split_shell_segments(_history_command_text(hist_detail_raw))
+        words = []
+        for seg in segments:
+            s = seg.strip()
+            if s:
+                words.append(s.split()[0].lower())
+        has_truncating_pipe = any(w in _SHELL_TRUNCATING_CMDS for w in words)
+        for seg in segments:
+            s = seg.strip()
+            if not s:
+                continue
+            first_word = s.split()[0].lower()
+            paths = profile.extract_file_paths(s)
+            if not paths:
+                continue
+            if first_word in _SHELL_FULL_READ_CMDS:
+                if has_truncating_pipe:
+                    # cat f | head/grep → 输出被截断，只能算部分读
+                    add_partial(paths, _parse_head_tail_limit_for_pipeline(segments))
+                else:
+                    full.update(paths)
+            elif first_word in ("head", "tail"):
+                add_partial(paths, _parse_head_tail_limit(s))
+            elif first_word in ("grep", "egrep", "fgrep", "rg", "awk"):
+                add_partial(paths, None)
+            elif first_word == "sed":
+                if SED_INPLACE_RE.search(s):
+                    continue  # 原地写，不是读
+                m = _SED_RANGE_RE.search(s)
+                if m:
+                    if m.group(2) == "$" and m.group(1) == "1":
+                        full.update(paths)
+                    else:
+                        add_partial(paths, None)
+                else:
+                    full.update(paths)  # sed 默认输出全文
+            # find/ls/stat/wc 等不算读取文件内容
+        return full, partial
+
+    # 3) 非 shell 工具
+    offset = limit = None
+    detail = hist_detail_raw.strip()
+    if detail.startswith("{"):
+        try:
+            obj = json.loads(detail)
+            if isinstance(obj, dict):
+                offset = obj.get("offset")
+                limit = obj.get("limit")
+        except Exception:  # noqa: BLE001 — 非法 JSON 按原文处理
+            pass
+    if "read" in hist_name:
+        if offset is not None or limit is not None:
+            try:
+                off = int(offset) if offset is not None else 1
+            except Exception:  # noqa: BLE001
+                off = 1
+            try:
+                lim = int(limit) if limit is not None else None
+            except Exception:  # noqa: BLE001
+                lim = None
+            # 连续覆盖到第几行：offset>1 时前面没读，无法算全量
+            upto = (off + lim - 1) if (off == 1 and lim is not None) else None
+            add_partial(profile.extract_file_paths(detail), upto)
+        else:
+            full.update(profile.extract_file_paths(detail))
+    elif "grep" in hist_name or "search" in hist_name:
+        add_partial(profile.extract_file_paths(detail), None)
+    elif "glob" in hist_name or "list" in hist_name:
+        pass
+    elif any(kw in hist_name for kw in read_keywords):
+        # 其他含读关键词的工具（head/tail 工具名等）：保守按部分读
+        add_partial(profile.extract_file_paths(detail), None)
+    return full, partial
+
+
+def _parse_head_tail_limit_for_pipeline(segments: list[str]) -> int | None:
+    """管道截断时的行数：取管道里 head/tail 的 -n；grep/awk 截断返回 None。"""
+    for seg in segments:
+        s = seg.strip()
+        if not s:
+            continue
+        fw = s.split()[0].lower()
+        if fw in ("head", "tail"):
+            return _parse_head_tail_limit(s)
+    return None
+
+
+def _file_has_at_most_lines(path: str, limit: int) -> bool:
+    """文件总行数是否 <= limit（用于判断「部分读」是否实际覆盖了全文）。
+
+    只流式读到 limit+1 行即返回；超过 _PARTIAL_COVER_CHECK_MAX_LINES 或读失败
+    一律按「未覆盖」处理（保守）。
+    """
+    if limit <= 0 or limit > _PARTIAL_COVER_CHECK_MAX_LINES:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, _ in enumerate(f, 1):
+                if i > limit:
+                    return False
+        return True
+    except Exception:  # noqa: BLE001 — 读不到就无法证明全量
+        return False
+
+
+def _append_only_targets(action_detail_raw: str, profile: "OSProfile") -> set[str]:
+    """仅以追加方式写入的路径集合（`>>` / `tee -a`）。
+
+    只收「该命令段没有任何覆盖写」的目标：同一段里同时出现 `>` 和 `>>` 时，
+    该段整体不视为纯追加（保守，避免把覆盖目标一起豁免）。
+    """
+    out: set[str] = set()
+    for seg in _split_shell_segments(action_detail_raw):
+        seg = seg.strip()
+        if not seg:
+            continue
+        # 剥掉 >> 后看是否还有单 >（覆盖）：有则本段不是纯追加
+        seg_no_append = _APPEND_REDIRECT_RE.sub(" ", seg)
+        seg_no_quotes = re.sub(r"'[^']*'|\"[^\"]*\"", "", seg_no_append)
+        has_overwrite = bool(re.search(r"(?<![/\-=>])>\s*(?!&)\S", seg_no_quotes))
+        if has_overwrite:
+            continue
+        for m in _APPEND_REDIRECT_RE.finditer(seg):
+            p = m.group(1) or m.group(2) or m.group(3)
+            if p:
+                out.add(p)
+        first_word = seg.split()[0].lower() if seg.split() else ""
+        if first_word == "tee" and re.search(r"(?:^|\s)(?:-a|--append)(?:\s|$)", seg):
+            out.update(profile.extract_file_paths(seg))
+    return out
 #: 临时目录（批量删除豁免）。与 heuristic 的 L1 判定共用 heuristic_rules.json 那一份；
 #: 本模块按 startswith 用，故拼上尾随斜杠。
 _TEMP_DIRS: tuple[str, ...] = tuple(
@@ -326,6 +769,119 @@ def _match_dangerous_action(action_detail: str, action: str) -> bool:
     # 英文词走词边界 + 排除参数前缀
     escaped = re.escape(action)
     return bool(re.search(rf"(?<![-\w]){escaped}\b", action_detail, re.IGNORECASE))
+
+
+def _intent_action_text(action_type: str, action_detail: str) -> str:
+    """意图规则的危险动作匹配文本：只保留「可执行/操作」部分。
+
+    把文档正文、搜索模式、引号字面量里的危险词排除，否则 "查看并生成清单，
+    清单注明『未做任何删除』" 会被判成「读取→删除」（2026-11 鸿蒙实测）：
+    - bash：剥 heredoc 正文（非解释器）、注释、引号内容；
+    - 非 bash：剥 content / 搜索模式，只保留动作声明与路径
+      （`写入文件: p — <content>` → `写入文件: p`；
+      `搜索: <pattern> in p` → `搜索: in p`）。
+    """
+    text = action_detail or ""
+    at = (action_type or "").lower()
+    if at in ("bash", "executebash", "terminal-executebash"):
+        text = _strip_heredoc_body(text)
+        text = re.sub(r"(?m)(?<!\S)#.*$", "", text)  # 注释
+        text = re.sub(r"'[^']*'|\"[^\"]*\"", "", text)  # 引号内容是数据
+        return text
+    m = re.match(r"^(.*?)\s*—\s*[\s\S]*$", text)
+    if m:
+        text = m.group(1)
+    m2 = re.match(r"^(搜索|search|查找)\s*[:：]\s*(.*?)\s+in\s+(.*)$", text, re.IGNORECASE)
+    if m2:
+        text = f"{m2.group(1)}: in {m2.group(3)}"
+    return text
+
+
+#: 删除命令词集合（段首词比较，小写）。来自 l2_rules.json::intent_matrix。
+_DELETE_ACTION_WORDS_SET = frozenset(w.lower() for w in _DELETE_ACTION_WORDS)
+
+
+def _action_category(
+    action_type: str,
+    action_detail_raw: str,
+    profile: "OSProfile",
+    extra_write_tools: frozenset[str] = frozenset(),
+) -> str:
+    """当前动作类别：read / create / append / overwrite / delete。
+
+    判定口径（不猜，与 RBW 同源）：
+    - 删除：删除类工具名，或段首词是删除命令（rm/rmdir/unlink/...）；
+    - 追加：append 模式（`(追加)` / mode=append）/ `>>`；
+    - 覆盖：editFile/searchReplace（工具语义就是改已有内容）、writeFile 且目标
+      已存在、bash `>` / `sed -i` / cp|mv|install|rsync；目标 stat 不到时按覆盖
+      处理（保守——宁可拦一次，也不漏「用户只看、agent 改写」）；
+    - 新建：writeFile 且目标不存在；
+    - 其余：读。
+    """
+    at = (action_type or "").lower()
+    # 先剥 `/dev/null` 重定向：`2>/dev/null` 是丢弃输出，不是写文件
+    # （否则 `git log --format=... 2>/dev/null` 被当覆盖写 → 意图误报）。
+    text = _DEVNULL_REDIRECT_RE.sub("", action_detail_raw or "")
+    if any(w in at for w in ("delete", "remove", "rmdir", "unlink")):
+        return "delete"
+    if _APPEND_MODE_RE.search(text):
+        return "append"
+    # OpenDesk 文本格式：不依赖工具名单（agent 扩展名单未传时也能识别）。
+    if re.match(r"^(?:编辑文件|应用补丁)\s*[:：]", text):
+        return "overwrite"
+    if re.match(r"^写入文件\s*[:：]", text):
+        paths = _declared_write_paths(text, profile)
+        if not paths:
+            return "overwrite"
+        return "overwrite" if any(os.path.exists(p) for p in paths) else "create"
+    if _is_precise_edit_tool(at, extra_write_tools):
+        return "overwrite"
+    if _is_full_overwrite_tool(at, extra_write_tools):
+        paths = _declared_write_paths(text, profile)
+        if not paths:
+            return "overwrite"
+        return "overwrite" if any(os.path.exists(p) for p in paths) else "create"
+    for seg in _split_shell_segments(text):
+        s = seg.strip()
+        if not s:
+            continue
+        fw = s.split()[0].lower() if s.split() else ""
+        if fw in _DELETE_ACTION_WORDS_SET:
+            return "delete"
+        if fw == "sed" and SED_INPLACE_RE.search(s):
+            return "overwrite"
+        if fw in ("cp", "mv", "install", "rsync"):
+            return "overwrite"
+    if ">>" in text:
+        return "append"
+    if re.search(r"(?<![/\-=<>])>\s*(?!&)\S", text):
+        return "overwrite"
+    return "read"
+
+
+def _intent_matrix_violation(intents: set[str], action_cat: str) -> str | None:
+    """按「意图 × 动作」矩阵判定：返回 reason 键（违规）或 None（放行）。
+
+    矩阵（见 DECISION_PRINCIPLES.md INT-1）：
+    - 覆盖动作：意图含 write 才放行（读→覆盖、删→覆盖 都拦）；
+    - 删除动作：意图含 delete 才放行（读→删、写→删 都拦）；
+    - 读/新建/追加：永远放行；意图提取不到：放行交 L3。
+    """
+    if not intents:
+        return None
+    if action_cat == "overwrite":
+        if "write" in intents:
+            return None
+        if "delete" in intents and "read" not in intents:
+            return "delete->overwrite"
+        return "read->overwrite"
+    if action_cat == "delete":
+        if "delete" in intents:
+            return None
+        if "write" in intents and "read" not in intents:
+            return "write->delete"
+        return "read->delete"
+    return None
 
 
 def has_exec_bypass_chain(action_detail: str) -> bool:
@@ -642,11 +1198,20 @@ class LogicRulesChecker:
             )
             if enabled:
                     from ..profiles.base import IntentDeviationPattern
+                    # 旧 runtime config（本次改动前生成）没有 allow_if_write_intent
+                    # 字段：按 reason 回填 profile 默认值，否则老配置会让新豁免失效。
+                    default_flags = {
+                        p.reason: p.allow_if_write_intent
+                        for p in self._profile.intent_deviation_patterns
+                    }
                     return [
                         IntentDeviationPattern(
                             intent_keywords=r["intent_keywords"],
                             dangerous_actions=r["dangerous_actions"],
                             reason=r["reason"],
+                            allow_if_write_intent=bool(
+                                r.get("allow_if_write_intent", default_flags.get(r["reason"], False))
+                            ),
                         )
                         for r in enabled
                     ]
@@ -704,7 +1269,7 @@ class LogicRulesChecker:
             LogicRuleResult: 检测结果
         """
         # 1. read_before_write 原则
-        rbw_result = self._check_read_before_write(action_history, a_next, reason)
+        rbw_result = self._check_read_before_write(action_history, a_next, reason, cwd=cwd)
         if rbw_result.hit:
             return rbw_result
 
@@ -814,12 +1379,23 @@ class LogicRulesChecker:
         return LogicRuleResult(hit=False)
 
     def _check_read_before_write(
-        self, action_history: list[dict[str, object]], a_next: dict[str, str], reason: str = ""
+        self,
+        action_history: list[dict[str, object]],
+        a_next: dict[str, str],
+        reason: str = "",
+        cwd: str = "",
     ) -> LogicRuleResult:
         write_keywords = self._profile.write_keywords
         read_keywords = self._profile.read_keywords
 
-        action_detail = a_next.get("action_detail", "").lower()
+        # raw 用于路径提取（保留大小写）；lower 仅用于关键词/命令匹配。
+        action_detail_raw = a_next.get("action_detail", "")
+        # heredoc 正文是数据（非解释器）：「写目标/重定向/段解析」都不看正文。
+        # 2026-11 鸿蒙实测：`cat > make_data.py <<'PY'` 正文里 Python 的
+        # `base = "/storage/.../核对"` 被当成「写文件 核对」→ RBW 误报。
+        # 解释器 heredoc（`bash <<EOF` / `python <<'PY'`）正文会执行，不剥。
+        action_detail_raw = _strip_heredoc_body(action_detail_raw)
+        action_detail = action_detail_raw.lower()
         action_type = a_next.get("action_type", "").lower()
 
         # 豁免非文件类工具前缀（仅通用基线，与 EXCLUDED_PREFIXES 一致）。
@@ -851,7 +1427,7 @@ class LogicRulesChecker:
         # 的写入是控制面动作（trace_marker 打点、/proc/self/... 调参），不存在「先读内容再覆写」
         # 的语义。真机实测（鸿蒙 PC，2026-10）：定向 syscall 实时研判把 trace_marker 判 high
         # 并真拦，被跟的 agent 卡死。
-        # 注：本豁免只针对路径本身；`file_write` 覆写普通文件仍按 RBW 守护。
+        # 注：本豁免只针对路径本身；`file_write` 覆写普通文件仍按 RBW 守护（tests/cases/logic-30）。
 
         # 写判定按工具类型分流：
         # - bash/executebash/terminal-executebash：同时匹配 action_type + action_detail
@@ -872,6 +1448,14 @@ class LogicRulesChecker:
                 is_write = _is_write_operation(action_type, action_detail, self._profile.write_keywords, self._profile)
         else:
             is_write = any(kw in action_type for kw in write_keywords)
+
+        # tar 创建归档是写操作（写 -f 指定的归档文件），但 tar 不在通用写命令集里。
+        # 只认 create 模式；解压/列表（-x/-t）是读。写目标由下方 per-segment 的
+        # tar 分支只取 -f，避免把 -C 源目录当写目标。
+        if not is_write and re.search(r"\btar\b", action_detail) and re.search(
+            r"(?:^|\s)(?:-[a-zA-Z]*c[a-zA-Z]*|--create)\b", action_detail
+        ):
+            is_write = True
 
         if not is_write:
             return LogicRuleResult(hit=False)
@@ -914,6 +1498,14 @@ class LogicRulesChecker:
                         continue
                     fw = seg.split()[0].lower() if seg.split() else ""
                     if fw in _WRITE_CMDS or SED_INPLACE_RE.search(seg):
+                        has_write_seg = True
+                        break
+                    # tar 创建归档（-c/--create + -f）也是写；解压/列表是读。
+                    if fw == "tar" and re.search(
+                        r"(?:^|\s)(?:-[a-zA-Z]*c[a-zA-Z]*|--create)\b", seg
+                    ) and re.search(
+                        r"(?:^|\s)(?:-[a-zA-Z]*f[a-zA-Z]*|--file)(?:=|\s+)\S+", seg
+                    ):
                         has_write_seg = True
                         break
                     # wget/curl + -O/-o/--output 下载写入（无 > 重定向，需单独识别）
@@ -970,13 +1562,34 @@ class LogicRulesChecker:
             r">{1,2}\s*(?!&)(?:'(/[^']+)'|\"(/[^\"]+)\"|(/[^\s;|&><'\"]+))"
         )
         target_paths: list[str] = []
-        for seg in _split_shell_segments(action_detail):
+        # 单文件写工具（filemgr-writeFile / file_write / write 等）：写目标只有一个，
+        # 就是工具声明的那个路径。不能走下面的 per-segment 全量提取——那会把 command
+        # 里 content 正文的路径（邮件正文、搜索结果、代码片段）也算成写目标 → 误报。
+        single_file_tools = _SINGLE_FILE_WRITE_TOOLS
+        if self._agent_ext is not None:
+            # 宿主 agent 独占的写工具名（如 OpenDesk 的 filemgr-writeFile）只配在
+            # agents/<id>/rules.json，不进通用名单。
+            single_file_tools = single_file_tools | frozenset(
+                self._agent_ext.extra_single_file_write_tools
+            )
+        single_file_tool = action_type in single_file_tools
+        if single_file_tool and _MISSING_WRITE_PATH_RE.search(action_detail_raw):
+            # 调用方没给出写目标（OpenDesk 旧版 hook 取错参数名后 command 退化成
+            # `写入文件: ? — <content>`）：信息不足，不做本规则判定，绝不用 content
+            # 里的路径凑数。修复接入后此形态消失，保留兜底防其它调用方同类错误。
+            return LogicRuleResult(hit=False)
+        for seg in (_split_shell_segments(action_detail_raw) if not single_file_tool else []):
             seg = seg.strip()
             if not seg:
                 continue
             first_word = seg.split()[0].lower() if seg.split() else ""
             if first_word == "cd":
                 # 切目录，无写目标
+                continue
+            if _SHELL_ASSIGN_RE.match(seg):
+                # `VAR=/path` / `export VAR=...`：变量赋值不是写操作，值里的路径是
+                # 数据/后续命令输入。2026-11 鸿蒙实测：`SRC=/storage/.../Download`
+                # 被当成「写文件 Download」→ RBW 误报。
                 continue
             # NEW-FN-P（M03）：sed -i/--in-place 是原地写，不算只读段——
             # sed 在 READ_ONLY_COMMANDS 里，此前 sed -i file 的 file 被当读目标丢弃，
@@ -1012,6 +1625,18 @@ class LogicRulesChecker:
                 # 排除首个路径（源文件），其余为写目标
                 if len(seg_paths) > 1:
                     target_paths.extend(seg_paths[1:])
+            elif first_word == "tar":
+                # tar 创建归档：写目标只有 -f/--file 后的归档文件；`-C <dir>` 是
+                # 源目录、位置参数是待打包文件，都不是写目标。否则
+                # `tar -czf out.tar -C /src .` 会把 /src 当写目标 → RBW 误报。
+                # 只对 create 模式（-c/--create）取 -f；解压/列表（-x/-t）是读。
+                if re.search(r"(?:^|\s)(?:-[a-zA-Z]*c[a-zA-Z]*|--create)\b", seg):
+                    m = re.search(
+                        r"(?:^|\s)(?:-[a-zA-Z]*f[a-zA-Z]*|--file)(?:=|\s+)(\S+)",
+                        seg,
+                    )
+                    if m:
+                        target_paths.append(m.group(1).strip("'\""))
             elif first_word == "dd":
                 # dd 的 if= 是输入源（读目标），of= 是输出目标（写目标）。
                 # 排除 if= 的路径，保留 of= 的路径作为写目标。
@@ -1028,6 +1653,9 @@ class LogicRulesChecker:
             else:
                 # 其他段（含重定向写 echo > file、tee、truncate 等）：该段所有路径为写目标
                 target_paths.extend(seg_paths)
+        if single_file_tool:
+            # 单文件写工具只取工具声明的路径（文本格式 > JSON 参数键 > 裸路径首个）。
+            target_paths = _declared_write_paths(action_detail_raw, self._profile)
         # 去重，并剔除伪文件系统路径（写 sysfs/procfs/devfs 是控制面动作，见豁免 2）。
         # 全部目标都在伪文件系统里时本规则无事可判。
         target_paths = [
@@ -1037,19 +1665,53 @@ class LogicRulesChecker:
         if not target_paths:
             return LogicRuleResult(hit=False)
 
-        # 检查历史动作中是否有对这些路径的读取操作
-        history_read_paths = set()
+        # 检查历史动作中是否有对这些路径的读取操作。
+        # raw 保留原始大小写供路径提取（lower 只用于关键词匹配）：Linux 大小写敏感，
+        # 若把历史路径也 lower，`ReadFile /tmp/A.txt` 会变成 /tmp/a.txt，与真实
+        # 写目标永远匹配不上 → 「明明读过却判未读」误报。
+        extra_write_tools = (
+            frozenset(self._agent_ext.extra_single_file_write_tools)
+            if self._agent_ext is not None
+            else frozenset()
+        )
+        history_full_read_paths: set[str] = set()
+        history_partial_read: dict[str, int | None] = {}
+        #: 本会话用「整文件覆盖」写工具写过的文件（write ⇒ 内容已知）。
+        #: 只用于**精确编辑**（editFile/searchReplace）：模型自己写的内容再局部改，
+        #: 不必重新读；整文件覆盖仍要求全量读（整体重写可能丢失未读内容）。
+        history_written_paths: set[str] = set()
         for action in action_history:
             hist_detail_raw = action.get("action_detail", "") if isinstance(action, dict) else ""
             if isinstance(hist_detail_raw, dict):
-                hist_detail = json.dumps(hist_detail_raw, ensure_ascii=False).lower()
+                hist_detail_raw = json.dumps(hist_detail_raw, ensure_ascii=False)
             else:
-                hist_detail = str(hist_detail_raw).lower()
+                hist_detail_raw = str(hist_detail_raw)
             hist_name = action.get("name", action.get("action_type", "")).lower() if isinstance(action, dict) else ""
-            is_read = any(kw in hist_name or kw in hist_detail for kw in read_keywords)
-            if is_read:
-                hist_paths = self._profile.extract_file_paths(hist_detail)
-                history_read_paths.update(hist_paths)
+            # 读判定必须按「动作类型/命令段首词」，不能扫整段参数内容：
+            # 写工具的 JSON 里路径含 "open"（/tmp/opendesk-...）会被误判成读过。
+            # 同时区分「全文读」与「部分读」（head/grep/sed -n/readFile offset）。
+            full_paths, partial_paths = _history_read_coverage(
+                hist_name, hist_detail_raw, read_keywords, self._profile
+            )
+            history_full_read_paths.update(full_paths)
+            # 本会话用「整文件覆盖」写工具写过的文件：模型自己生成的内容即已知内容。
+            # 仅用于精确编辑（editFile）豁免「全量读」要求；整文件覆盖仍要求读全
+            # （整体重写可能丢失未读内容）。追加（append）只掌握尾部，不算。
+            # 2026-11 鸿蒙实测：writeFile 新建 → editFile 改错别字被 RBW 拦。
+            if _is_full_overwrite_tool(hist_name, extra_write_tools) and not _APPEND_MODE_RE.search(
+                hist_detail_raw
+            ):
+                for p in _declared_write_paths(hist_detail_raw, self._profile):
+                    history_written_paths.add(p)
+            for p, upto in partial_paths.items():
+                if p in history_partial_read:
+                    old = history_partial_read[p]
+                    if old is None or upto is None:
+                        history_partial_read[p] = None
+                    else:
+                        history_partial_read[p] = max(old, upto)
+                else:
+                    history_partial_read[p] = upto
 
         # 豁免「纯临时文件生成」写目标：`dd if=/dev/zero of=/tmp/file`（用 /dev/zero
         # 填充临时文件）是明确的 scratch 空间生成，无敏感语义（A2 定义里 /tmp 清理
@@ -1065,13 +1727,91 @@ class LogicRulesChecker:
         if not target_paths:
             return LogicRuleResult(hit=False)
 
-        # 检查写入目标是否在已读取的路径中
+        # 比对前统一归一化：~ 展开、相对路径按调用方 cwd 解析、折叠 // 与 /./。
+        # 工程上「读 /workspace/B」与「写 B（cwd=/workspace）」是同一个文件，
+        # 不归一化会因字符串不同判成「没读过」——OpenDesk 的 filemgr 两种路径
+        # 形态都可能出现（工具参数支持工作区相对路径）。保留大小写。
+        target_paths = list(
+            dict.fromkeys(
+                p for p in (_normalize_path_for_compare(x, cwd) for x in target_paths) if p
+            )
+        )
+        history_full_read_paths = {
+            p for p in (_normalize_path_for_compare(x, cwd) for x in history_full_read_paths) if p
+        }
+        history_partial_read = {
+            _normalize_path_for_compare(k, cwd): v
+            for k, v in history_partial_read.items()
+            if _normalize_path_for_compare(k, cwd)
+        }
+        history_written_paths = {
+            p for p in (_normalize_path_for_compare(x, cwd) for x in history_written_paths) if p
+        }
+
+        # 追加豁免：`>>` / `tee -a` 只追加不破坏原内容，普通路径不要求先读；
+        # 受保护路径（系统目录 / 家目录隐藏配置）仍保留先读要求——
+        # `>> /etc/hosts`、`>> ~/.bashrc` 是后门，不能一起放。
+        append_targets = _append_only_targets(action_detail_raw, self._profile)
+        if _APPEND_MODE_RE.search(action_detail_raw):
+            # command 明确标记追加（OpenDesk writeFile 的「(追加)」/ JSON
+            # mode=append）：本次声明目标按追加处理，不要求先读。
+            append_targets |= set(target_paths)
+        if append_targets:
+            append_norm = {
+                p for p in (_normalize_path_for_compare(x, cwd) for x in append_targets) if p
+            }
+            target_paths = [
+                p for p in target_paths
+                if not (
+                    any(
+                        _path_is_same_or_under(p, ap) or _path_is_same_or_under(ap, p)
+                        for ap in append_norm
+                    )
+                    and not _is_protected_write_path(p)
+                )
+            ]
+            if not target_paths:
+                return LogicRuleResult(hit=False)
+
+        # 检查写入目标是否在已读取的路径中。
+        # 全文读 → 直接算已读；部分读 → 只有当「读到第 N 行 >= 文件总行数」时
+        # 才算实际覆盖全文（`head -n 10` 读 5 行的小文件不算误报）。
+        # 精确编辑（editFile/searchReplace）：只替换局部片段，读到 oldString 所在
+        # 片段就够，不要求读到文件末尾；整文件覆盖（writeFile）仍要求全量读。
+        precise_edit = _is_precise_edit_tool(action_type, extra_write_tools)
+
         unread_paths = []
         for path in target_paths:
-            if not any(
-                path == rp or path.startswith(rp) or rp.startswith(path)
-                for rp in history_read_paths
+            # 写目标是目录（`cp -r a b/`、`mkdir -p dir`）：不是覆盖文件内容，
+            # read_before_write 不适用（2026-11 鸿蒙实测：cp 到新建目录被要求先读）。
+            if _is_directory_target(path):
+                continue
+            is_full_read = any(
+                _path_is_same_or_under(path, rp) or _path_is_same_or_under(rp, path)
+                for rp in history_full_read_paths
+            )
+            # 精确编辑 + 本会话写过该文件：内容已知，视为已读
+            # （2026-11 鸿蒙实测：writeFile 新建 → editFile 改错别字被 RBW 拦）。
+            if not is_full_read and precise_edit and any(
+                _path_is_same_or_under(path, wp) or _path_is_same_or_under(wp, path)
+                for wp in history_written_paths
             ):
+                is_full_read = True
+            is_partial_covered = False
+            if not is_full_read:
+                for pp, upto in history_partial_read.items():
+                    if not (
+                        _path_is_same_or_under(path, pp) or _path_is_same_or_under(pp, path)
+                    ):
+                        continue
+                    if precise_edit:
+                        # 精确编辑：读到过即可（不要求覆盖全文）
+                        is_partial_covered = True
+                        break
+                    if upto is not None and _file_has_at_most_lines(path, upto):
+                        is_partial_covered = True
+                        break
+            if not is_full_read and not is_partial_covered:
                 # 排除新文件创建：文件不存在于磁盘时视为新建，直接放行
                 # 同时检查 reason/action_detail 中是否有创建/新建关键词
                 is_create = not os.path.exists(path)
@@ -1116,34 +1856,104 @@ class LogicRulesChecker:
         if any(action_type.startswith(p) for p in _EXCLUDED_PREFIXES):
             return LogicRuleResult(hit=False)
 
-        # 收集本次会话的全部意图文本（含历史 prompt，按时间序去重）。
-        # 避免多轮会话里 "continue/继续" 等最近输入覆盖掉最初的读取/搜索意图而漏报。
-        # 有交错 prompt_history 时优先用它；否则退化为单条 prompt_session（向后兼容）。
-        intent_texts = self._collect_intent_texts(prompt_session, prompt_history)
-        if not intent_texts:
-            return LogicRuleResult(hit=False)
-
-        for pattern in self._get_intent_patterns():
-            # 任一历史 prompt 命中意图词即视为"存在该意图"（防"继续"覆盖漏报）
-            intent_matched = any(
-                kw in text
-                for text in intent_texts
-                for kw in pattern.intent_keywords
+        # 意图类别 × 动作类别 矩阵判定（2026-11 重构）：
+        #   覆盖动作 → 意图含 write 才放行；删除动作 → 意图含 delete 才放行；
+        #   读/新建/追加永远放行；意图提取不到 → 不判（放行交 L3）。
+        # 意图文本：当前 prompt 优先；指代前文（继续/看上一句/根据之前说的办）
+        # 回退到最近 3 条历史，回退必须唯一，否则视为意图不明。
+        # 不能用「历史任意一条命中即算」——长会话里几小时前的一句"搜索"会让
+        # 后续所有写操作都被判偏离（2026-11 鸿蒙实测误报）。
+        extra_write_tools = (
+            frozenset(self._agent_ext.extra_single_file_write_tools)
+            if self._agent_ext is not None
+            else frozenset()
+        )
+        intent_text = self._resolve_intent_text(
+            prompt_session, prompt_history, _ALL_INTENT_KEYWORDS
+        )
+        intents = _intent_categories(intent_text)
+        # 「执行 xxx / 按要求做」：动作在外部指令里，prompt 的"读取"不代表只读。
+        # 含此类表达且没有明确删除意图 → 视为意图不明，交 L3（不猜）。
+        if intents and _EXEC_REFERENCE_RE.search(intent_text) and "delete" not in intents:
+            logger.info(
+                "[intent] 指令指向外部文件/要求（执行类表达），意图不明确，放行交 L3：prompt=%r",
+                (prompt_session or "")[:80],
             )
-            dangerous_matched = any(
-                _match_dangerous_action(action_detail, kw)
-                for kw in pattern.dangerous_actions
+            intents = set()
+        action_cat = _action_category(
+            action_type, a_next.get("action_detail", ""), self._profile, extra_write_tools
+        )
+        reason_key = _intent_matrix_violation(intents, action_cat)
+        if reason_key is not None:
+            return LogicRuleResult(
+                hit=True,
+                violated_rule="intent_consistency",
+                risk_level="high",
+                reason=_INTENT_REASONS.get(reason_key, "原始意图与执行动作不一致"),
+                risk_type="intent_deviation",
             )
-            if intent_matched and dangerous_matched:
-                return LogicRuleResult(
-                    hit=True,
-                    violated_rule="intent_consistency",
-                    risk_level="high",
-                    reason=pattern.reason,
-                    risk_type="intent_deviation",
-                )
-
+        # 意图不明确（读/写/删都提取不到）但动作是覆盖/删除：不猜，放行交 L3；
+        # L3 带完整对话历史，能理解"根据之前说的办"这类指代。留日志供审计。
+        if action_cat in ("overwrite", "delete") and not intents:
+            logger.info(
+                "[intent] 意图不明确，跳过意图偏离判定并交 L3：prompt=%r 动作=%s(%r)",
+                (prompt_session or "")[:80],
+                action_cat,
+                action_detail[:80],
+            )
         return LogicRuleResult(hit=False)
+
+    @staticmethod
+    def _resolve_intent_text(
+        prompt_session: str,
+        prompt_history: list[dict[str, object]] | None,
+        intent_keywords,
+    ) -> str:
+        """本次动作对应的意图文本（当前 prompt 优先）。
+
+        1. 当前 prompt 含该类意图词 → 用它（当前任务意图）；
+        2. 当前输入是「指代前文」（"继续"、"你看下上一句"、"根据之前说的办"、
+           "按刚才的来"）→ 回退到最近 `_REFERENCE_LOOKBACK` 条里第一条含该意图词的
+           prompt（覆盖 logic-21 多轮场景与所有"看上一句"类说法）；
+        3. 都没有 → 返回当前 prompt（不命中，不做本规则判定）。
+
+        历史 prompt 的用途**仅限「指代前文」回退**：当前 prompt 有自己的实质内容
+        （如"执行自测指令.md"）时绝不被几小时前的旧意图左右（2026-11 鸿蒙实测：
+        压测会话里写周报被上午的"搜索"意图判「查询→修改」误报）。
+        """
+        cur = (prompt_session or "").strip().lower()
+        if any(kw in cur for kw in intent_keywords):
+            return cur
+        if not _REFERENCE_PRIOR_RE.search(cur):
+            return cur
+        # 指代前文：回退到最近的历史 prompt。**回退必须准确**——
+        # 找不到候选、或最近多条候选的意图互相冲突时，视为「无法确定意图」，
+        # 返回当前（不命中 → 放行），交 L3 结合完整历史判断。
+        turns = prompt_history or []
+        candidates: list[str] = []
+        for turn in reversed(turns[-_REFERENCE_LOOKBACK:]):
+            if isinstance(turn, str):
+                text = turn.strip().lower()
+            elif isinstance(turn, dict):
+                t = turn.get("text", "")
+                text = t.strip().lower() if isinstance(t, str) else ""
+            else:
+                continue
+            if text and any(kw in text for kw in intent_keywords):
+                candidates.append(text)
+        if not candidates:
+            return cur  # 回退不到 → 放行
+        # 冲突按**意图类别**判断（读/写/删），不是按关键词：
+        # "查看"和"搜索"同属 read 类别，不算冲突；"查看"和"删除"才算。
+        first_cats = _intent_categories(candidates[0])
+        for other in candidates[1:]:
+            if _intent_categories(other) != first_cats:
+                logger.info(
+                    "[intent] 指代前文的回退结果有歧义（多条历史意图类别不一致），放行交 L3：候选=%r",
+                    [c[:40] for c in candidates],
+                )
+                return cur
+        return candidates[0]
 
     @staticmethod
     def _collect_intent_texts(
@@ -1487,6 +2297,13 @@ class LogicRulesChecker:
 
         if action_type in ("file_write", "file_edit"):
             return LogicRuleResult(hit=False)
+
+        # 与 L1 同源：检索命令（grep/rg/...）的引号内容是搜索模式/glob，
+        # 不是删除动作（`rg "remove|delete" --glob "*.py"` 是只读检索）。
+        # 函数级导入避免 logic_rules ↔ heuristic 模块级循环依赖。
+        from .heuristic import strip_search_pattern_literals
+
+        action_detail = strip_search_pattern_literals(action_detail)
 
         # 通配符 + 删除/修改 — 排除 /tmp 等临时目录的清理操作
         is_temp_path = any(td in action_detail for td in _TEMP_DIRS)

@@ -103,8 +103,10 @@ class RecursiveTracker:
         max_nodes: int = DEFAULT_MAX_NODES,
         max_file_size: int = DEFAULT_MAX_FILE_SIZE,
         max_total_size: int = DEFAULT_MAX_TOTAL_SIZE,
+        stop_on_critical: bool = True,
     ):
         self._scanner = command_scanner
+        self._stop_on_critical = stop_on_critical
         self._max_depth = max_depth
         self._max_nodes = max_nodes
         self._max_file_size = max_file_size
@@ -225,9 +227,11 @@ class RecursiveTracker:
                 )
                 if l1.risk_level == "critical":
                     self._result.has_critical = True
-                    self._result.first_hit_node = node
-                    self._visiting.discard(path_str)
-                    return
+                    if self._result.first_hit_node is None:
+                        self._result.first_hit_node = node
+                    if self._stop_on_critical:
+                        self._visiting.discard(path_str)
+                        return
 
         # 子脚本调用（IR.calls，含参数）→ 递归
         child_paths: list[str] = []
@@ -240,7 +244,7 @@ class RecursiveTracker:
                 base_dir=str(Path(child).parent),
                 args=call.args,  # 关键：子脚本用自己的调用参数
             )
-            if self._result.has_critical:
+            if self._stop_on_critical and self._result.has_critical:
                 break
         node.child_paths = child_paths
 

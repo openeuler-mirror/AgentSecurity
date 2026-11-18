@@ -13,6 +13,7 @@
 
 本文件直接调 `LogicRulesChecker`，不经过 L1，专门锁死上面每一条。
 
+双端对应：TS 侧 `ts/src/__tests__/consent-strength.test.ts`。
 """
 
 import pytest

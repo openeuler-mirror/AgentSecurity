@@ -57,7 +57,8 @@ Python 和 TS 是同一套规则的**两份实现**。凡是"两边各写一遍"
 L1 先拦下」的假绿（`tests/cases/l2/logic-06`、`logic-08` 都声明
 `expected_layers: ["1.2"]` + `consent_missing`，实际返回 `1.1` + `script_execution`）。
 
-2026-10 起它变成真断言（`tests/test_case_metadata.py`），范围限 `l1/ l2/ agent/`（确定性判定）。
+2026-10 起它变成真断言（`tests/test_case_metadata.py` +
+`ts/src/__tests__/json-cases.test.ts`），范围限 `l1/ l2/ agent/`（确定性判定）。
 清单条目形如 `{case, expected, python, typescript}`，两端各比自己的字段：
 
 - **偏差集合必须与清单完全一致**：新漂移 → 失败；清单过期（已修复）→ 失败并提示删除

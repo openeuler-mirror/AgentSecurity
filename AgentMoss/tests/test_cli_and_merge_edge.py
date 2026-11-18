@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """两条边角修复的看护（2026-09）：
 
-1. **CLI 必须透传 agent_id / scenario_id / cwd**。
+1. **CLI 必须透传 agent_id / scenario_id / cwd**（对应 ts/src/cli.ts）。
    历史 bug：Python CLI 只传 5 个参数，于是**同一个输入文件两端判定不同** ——
    agent 专属规则、场景定制规则全不加载，cwd 缺失还让间接文件访问检测直接跳过
    （logic_rules 里 `if cwd and os.path.isdir(cwd)`）。
