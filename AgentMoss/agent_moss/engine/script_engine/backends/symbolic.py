@@ -329,24 +329,31 @@ def _parse_case_stmt(block: str) -> Optional[CaseStmt]:
     # body = header("... in") 之后到 esac 之前
     body_text = "\n".join(block_lines[body_start_idx:end_line])
     body = body_text
+    # 深度感知切分：内层 case 的 `pattern)` 不能当成外层分支。
     branches: list[tuple[str, str, str]] = []
     cur_pat: str | None = None
     cur_body: list[str] = []
+    depth = 0
     for ln in body.split("\n"):
         stripped = ln.strip()
-        bm = re.match(r"^([^()]+?)\s*\)\s*(.*)$", stripped)
-        if bm:
-            if cur_pat is not None:
-                branches.append((cur_pat, "\n".join(cur_body), cur_pat))
-            cur_pat = bm.group(1).strip().strip("\"'")
-            cur_body = [bm.group(2).strip()] if bm.group(2).strip() else []
-        elif cur_pat is not None:
+        if depth == 0:
+            bm = re.match(r"^([^()]+?)\s*\)\s*(.*)$", stripped)
+            if bm:
+                if cur_pat is not None:
+                    branches.append((cur_pat, "\n".join(cur_body), cur_pat))
+                cur_pat = bm.group(1).strip().strip("\"'")
+                cur_body = [bm.group(2).strip()] if bm.group(2).strip() else []
+                continue
+        if re.search(r"\bcase\b", stripped):
+            depth += 1
+        elif re.search(r"\besac\b", stripped):
+            depth = max(0, depth - 1)
+        if cur_pat is not None:
             cur_body.append(ln)
-            if stripped.endswith(";;"):
+            if depth == 0 and stripped.endswith(";;"):
                 branches.append((cur_pat, "\n".join(cur_body), cur_pat))
                 cur_pat = None
                 cur_body = []
-    # flush 最后的未闭合分支（单行 `*) ... ;;` 结尾）
     if cur_pat is not None and cur_body:
         branches.append((cur_pat, "\n".join(cur_body), cur_pat))
     return CaseStmt(block, sel, branches)
@@ -358,6 +365,7 @@ def _find_body_start_line(block_lines: list[str], header_match) -> int:
     for i, ln in enumerate(block_lines):
         if "in" in ln and ("case " in ln or ln.lstrip().startswith("case")):
             start = i
+            break  # 只认最外层 case 头；嵌套 case 的头不能覆盖它
     # body 从含 in 的行之后开始
     for j in range(start + 1, len(block_lines)):
         return j
@@ -558,7 +566,7 @@ def eval_condition(cond: str, env: dict[str, SVal]) -> Optional[bool]:
         return eval_numeric_compare(op, lv, rv)
 
     # 字符串相等/不等/匹配
-    m = re.search(r"(.*?)\s*(==|=|!=|=~)\s*(.*)", inner_q)
+    m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner_q)
     if not m:
         return None
     op = m.group(2)
@@ -578,9 +586,12 @@ def eval_condition(cond: str, env: dict[str, SVal]) -> Optional[bool]:
     rv = _resolve_var_side(right)
     if lv is None or rv is None:
         return None
-    if op == "!=":
-        return lv != rv
-    return lv == rv
+    if "*" in rv or "?" in rv or "[" in rv:
+        import fnmatch
+        matched = fnmatch.fnmatchcase(lv, rv)
+    else:
+        matched = lv == rv
+    return (not matched) if op == "!=" else matched
 
 
 # ==================== 执行器 ====================
@@ -630,6 +641,9 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
 
     budget = Budget()
     env = _init_env(entry_args)
+    # 预算覆盖初始化入口（启动参数 + $@/$*）。超过上限 → 放弃精确分析、回退全文。
+    if len(env) > MAX_VARS:
+        return None
 
     # 组装可达文本：保留被选中的分支体，其余普通行原样保留
     out: list[str] = []
@@ -643,7 +657,8 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
         if isinstance(s, AssignStmt):
             # 变量表上限：脚本可以是自动生成/拼接的，几万个变量赋值会把
             # 环境表一路撑大（TS 侧同款保护，超限返回 None 回退全文匹配）。
-            if len(env) >= MAX_VARS:
+            # 只限制“新增变量”；修改已有变量的值不增加表项，不应触发回退。
+            if s.name not in env and len(env) >= MAX_VARS:
                 return None
             # 赋值：右值求值写入 env
             modelable_encountered = True

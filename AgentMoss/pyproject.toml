@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-moss"
-version = "0.17.32"
+version = "0.17.34"
 description = "Multi-layer security analysis engine for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,3 +27,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["agent_moss*"]
+# 测试用例不进交付物（2026-10 事故：wheel 混入 36 个测试文件）。顶层 tests/
+# 不是包，但包内若出现 agent_moss/tests 会被 include 通配收进来，这里兜底排除。
+exclude = ["agent_moss.tests*"]

@@ -18,3 +18,8 @@ prune tests
 # __pycache__/ 一并收进 sdist，再经 `python -m build` 的 sdist→wheel 流程传染进
 # wheel（0.15.5 wheel 实测混入 8 个 .pyc，且内嵌构建机绝对路径）。
 global-exclude __pycache__ *.pyc *.pyo
+
+# 场景专属/商业内容（editions/）与开发资产不进任何分发渠道
+prune editions
+prune docs
+prune benchmarks

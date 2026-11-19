@@ -287,6 +287,56 @@ def _is_protected_write_path(path: str) -> bool:
     return False
 
 
+#: 可执行脚本扩展名：本会话写入后又被执行过的脚本，其同目录产物视为会话生成
+#: （见 RBW-11 / ``_is_script_generated_target``）。
+_SCRIPT_FILE_RE = re.compile(
+    r"\.(?:py|pyw|sh|bash|zsh|js|mjs|cjs|ts|pl|rb|php|ps1|bat|cmd)$", re.IGNORECASE
+)
+
+
+def _is_script_generated_target(
+    path: str,
+    written_scripts: list[tuple[str, str, int]],
+    shell_runs: list[tuple[int, str]],
+) -> bool:
+    """目标是否是「本会话自己写脚本、脚本自己生成」的产物（RBW-11）。
+
+    RBW 只追踪工具层的读/写：脚本经 shell 执行后生成的文件，引擎看不到写事件，
+    后续覆盖/编辑该文件会被判「未读」误报（2026-11 鸿蒙实测：agent 自己写
+    ``gen_depreciation.py`` 并执行，生成 ``折旧表.csv`` 后 writeFile 覆盖被拦）。
+
+    全部满足才豁免（任何一条不满足都维持 RBW 要求）：
+    1. 目标 basename 至少 3 个字符（避免 ``a``/``x`` 这类宽匹配）；
+    2. 历史里有**整文件覆盖写**的脚本文件（.py/.sh/.js/...），且与目标**同目录**；
+    3. 写脚本的内容里出现目标 basename（脚本按名生成/输出该文件）；
+    4. 脚本写入**之后**，历史里有 shell 动作执行过它（命令文本含脚本 basename）。
+
+    受保护路径（系统目录 / 家目录隐藏配置）由调用方排除；本函数只判「是不是
+    会话自产」。RBW 是工作流防护而非安全边界（RBW-8），敏感路径/危险命令仍由
+    L1/敏感路径规则独立判定。
+    """
+    base = os.path.basename(path)
+    if len(base) < 3:
+        return False
+    target_dir = os.path.dirname(path)
+    if not target_dir:
+        return False
+    for script_path, script_detail, script_idx in written_scripts:
+        if os.path.dirname(script_path) != target_dir:
+            continue
+        if base not in script_detail:
+            continue
+        script_name = os.path.basename(script_path)
+        if not script_name:
+            continue
+        if any(
+            run_idx > script_idx and script_name in command
+            for run_idx, command in shell_runs
+        ):
+            return True
+    return False
+
+
 def _history_command_text(hist_detail_raw: str) -> str:
     """历史动作的「命令文本」：JSON 参数取 command/cmd 字段，否则原样。
 
@@ -1680,7 +1730,12 @@ class LogicRulesChecker:
         #: 只用于**精确编辑**（editFile/searchReplace）：模型自己写的内容再局部改，
         #: 不必重新读；整文件覆盖仍要求全量读（整体重写可能丢失未读内容）。
         history_written_paths: set[str] = set()
-        for action in action_history:
+        #: 本会话「整文件覆盖写」过的脚本文件（归一化路径、写入参数原文、历史序号），
+        #: 与 shell 执行动作一起用于 RBW-11 脚本生成豁免。
+        history_written_scripts: list[tuple[str, str, int]] = []
+        #: 本会话的 shell 执行动作（历史序号、命令文本）：确认脚本确实被执行过。
+        shell_run_actions: list[tuple[int, str]] = []
+        for action_idx, action in enumerate(action_history):
             hist_detail_raw = action.get("action_detail", "") if isinstance(action, dict) else ""
             if isinstance(hist_detail_raw, dict):
                 hist_detail_raw = json.dumps(hist_detail_raw, ensure_ascii=False)
@@ -1703,6 +1758,14 @@ class LogicRulesChecker:
             ):
                 for p in _declared_write_paths(hist_detail_raw, self._profile):
                     history_written_paths.add(p)
+                    # 脚本文件额外记下写入参数原文（含 content），供脚本生成豁免
+                    # 判断「脚本内容是否提到目标文件名」。
+                    if _SCRIPT_FILE_RE.search(p):
+                        history_written_scripts.append((p, hist_detail_raw, action_idx))
+            if hist_name in BASH_LIKE_ACTION_TYPES:
+                shell_run_actions.append(
+                    (action_idx, _history_command_text(hist_detail_raw))
+                )
             for p, upto in partial_paths.items():
                 if p in history_partial_read:
                     old = history_partial_read[p]
@@ -1747,6 +1810,13 @@ class LogicRulesChecker:
         history_written_paths = {
             p for p in (_normalize_path_for_compare(x, cwd) for x in history_written_paths) if p
         }
+        # 脚本路径同样按调用方 cwd 归一化，后续与写目标比「同目录」。
+        normalized_scripts: list[tuple[str, str, int]] = []
+        for p, detail, idx in history_written_scripts:
+            np = _normalize_path_for_compare(p, cwd)
+            if np:
+                normalized_scripts.append((np, detail, idx))
+        history_written_scripts = normalized_scripts
 
         # 追加豁免：`>>` / `tee -a` 只追加不破坏原内容，普通路径不要求先读；
         # 受保护路径（系统目录 / 家目录隐藏配置）仍保留先读要求——
@@ -1795,6 +1865,16 @@ class LogicRulesChecker:
             if not is_full_read and precise_edit and any(
                 _path_is_same_or_under(path, wp) or _path_is_same_or_under(wp, path)
                 for wp in history_written_paths
+            ):
+                is_full_read = True
+            # 脚本生成豁免（RBW-11）：本会话自己写、自己执行过的脚本在**同目录**
+            # 生成的产物，生成逻辑在会话内已知，不要求再读一遍；受保护路径不豁免。
+            if (
+                not is_full_read
+                and not _is_protected_write_path(path)
+                and _is_script_generated_target(
+                    path, history_written_scripts, shell_run_actions
+                )
             ):
                 is_full_read = True
             is_partial_covered = False

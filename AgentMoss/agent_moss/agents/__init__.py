@@ -19,6 +19,7 @@ Python 与 TypeScript 两端共享同一份 rules.json：
 
 from pathlib import Path
 import threading
+from contextlib import nullcontext
 import logging
 
 from ..infra.paths import asset_dir, is_safe_id
@@ -65,6 +66,8 @@ def get_agent_extensions(agent_id: str) -> AgentExtensions | None:
     Returns:
         AgentExtensions 实例，或 None（无 agent 专属规则）。
     """
+    from ..engine.prefilter_rule_source import capture_startup_sources, record_startup_read
+    capture_startup_sources()
     if not agent_id:
         return None
     # 目录穿越防护：agent_id 会被拼进 `<agents>/<id>/rules.json`，而它是调用方
@@ -72,19 +75,21 @@ def get_agent_extensions(agent_id: str) -> AgentExtensions | None:
     if not is_safe_id(agent_id):
         logger.warning("非法 agent_id 已忽略（含路径字符或超长）: %.120r", agent_id)
         return None
+    from ..infra.runtime_config import _READONLY_RUNTIME
+    readonly = _READONLY_RUNTIME.get() is not None
     # 缓存键来自调用方自报，穷举不同 id 会撑大缓存（下面的 None 分支同样会写缓存）
-    if len(_cache) >= _CACHE_MAX:
+    if not readonly and len(_cache) >= _CACHE_MAX:
         _cache.clear()
 
     # 双重检查锁定，避免并发重复 IO；指纹变化（runtime JSON 被改）时重新加载。
     fp = _rule_source_fingerprint()
-    cached = _cache.get(agent_id)
+    cached = None if readonly else _cache.get(agent_id)
     if cached is not None and cached[0] == fp:
         return cached[1]
 
-    with _lock:
+    with (nullcontext() if readonly else _lock):
         fp = _rule_source_fingerprint()
-        cached = _cache.get(agent_id)
+        cached = None if readonly else _cache.get(agent_id)
         if cached is not None and cached[0] == fp:
             return cached[1]
         if cached is not None:
@@ -99,22 +104,31 @@ def get_agent_extensions(agent_id: str) -> AgentExtensions | None:
             if has_runtime_config():
                 ext = get_enabled_agent_extensions(load_runtime_config(), agent_id)
         except Exception:
+            if readonly:
+                raise
             pass  # runtime_config 不可用时回退 rules.json
 
         if ext is None:
             rules_file = _agents_dir() / agent_id / "rules.json"
             if not rules_file.exists():
+                record_startup_read(rules_file, None)
                 logger.debug("agent %s 无 rules.json，走通用模式", agent_id)
-                _cache[agent_id] = (fp, None)
+                if not readonly:
+                    _cache[agent_id] = (fp, None)
                 return None
             try:
                 ext = AgentExtensions.from_json(rules_file)
             except Exception as e:
+                record_startup_read(rules_file, None)
+                if readonly:
+                    raise
                 logger.error("加载 agent %s rules.json 失败: %s", agent_id, e)
-                _cache[agent_id] = (fp, None)
+                if not readonly:
+                    _cache[agent_id] = (fp, None)
                 return None
 
-        _cache[agent_id] = (fp, ext)
+        if not readonly:
+            _cache[agent_id] = (fp, ext)
         logger.info(
             "加载 agent %s 定制规则: %d cmd patterns, %d injection keywords, "
             "%d sensitive paths, %d builtin safe skills, %d builtin safe action types",
