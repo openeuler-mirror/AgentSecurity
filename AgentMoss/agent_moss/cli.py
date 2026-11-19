@@ -428,6 +428,18 @@ def main():
              "链状态会自动切换为跨进程一致模式",
     )
 
+    # accel 子命令（预筛包手动构建与磁盘检查；prefilter 可选模块）
+    accel_parser = subparsers.add_parser("accel", help="预筛包手动构建与磁盘检查")
+    accel_sub = accel_parser.add_subparsers(dest="accel_command")
+    accel_build = accel_sub.add_parser("build-db", help="在固定目录生成或更新预筛包")
+    accel_build.add_argument("--profile", choices=["linux", "windows", "macos", "harmony"], default="linux")
+    accel_build.add_argument("--rules-file", help="完整规则快照；提供后不追加默认规则")
+    accel_build.add_argument("--out", required=True, help="加速包专用目录（不能是软链接）")
+    accel_build.add_argument("--disable-rule", action="append", default=[], metavar="RULE_KEY",
+                             help="禁用某条规则（可重复）")
+    accel_status = accel_sub.add_parser("status", help="只读检查磁盘包")
+    accel_status.add_argument("--db", help="包目录；默认 AGENT_MOSS_ACCEL_DB")
+
     install_parser = subparsers.add_parser("install", help="Install systemd service for AgentMoss")
     install_parser.add_argument("--enable", action="store_true", help="Enable service on boot (systemctl enable)")
 
@@ -482,9 +494,16 @@ def main():
     state_reset.add_argument("--yes", action="store_true", help="确认删除")
     state_reset.add_argument("--port", type=int, default=9090, help="用于探测服务是否在跑")
 
-    # brain 子命令（contribute = 提交本地沉淀为 MR；中心化上传接口在此预留）
-    from agent_moss.brain.contributor import add_contribute_parser
-    add_contribute_parser(subparsers)
+    # brain 子命令（contribute = 提交本地沉淀为 MR；中心化上传接口在此预留）。
+    # brain 是可选模块：场景裁剪版（如 openEuler）不交付，缺失时跳过子命令即可，
+    # 不能拖垮 --version / server / analyze 等主命令（2026-11 裁剪仓实测：硬导入
+    # 导致 `/usr/bin/agent-moss --version` 直接 ModuleNotFoundError）。
+    try:
+        from agent_moss.brain.contributor import add_contribute_parser
+    except ImportError:
+        pass
+    else:
+        add_contribute_parser(subparsers)
 
     args = parser.parse_args()
 
@@ -494,6 +513,9 @@ def main():
         sys.exit(cmd_analyze(args))
     elif args.command == "server":
         sys.exit(cmd_server(args))
+    elif args.command == "accel":
+        from .accel_cli import cmd_accel
+        sys.exit(cmd_accel(args))
     elif args.command == "install":
         sys.exit(cmd_install(args))
     elif args.command == "status":

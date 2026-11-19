@@ -25,6 +25,9 @@ ENV_DATA_ROOT = "AGENT_MOSS_DATA_DIR"
 # 归属实例标识（spawn/systemd 注入，多实例隔离用）
 ENV_INSTANCE = "AGENT_MOSS_INSTANCE"
 
+# 链状态根目录（未设 → ~/.agentmoss；有 instance 时再按 instance 分子目录）
+ENV_STATE_DIR = "AGENT_MOSS_STATE_DIR"
+
 # 默认数据根目录（旧行为兼容）
 DEFAULT_DATA_ROOT = Path.home() / ".config" / "agentmoss"
 
@@ -186,3 +189,41 @@ def get_token_stats_path() -> Path:
     if instance:
         return get_data_root() / instance / "agent_moss_token_stats.json"
     return get_data_root() / "agent_moss_token_stats.json"
+
+
+def get_instance_dir() -> Path:
+    """有 instance → <data_root>/<instance>；无 instance → <data_root>。"""
+    instance = get_instance()
+    if instance:
+        return get_data_root() / instance
+    return get_data_root()
+
+
+def get_port_file_path() -> Path:
+    """AgentMoss 端口文件路径（按 instance 隔离）。
+
+    有 instance → <data_root>/<instance>/agent_moss_server.port.json
+    无 instance → <data_root>/agent_moss_server.port.json（旧路径）
+    """
+    return get_instance_dir() / "agent_moss_server.port.json"
+
+
+def get_state_root() -> Path:
+    """链状态根目录：AGENT_MOSS_STATE_DIR > ~/.agentmoss。"""
+    env_path = os.getenv(ENV_STATE_DIR)
+    if env_path:
+        return Path(env_path)
+    return Path.home() / ".agentmoss"
+
+
+def get_state_db_path() -> Path:
+    """链状态库路径（按 instance 隔离）。
+
+    有 instance → <state_root>/<instance>/stateful_chains.db
+    无 instance → <state_root>/stateful_chains.db（旧路径）
+    """
+    instance = get_instance()
+    base = get_state_root()
+    if instance:
+        return base / instance / "stateful_chains.db"
+    return base / "stateful_chains.db"

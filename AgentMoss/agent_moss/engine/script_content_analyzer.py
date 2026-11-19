@@ -574,10 +574,6 @@ def analyze_script_content(
     if not chain_result.nodes:
         return chain_result
 
-    # L1 兜底扫描：递归过程中已内联扫描的命中节点（l1_hit）跳过，其余补扫
-    if command_scanner is not None:
-        scan_script_chain_with_l1(chain_result, command_scanner, stop_on_critical)
-
     # 关键词扫描（兼容 L3）
     scan_script_chain_keywords(chain_result)
 

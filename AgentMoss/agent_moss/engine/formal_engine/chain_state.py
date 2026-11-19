@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -25,13 +26,35 @@ from typing import Any
 
 from .stateful import StatefulChainTracker, AdvanceResult, StateNode
 
+logger = logging.getLogger(__name__)
+
 
 def default_state_db_path() -> str:
-    """默认状态库路径（与 brain/runtime_config 同目录风格）。"""
-    base = os.environ.get("AGENT_MOSS_STATE_DIR") or os.path.join(
-        Path.home(), ".agentmoss"
-    )
-    return os.path.join(base, "stateful_chains.db")
+    """默认状态库路径（按 instance 隔离）。
+
+    有 AGENT_MOSS_INSTANCE → <state_root>/<instance>/stateful_chains.db
+    无 instance → <state_root>/stateful_chains.db（旧路径，兼容）
+    旧共享库存在而 instance 库不存在时，用 SQLite backup 复制一份（保留历史链）。
+    """
+    from ...infra.paths import get_instance, get_state_db_path, get_state_root
+
+    path = get_state_db_path()
+    if get_instance():
+        legacy = get_state_root() / "stateful_chains.db"
+        if not path.exists() and legacy.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with sqlite3.connect(str(legacy)) as src, sqlite3.connect(str(path)) as dst:
+                    src.backup(dst)
+                logger.warning(
+                    "链状态库按 instance 隔离：已从旧共享库 %s 复制到 %s",
+                    legacy, path,
+                )
+            except Exception:  # noqa: BLE001 — 迁移失败不阻断，使用新库
+                logger.warning(
+                    "迁移链状态库失败（将使用新空库）: %s", path, exc_info=True
+                )
+    return str(path)
 
 
 class ChainStateStore:

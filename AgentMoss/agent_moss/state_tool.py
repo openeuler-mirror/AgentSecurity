@@ -24,8 +24,9 @@ from pathlib import Path
 
 
 def _db_path() -> Path:
-    base = os.environ.get("AGENT_MOSS_STATE_DIR") or str(Path.home() / ".agentmoss")
-    return Path(base) / "stateful_chains.db"
+    from .engine.formal_engine.chain_state import default_state_db_path
+
+    return Path(default_state_db_path())
 
 
 def _service_running(port: int = 9090) -> bool:

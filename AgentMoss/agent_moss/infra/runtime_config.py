@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from .rules_mode import get_rules_mode, is_runtime_config_disabled
@@ -624,6 +626,34 @@ def save_runtime_config(config: dict) -> None:
 #: 约定：调用方**不得原地修改**返回的 dict（需改请 copy 后改，或改完落盘使缓存失效）。
 _RUNTIME_CONFIG_CACHE: dict[tuple[str, int, int], dict] = {}
 
+#: 预筛（prefilter）只读快照：在该上下文内 load_runtime_config 直接返回快照，
+#: 不创建、不改写用户配置文件（prefilter RuleSource 读取规则源时使用）。
+_READONLY_RUNTIME: ContextVar = ContextVar('prefilter_readonly_runtime', default=None)
+
+
+def load_runtime_config_readonly() -> dict:
+    """按正常合并语义读取运行时配置，但不创建/改写配置文件。"""
+    if is_runtime_config_disabled():
+        return {"version": 1, "layers": dict(DEFAULT_LAYERS)}
+    path = get_runtime_config_path()
+    try:
+        user = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return generate_source_defaults()
+    if type(user) is not dict:
+        raise ValueError('runtime configuration must be an object')
+    return merge_config(user, generate_source_defaults())
+
+
+@contextmanager
+def readonly_runtime_snapshot():
+    value = load_runtime_config_readonly()
+    token = _READONLY_RUNTIME.set(value)
+    try:
+        yield value
+    finally:
+        _READONLY_RUNTIME.reset(token)
+
 
 def load_runtime_config() -> dict:
     """加载运行时配置：缺失则从种子生成并写入，已有则合并新出厂规则。
@@ -634,6 +664,9 @@ def load_runtime_config() -> dict:
     直接返回只含默认层级开关的空配置；各 `*_or_default` 取数函数因此自动回退到
     包内 profile / 模块常量（cold 模式再叠加规则目录）。
     """
+    readonly = _READONLY_RUNTIME.get()
+    if readonly is not None:
+        return readonly
     if is_runtime_config_disabled():
         return {"version": 1, "layers": dict(DEFAULT_LAYERS)}
     config_path = get_runtime_config_path()

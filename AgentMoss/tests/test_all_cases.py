@@ -578,6 +578,8 @@ class TestLayer1And2:
             ("logic-41-rbw-history-sed-range-partial-deny.json", dict(decision="Deny", risk_level="high")),
             ("logic-42-rbw-history-cat-pipe-head-partial-deny.json", dict(decision="Deny", risk_level="high")),
             ("logic-44-rbw-tar-c-existing-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：脚本生成豁免的反向看护 —— 脚本写了但没执行过，仍要求先读
+            ("logic-67-script-not-executed-deny.json", dict(decision="Deny", risk_level="high")),
             # 2026-11：RBW/意图误报修正的反向看护（放行项在 Allow 列表 45-51）
             ("logic-52-rbw-real-redirect-still-deny.json", dict(decision="Deny", risk_level="critical")),
             ("logic-53-intent-real-delete-still-deny.json", dict(decision="Deny", risk_level="high")),
@@ -868,6 +870,8 @@ class TestLayer1And2:
             # 2026-11：RBW/意图误报修正（精确编辑/写后编辑/变量赋值/heredoc/目录/内容词）
             ("logic-45-rbw-editfile-partial-read-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-46-rbw-editfile-after-write-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：本会话自己写并执行过的脚本在同目录生成的文件（脚本产物免读）
+            ("logic-66-script-generated-output-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-47-rbw-var-assign-not-write-target-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-48-rbw-heredoc-body-not-write-target-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-49-rbw-directory-target-allow.json", dict(decision="Allow", risk_level="low")),
@@ -1399,6 +1403,8 @@ class TestLayer1And2:
             ("allow-1125-grep-pattern-pipe-passwd.json", dict(decision="Allow", risk_level="low")),
             # 2026-11 鸿蒙压测：rg 检索 remove|delete + --glob "*.py" 是只读检索，非批量误删
             ("allow-1126-rg-search-delete-pattern.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11 鸿蒙：echo "$?" 的 ? 不是通配符
+            ("allow-1127-rm-exit-code.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-scan-allow.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-cred-allow.json", dict(decision="Allow", risk_level="low")),
             ("combo-listener-exec-exfil-allow.json", dict(decision="Allow", risk_level="low")),

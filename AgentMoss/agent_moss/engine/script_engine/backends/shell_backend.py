@@ -233,45 +233,50 @@ def parse_case(content: str, args: list[str] | None) -> str | None:
 
 
 def _eval_if_condition(cond: str, args: list[str] | None) -> bool | None:
-    """求值 if 的字符串相等条件；无法判定返回 None。
+    """求值 if 的字符串条件；无法判定返回 None。
 
     支持：
-      [ "$1" = "clean" ]   /  [ "$1" == "clean" ]
-      [ "$MODE" = "x" ]    （$MODE 不可绑定 → None）
-      [[ "$1" = test ]]
-      [ -f /tmp/x ]        （文件存在性 → None，运行期）
-    条件变量里 $1 替换为 args[0] 后比较。
+      [ "$1" = "clean" ] / [ "$1" == "clean" ] / [ "$1" != "x" ]
+      [ "$1" = bak* ]（glob 通配符）
+      [[ "$1" =~ ^ba.* ]]（正则）
+      [ -f /tmp/x ]（文件存在性 → None，运行期）
+    条件变量里 $1 替换为 args[0] 后比较；操作符按最长优先匹配，`=~` 不会被 `=` 截断。
     """
     if not args:
         return None
     inner = re.sub(r"^\[\[?|\]\]?$", "", cond).strip()
-    # 单引号/双引号剥除
     inner = inner.replace('"', "").replace("'", "")
-    # 找相等操作符
-    m = re.search(r"(.*?)\s*(==|=)\s*(.*)", inner)
+    m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner)
     if not m:
-        return None  # 非相等条件（-f 等）无法静态判定
+        return None  # 非字符串条件（-f 等）无法静态判定
+    op = m.group(2)
     left, right = m.group(1).strip(), m.group(3).strip()
-    # 左侧变量绑定：$1 → args[0]
-    lm = re.match(r"^\$(\d+)$", left)
-    if lm:
-        idx = int(lm.group(1))
-        if 1 <= idx <= len(args):
-            left = args[idx - 1]
-        else:
+
+    def _resolve(tok: str) -> str | None:
+        rm = re.match(r"^\$(\d+)$", tok)
+        if rm:
+            idx = int(rm.group(1))
+            return args[idx - 1] if 1 <= idx <= len(args) else None
+        if tok.startswith("$"):
+            return None  # $MODE 命名变量不可绑定
+        return tok
+
+    lv, rv = _resolve(left), _resolve(right)
+    if lv is None or rv is None:
+        return None
+    if op == "=~":
+        if rv.startswith("/") and rv.endswith("/") and len(rv) > 1:
+            rv = rv[1:-1]
+        try:
+            return bool(re.search(rv, lv))
+        except re.error:
             return None
-    elif left.startswith("$"):
-        return None  # $MODE 命名变量不可绑定
-    # 右侧同理
-    rm = re.match(r"^\$(\d+)$", right)
-    if rm:
-        idx = int(rm.group(1))
-        if 1 <= idx <= len(args):
-            right = args[idx - 1]
-        else:
-            return None
-    # 字面量相等判断
-    return (left == right)
+    if "*" in rv or "?" in rv or "[" in rv:
+        import fnmatch
+        matched = fnmatch.fnmatchcase(lv, rv)
+    else:
+        matched = lv == rv
+    return (not matched) if op == "!=" else matched
 
 
 def parse_if(content: str, args: list[str] | None) -> str | None:

@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -40,6 +42,10 @@ def test_module_version_matches_pyproject():
     assert _module_version() == _pyproject_version()
 
 
+@pytest.mark.skipif(
+    not (ROOT / "ts" / "package.json").exists(),
+    reason="Python-only 交付（无 ts/）：跳过双端版本一致性断言",
+)
 def test_ts_package_version_matches_pyproject():
     """npm 包版本必须与 Python 包版本一致（双端发版同号）。"""
     assert _ts_package_version() == _pyproject_version()

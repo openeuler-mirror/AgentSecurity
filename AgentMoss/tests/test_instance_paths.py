@@ -7,6 +7,7 @@
 """
 
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -17,8 +18,10 @@ def _clean_env():
     """每个用例前清掉 AGENT_MOSS_INSTANCE / AGENT_MOSS_DATA_DIR，用后还原。"""
     saved_i = os.environ.get("AGENT_MOSS_INSTANCE")
     saved_d = os.environ.get("AGENT_MOSS_DATA_DIR")
+    saved_s = os.environ.get("AGENT_MOSS_STATE_DIR")
     os.environ.pop("AGENT_MOSS_INSTANCE", None)
     os.environ.pop("AGENT_MOSS_DATA_DIR", None)
+    os.environ.pop("AGENT_MOSS_STATE_DIR", None)
     yield
     if saved_i is None:
         os.environ.pop("AGENT_MOSS_INSTANCE", None)
@@ -28,6 +31,10 @@ def _clean_env():
         os.environ.pop("AGENT_MOSS_DATA_DIR", None)
     else:
         os.environ["AGENT_MOSS_DATA_DIR"] = saved_d
+    if saved_s is None:
+        os.environ.pop("AGENT_MOSS_STATE_DIR", None)
+    else:
+        os.environ["AGENT_MOSS_STATE_DIR"] = saved_s
 
 
 def _fresh_token_path():
@@ -80,3 +87,45 @@ def test_data_root_override_no_instance():
     os.environ["AGENT_MOSS_DATA_DIR"] = "/tmp/am-data"
     os.environ.pop("AGENT_MOSS_INSTANCE", None)
     assert Path(_fresh_token_path()) == Path("/tmp/am-data/agent_moss_token_stats.json")
+
+def test_port_file_instance_scoped():
+    """端口文件按 instance 分：避免同机多实例互相覆盖。"""
+    from agent_moss.infra.paths import get_port_file_path
+
+    os.environ["AGENT_MOSS_DATA_DIR"] = "/tmp/am-data"
+    os.environ["AGENT_MOSS_INSTANCE"] = "xiaoo"
+    assert get_port_file_path() == Path("/tmp/am-data/xiaoo/agent_moss_server.port.json")
+    os.environ.pop("AGENT_MOSS_INSTANCE", None)
+    assert get_port_file_path() == Path("/tmp/am-data/agent_moss_server.port.json")
+
+
+def test_state_db_instance_scoped():
+    """链状态库按 instance 分：避免 xiaoO / OpenDesk 共用一份状态。"""
+    from agent_moss.infra.paths import get_state_db_path
+
+    os.environ["AGENT_MOSS_STATE_DIR"] = "/tmp/am-state"
+    os.environ["AGENT_MOSS_INSTANCE"] = "opendesk"
+    assert get_state_db_path() == Path("/tmp/am-state/opendesk/stateful_chains.db")
+    os.environ.pop("AGENT_MOSS_INSTANCE", None)
+    assert get_state_db_path() == Path("/tmp/am-state/stateful_chains.db")
+
+
+def test_state_db_migrates_legacy_shared_db(tmp_path):
+    """首次启用 instance 隔离时，把旧共享库复制到实例目录（保留历史链）。"""
+    from agent_moss.engine.formal_engine.chain_state import default_state_db_path
+
+    os.environ["AGENT_MOSS_STATE_DIR"] = str(tmp_path)
+    os.environ["AGENT_MOSS_INSTANCE"] = "xiaoo"
+    legacy = tmp_path / "stateful_chains.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE marker(x INTEGER)")
+    conn.execute("INSERT INTO marker VALUES (1)")
+    conn.commit()
+    conn.close()
+
+    path = Path(default_state_db_path())
+    assert path == tmp_path / "xiaoo" / "stateful_chains.db"
+    assert path.exists()
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT x FROM marker").fetchone()[0] == 1
+    conn.close()

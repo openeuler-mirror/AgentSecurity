@@ -327,6 +327,12 @@ def create_app() -> FastAPI:
         sp.fail_fast_on_auth_error()
         # 部署自检：明确告知场景规则是否启用（未启用 = 银行沙箱目录白名单不生效）
         _log_deployment_selfcheck()
+        # 预筛包监控（可选模块）：每个 worker 显式启动；首包未加载时请求继续走 Python。
+        try:
+            from ..engine.prefilter_reload import start_configured_manager
+            start_configured_manager()
+        except ImportError:
+            pass
         # 在默认线程池里预热：真实请求也是经 run_in_executor 跑的（routes.py:350），
         # 这样线程池本身、以及 worker 线程里才会触发的惰性导入也一并热掉。
         loop = asyncio.get_running_loop()
@@ -341,6 +347,17 @@ def create_app() -> FastAPI:
         from ..infra.loop_monitor import get_loop_monitor
 
         await get_loop_monitor().stop()
+
+    async def close_prefilter_manager():
+        """关闭预筛包监控（可选模块；未安装时静默跳过）。"""
+        try:
+            from ..engine.prefilter_reload import stop_managers
+        except ImportError:
+            return
+        stop_managers()
+
+    # 用 router.add_event_handler 而非 @app.on_event，避免新增 FastAPI 弃用告警。
+    app.router.add_event_handler("shutdown", close_prefilter_manager)
 
     # CORS：**不再默认全放行**（2026-10 安全加固）。
     # 为什么收紧是安全的：Console 前端用的是相对路径 fetch（同源），iframe 嵌入时
@@ -650,12 +667,15 @@ def _write_port_file(port: int) -> None:
     写失败只记日志（调用方仍可用配置端口或 health 探测）。
     """
     try:
-        from ..infra.paths import get_data_root
-        path = get_data_root() / "agent_moss_server.port.json"
+        from ..infra.paths import get_instance, get_port_file_path
+        path = get_port_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "port": port,
             "pid": os.getpid(),
+            # instance/version 供调用方校验，避免同机多实例端口文件串台
+            "instance": get_instance(),
+            "version": __version__,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = path.with_name(path.name + ".tmp")

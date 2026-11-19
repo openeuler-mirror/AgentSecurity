@@ -182,8 +182,9 @@ def _check_rules(report: DoctorReport) -> None:
 
 
 def _check_chain_state(report: DoctorReport) -> None:
-    base = os.environ.get("AGENT_MOSS_STATE_DIR") or str(Path.home() / ".agentmoss")
-    db = Path(base) / "stateful_chains.db"
+    from .engine.formal_engine.chain_state import default_state_db_path
+
+    db = Path(default_state_db_path())
     if not db.exists():
         report.add("链状态库", "ok", "尚未创建（首次有状态分析时生成）")
         return

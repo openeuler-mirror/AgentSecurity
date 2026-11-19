@@ -1,22 +1,22 @@
 # tests/cases — AgentMoss 安全分析引擎基准测试集
 
 > 本文档记录 `tests/cases/` 下全部测试用例的统计与实测通过率数据。
-> 数据口径：对 430 个用例逐一调用 `agent_moss.engine.analyzer.analyze()`，比较实际 `decision` 与用例期望 `expected_decision`。
+> 数据口径：对 1287 个用例逐一调用 `agent_moss.engine.analyzer.analyze()`，比较实际 `decision` 与用例期望 `expected_decision`。
 > 复现命令见文末。
 
 ---
 
 ## 一、用例总量
 
-`tests/cases/` 共 **1243** 个测试用例，其中 **Deny 557 个、Allow 686 个**（2026-11 OpenDesk 写工具误报 + append 豁免用例后重算）。
+`tests/cases/` 共 **1287** 个测试用例，其中 **Deny 573 个、Allow 714 个**（2026-11 脚本产物 RBW 豁免 logic-66/67 后重算）。
 
 按子目录分层（对应 AgentMoss 三层规则 + agent 专属规则 + 场景定制规则）：
 
 | 子目录 | 层级 | 用例数 | 说明 |
 |---|---|---|---|
-| `l1/` | L1 特征匹配 | 863 | 危险命令正则 + 敏感路径 + 内联脚本 + 脚本分支感知（case $1 / python sys.argv） + 用户规则 |
+| `l1/` | L1 特征匹配 | 869 | 危险命令正则 + 敏感路径 + 内联脚本 + 脚本分支感知（case $1 / python sys.argv） + 用户规则 |
 | `os/<平台>/` | **平台专属规则** | 213 | `os/windows/`(154) + `os/macos/`(36) + `os/harmony/`(23)：子目录名即 `input.os_type`。**客户交付集默认排除**（客户沙箱是麒麟/Linux，平台用例在此判定必然失败） |
-| `l2/` | L2 逻辑规则 | 92 | read_before_write / 意图一致 / 提权 / 授权 / 间接访问 / 通配 / 重定向 / 组合攻击链（combo_chain）/ 跨会话组合链 + P2–P8 形式化性质（formal_engine） |
+| `l2/` | L2 逻辑规则 | 117 | read_before_write / 意图一致 / 提权 / 授权 / 间接访问 / 通配 / 重定向 / 组合攻击链（combo_chain）/ 跨会话组合链 + P2–P8 形式化性质（formal_engine） |
 | `l3/` | L3 LLM 语义 | 32 | security skill 命中+放行，需有效 LLM key 真跑 |
 | `agent/` | Agent 专属规则 | 19 | xiaoo/opendesk 的 extra_* / builtin_safe_* 看护（见下节） |
 | `scenario/<id>/` | 场景定制规则 | 37 | 客户沙箱部署级约束（如 bank 的目录白名单/禁 ssh），见下节 |
@@ -65,32 +65,25 @@
 `conftest.py` 的 `_clear_agent_cache` autouse fixture 同时清理 agent 与场景扩展缓存，防止
 用例间串扰。
 
-**关于测试数字（"tests/cases 与 Python/TS passed 数不一致"）**：`tests/cases/` 的 l1+l2+agent 共 961 个 JSON 是 Python 与 TS **完全共用**的归一化用例（单一事实源）——双端加载器读同一批文件，**规则覆盖考察的是同一批用例**。两端 pytest/vitest 报告的总 passed 数更大且**互不相同**，是因为**各自端还有语言特有的手写单测**（不读 JSON、直接测引擎子模块）：
+**关于测试数字（"tests/cases 与 Python/TS passed 数不一致"）**：`tests/cases/` 的 l1+l2+agent 共 1005 个 JSON 是 Python 与 TS **完全共用**的归一化用例（单一事实源）——双端加载器读同一批文件，**规则覆盖考察的是同一批用例**。两端 pytest/vitest 报告的总 passed 数更大且**互不相同**，是因为**各自端还有语言特有的手写单测**（不读 JSON、直接测引擎子模块）：
 - **Python 额外单测**：`test_all_cases.py::TestHeuristicDetector`/`TestLogicRules`/`TestOSProfile`/`TestCoordinator` 等手写方法、`test_agents_*`、`test_brain`、`test_runtime_config_merge`、`test_instance_paths`、`test_cases_exec_smoke`（cases_exec 工具链冒烟看护：警告文案命令替换 lint + 匹配器决策表 + 命令集「判定集/执行集不串台」决策表）。
 - **TS 额外单测**：`rule-audit-matrix.test.ts`、`heuristic.test.ts`、`logic-rules.test.ts`、`coordinator.test.ts`、`console-routes.test.ts`、`agents.test.ts`、`dual-parity.test.ts`、`rules-loader.test.ts`、`script-engine.test.ts`、`asset-paths.test.ts`、`platform-traits.test.ts`、`formal-*.test.ts` 等。
 
-**结论：两端真实独立 JSON 用例数一致（961，l1+l2+agent）**，passed 总数差异只来自各自补充的单元测试，**不代表规则或用例不一致**。判断"规则是否双端一致"看 JSON 用例 + 双端同步校验测试，不看 passed 总数。
+**结论：两端真实独立 JSON 用例数一致（1005，l1+l2+agent）**，passed 总数差异只来自各自补充的单元测试，**不代表规则或用例不一致**。判断"规则是否双端一致"看 JSON 用例 + 双端同步校验测试，不看 passed 总数。
 
-共用部分（双端跑同一批 1243 个 JSON）：
-- 942 个 L1/L2 用例（禁 LLM 跑；2026-11 新增 OpenDesk 写工具误报 5 条 + append 豁免 2 条）
+共用部分（双端跑同一批 1287 个 JSON）：
+- 986 个 L1/L2 用例（禁 LLM 跑；2026-11 新增 OpenDesk 写工具误报 5 条 + append 豁免 2 条 + 脚本产物 RBW 豁免 2 条）
 - 32 个 L3 LLM 用例（禁 LLM 时 **skip**，需真 LLM key）
 - 19 个 agent 专属用例（xiaoo/opendesk，禁 LLM 跑）
 - 37 个 scenario 场景用例（如 bank，禁 LLM 跑）
-- 213 个 os 平台专属用例（windows/macos/harmony，禁 LLM 跑；默认不进客户交付集）
-- 57 个平台专属用例（`os/windows`43 + `os/macos`7 + `os/harmony`7，禁 LLM 跑；**不进客户交付集**，见上表说明）
+- 213 个 os 平台专属用例（`os/windows` 154 + `os/macos` 36 + `os/harmony` 23，禁 LLM 跑；默认不进客户交付集）
 
 | 端 | 共用 JSON | 其中 L3(skip) | 语言特有手写单测 | 总用例 | passed |
 |---|---|---|---|---|---|
-| **Python**（`pytest tests/test_all_cases.py`） | 630 | 28 | 91 | 721 | **693** |
-| **TS**（`vitest`） | 630 | 28 | 480 | 1110 | **1082** |
+| **Python**（`pytest tests/test_all_cases.py`） | 1287 | 32 | 97 | 1384 | **1352** |
+| **TS**（`vitest`） | 1287 | 32 | 996 | 2283 | **2251** |
 
-> 2026-10-09 修复批次实测：Python `test_all_cases.py` 693 passed（721 − 28 L3 skip；手写 +10 = TestUserRuleMatcherGuard 5 + TestLayer1And2 内联等）；TS 全量 vitest 1226 passed（1254 − 28 skip），其中 json-cases 630 + 手写 624。手写单测精确列举随批次增长有漂移，以上为实测口径。
-
-- **Python 的 511 = 430 JSON + 81 手写**（`TestCoordinator`6 + `TestHeuristicDetector`16 + `TestLogicRules`41 + `TestOSProfile`18）。483 passed = 511 − 28(L3 skip)。
-- **TS 的 905 = 430 JSON + 475 手写**（28 个测试文件精确列举：`rule-audit-matrix` 79 + `heuristic` 63 + `logic-rules` 51 + `coordinator` 37 + `script-engine` 28 + `console-routes` 26 + `dual-parity` 26 + `formal-stateful` 18 + `agents` 16 + `runtime-config-seed` 16 + `brain` 12 + `symbolic` 12 + `formal-abstract-properties` 11 + `formal-ltl` 9 + `formal-rule5` 9 + `formal-decode` 8 + `platform-traits` 7 + `formal-pattern-miner` 6 + `paths` 6 + `rules-loader` 6 + `formal-rule12` 5 + `llm-analyzer` 5 + `asset-paths` 5 + `find-free-port` 4 + `formal-ebpf` 4 + `cli-analyze` 3 + `formal-chain-state` 3 + json-cases 430）。877 passed = 905 − 28(L3 skip)。
-- 注：若跑 `pytest tests/`（全部测试文件），Python 全量是 `860 passed + 28 skipped`（2026-09-22 实测）。CLAUDE.md 的标准命令只跑 `test_all_cases.py`，故日常报告 483。
-
-两者差异全部来自**语言特有单元测试的数量**（TS 的单元测试比 Python 多），**共用 JSON 的 430 个完全一致**，因此规则覆盖口径相同。
+> 2026-11-18 实测（logic-66/67 加入后）：Python `test_all_cases.py` **1352 passed + 32 L3 skip**；TS 全量 vitest **2251 passed + 32 L3 skip**（json-cases 1287 + 手写 996）。手写单测精确列举随批次增长有漂移，以上为实测口径；两端共用 JSON 完全一致，因此规则覆盖口径相同。
 
 > **2026-09 rm-root-recursion 降级（NEW-FP）**：新增 2 个 L1 用例（deny-132-rm-log-wildcard + allow-109-rm-log-dir 一拦一放）。A3 `rm -r /...` 规则从 high 降 medium（交 L2/L3 意图判断），`rm -rf /logs` 这类根下普通业务目录清理不再被当"删根"误伤；非临时通配 `rm -rf /logs/*` 仍由 wildcard+delete high 拦截（详见 SECURITY_RULES.md A3 节）。
 
@@ -460,12 +453,12 @@ for f in sorted(glob.glob("tests/cases/l*/*.json")):
 
 > 说明：上述脚本覆盖不启用 / L1 / L1+L2 三档（禁用 LLM 时 L3 走 fail_open 放行，对应"漏报"）。L1+L2+L3 全通过行由 §6.2 的 LLM 真跑补齐。
 
-### 6.4 关于计数口径（430 vs Python/TS 报告数值）
+### 6.4 关于计数口径（1287 vs Python/TS 报告数值）
 
-`tests/cases/` 的 430 个 JSON 是双端**共用**的归一化用例。Python `pytest` / TS `vitest` 报告的总 passed 数 > 430，是因为各自端还有**额外的手写单测**（不读 JSON，直接测引擎子模块）。两端真实独立 JSON 用例数一致（430）；passed 总数差异只来自各自补充的单元测试，不是用例集不一致。详见顶部"关于测试数字"节。
+`tests/cases/` 的 1287 个 JSON 是双端**共用**的归一化用例。Python `pytest` / TS `vitest` 报告的总 passed 数 > 1287，是因为各自端还有**额外的手写单测**（不读 JSON，直接测引擎子模块）。两端真实独立 JSON 用例数一致（1287）；passed 总数差异只来自各自补充的单元测试，不是用例集不一致。详见顶部"关于测试数字"节。
 
-> **平台覆盖说明**：Linux 之外的规则已由 `tests/cases/os/<平台>/` 的 23 个用例覆盖
-> （`os/windows` 6 + `os/macos` 7 + `os/harmony` 7，子目录名即 `input.os_type`；
+> **平台覆盖说明**：Linux 之外的规则已由 `tests/cases/os/<平台>/` 的 213 个用例覆盖
+> （`os/windows` 154 + `os/macos` 36 + `os/harmony` 23，子目录名即 `input.os_type`；
 > macos / harmony 各含一条**继承 Linux** 的验证用例）。这些用例**不进客户交付集**
 > （`generate_bash_exc.py` 提取命令集时排除 `os/`，客户沙箱是麒麟/Linux，平台用例
 > 在那里判定必然失败）。新增平台规则请照 `docs/MULTI_OS_EXTENSION_GUIDE.md` 走。
