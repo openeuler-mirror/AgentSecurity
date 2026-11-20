@@ -17,7 +17,7 @@ from pathlib import Path
 # 污染（曾出现：本机 runtime 的 dangerous_commands 57 条 vs 源码 55 条的分叉）。
 # 逃生门：显式设 AGENT_MOSS_TEST_USE_RUNTIME=1 时跳过本隔离（data_root 落真实
 # ~/.config/agentmoss），供「确认改规则后真实运行时是否生效」的场景（见
-# MAINTENANCE_WORKFLOW.md「验证真实运行」）。
+# docs/process/MAINTENANCE_WORKFLOW.md「验证真实运行」）。
 # 注：conftest 是 pytest 首个加载的测试文件，本语句在 agent_moss 任何 import 之前执行，
 # 之后加载的 agent_moss.infra.paths 首次调用 get_data_root() 即读到该 env，无缓存问题。
 # 测试默认关闭鉴权（2026-10 起产品默认 auto：首次启动自动生成 token）。

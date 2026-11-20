@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..infra.script_diagnostics import ScriptDiagnostics
     from ..profiles.base import OSProfile
     from ..agents.base import AgentExtensions
 
@@ -111,6 +112,7 @@ class AgentMossBot:
         session_history: list[dict[str, object]] | None = None,
         agent_id: str = "",
         instance_id: str = "",
+        script_diagnostics: "ScriptDiagnostics | None" = None,
     ) -> SecurityJudgment:
         """
         执行三层防御安全判断。
@@ -260,6 +262,7 @@ class AgentMossBot:
                 cwd=cwd,
                 # L1 关闭时继续追踪子脚本（不因 critical 短路），线索留给 L2/L3。
                 stop_on_critical=heuristic_enabled,
+                diagnostics=script_diagnostics,
             )
             # ⚠️ 「脚本存在但内容读不了」（超过大小上限 / 权限）**不能当安全放行**：
             # 否则把恶意脚本用注释撑到 2MB 就能让整个内容扫描静默跳过（实测
@@ -997,6 +1000,7 @@ def judge_security(
     prompt_history: list[dict[str, object]] | None = None,
     session_history: list[dict[str, object]] | None = None,
     instance_id: str = "",
+    script_diagnostics: "ScriptDiagnostics | None" = None,
 ) -> SecurityJudgment:
     """
     便捷函数：执行 AgentMoss 安全判断。
@@ -1047,4 +1051,9 @@ def judge_security(
         skills_dir=config.security.skills_dir,
         agent_ext=ext,
     )
-    return agent.judge(prompt_session, action_history, a_next, reason, config, llm_config=llm_config, cwd=cwd, llm_log_path=llm_log_path, prompt_history=prompt_history, session_history=session_history, agent_id=agent_id, instance_id=instance_id)
+    return agent.judge(
+        prompt_session, action_history, a_next, reason, config,
+        llm_config=llm_config, cwd=cwd, llm_log_path=llm_log_path,
+        prompt_history=prompt_history, session_history=session_history,
+        agent_id=agent_id, instance_id=instance_id, script_diagnostics=script_diagnostics,
+    )

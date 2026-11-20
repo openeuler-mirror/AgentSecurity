@@ -29,6 +29,7 @@ from ..rules_loader import compile_rule_regex, load_script_rules, resolve_keywor
 from .types import ScriptNode, ScriptChainAnalysisResult
 
 if TYPE_CHECKING:
+    from ..infra.script_diagnostics import ScriptDiagnostics
     from ..profiles.base import OSProfile
 
 logger = logging.getLogger(__name__)
@@ -521,6 +522,8 @@ def analyze_script_content(
     command_scanner=None,
     cwd: str = "",
     stop_on_critical: bool = True,
+    *,
+    diagnostics: "ScriptDiagnostics | None" = None,
 ) -> ScriptChainAnalysisResult:
     """分析脚本内容（递归追踪 + 预处理 + L1/L2 扫描）。
 
@@ -529,9 +532,8 @@ def analyze_script_content(
     流程：
     1. 提取脚本路径
     2. 递归追踪读取调用链（传入 command_scanner，递归过程中即时做 L1 扫描）
-    3. L1 CommandPatternScanner 兜底扫描预处理内容
-    4. 关键词扫描（兼容 L3）
-    5. 返回 ScriptChainAnalysisResult
+    3. 关键词扫描（兼容 L3）
+    4. 返回 ScriptChainAnalysisResult
 
     Args:
         action_type: 动作类型
@@ -562,8 +564,11 @@ def analyze_script_content(
     # RecursiveTracker 消费 ShellBackend 的 IR：case/if 控制流切片 + 子脚本
     # 调用参数传递（修复子调用参数丢失 + 深层链漏追踪）。
     from .script_engine.tracker import RecursiveTracker
+    diagnostic_data = diagnostics.begin() if diagnostics is not None else None
     tracker = RecursiveTracker(
-        command_scanner=command_scanner, stop_on_critical=stop_on_critical,
+        command_scanner=command_scanner,
+        stop_on_critical=stop_on_critical,
+        diagnostics=diagnostic_data,
     )
     chain_result = tracker.track(
         entry_path=script_path,

@@ -8,7 +8,7 @@
 
 暴露方式：`GET /metrics`（与 `/api/v1/health` 同级的运维端点）。
 
-指标清单见 `docs/PERFORMANCE_TUNING.md` / `docs/METRICS.md`。
+指标清单见 `docs/deploy/PERFORMANCE_TUNING.md` / `docs/METRICS.md`。
 
 线程安全：所有写入走同一把 `threading.Lock`。单次写入是几个 dict 操作，
 在 analyze 的耗时里占比可忽略（实测 < 1μs）。

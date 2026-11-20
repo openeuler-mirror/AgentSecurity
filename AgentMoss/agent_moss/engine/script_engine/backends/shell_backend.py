@@ -20,7 +20,7 @@ shell（bash/sh/zsh）脚本的静态解析后端，产出 IR。
 import re
 from dataclasses import dataclass, field
 
-from ..ir import BranchInfo, ScriptCall, ScriptIR
+from ..ir import BranchInfo, ScriptCall, ScriptIR, scan_fingerprint
 from .base import LanguageBackend
 
 
@@ -116,6 +116,8 @@ def _split_case_body(body: str) -> list[BranchInfo]:
 def _split_nested_case_branches(
     body_lines: list[str],
     selector_val: str,
+    *,
+    diagnostics: dict | None = None,
 ) -> str | None:
     """嵌套 case 的外层分支切分：选中的分支整体保留，未选中剔除。
 
@@ -174,10 +176,14 @@ def _split_nested_case_branches(
     if cur_pat is not None and cur_body:
         _flush_as_selected("\n".join(cur_body), cur_pat)
 
+    if diagnostics is not None and (selected is not None or fallback is not None):
+        diagnostics["p1_case"] = "match" if selected is not None else "default"
     return selected if selected is not None else fallback
 
 
-def parse_case(content: str, args: list[str] | None) -> str | None:
+def parse_case(
+    content: str, args: list[str] | None, *, diagnostics: dict | None = None,
+) -> str | None:
     """解析 case 结构，返回可达分支内容（None = 未识别/fail-closed）。
 
     识别 `case <selector> in ... esac`。selector 由 args 绑定，
@@ -207,7 +213,7 @@ def parse_case(content: str, args: list[str] | None) -> str | None:
         # 嵌套：外层仍剪枝（选中的分支整体保留，未选中的剔除），内层候选不细化。
         # 用深度感知的分支切分：`pattern)` 行 + `;;` 结束，但 `;;` 属于外层分支时才算
         # 分支结束（内层 case 的 `;;` 不结束外层）。
-        selected = _split_nested_case_branches(body_lines, val)
+        selected = _split_nested_case_branches(body_lines, val, diagnostics=diagnostics)
         if selected is None:
             return None
     else:
@@ -220,6 +226,8 @@ def parse_case(content: str, args: list[str] | None) -> str | None:
                 fallback = b.body
             elif val in values:
                 selected = b.body
+        if diagnostics is not None and (selected is not None or fallback):
+            diagnostics["p1_case"] = "match" if selected is not None else "default"
         selected = selected if selected is not None else (fallback or None)
         if selected is None:
             return None
@@ -279,7 +287,9 @@ def _eval_if_condition(cond: str, args: list[str] | None) -> bool | None:
     return (not matched) if op == "!=" else matched
 
 
-def parse_if(content: str, args: list[str] | None) -> str | None:
+def parse_if(
+    content: str, args: list[str] | None, *, diagnostics: dict | None = None,
+) -> str | None:
     """解析 if [cond] then A else B fi，选可达分支。None = 无法静态判定。
 
     只支持 else 分支存在且条件可求值的形态；无法判定 → 保两条分支都可达
@@ -310,6 +320,8 @@ def parse_if(content: str, args: list[str] | None) -> str | None:
 
     prefix = content[:start]
     suffix = content[fi_pos + len("fi"):]
+    if diagnostics is not None:
+        diagnostics["p1_if"] = "then" if truth else "else"
     return f"{prefix}\n{chosen}\n{suffix}"
 
 
@@ -411,7 +423,9 @@ class ShellBackend(LanguageBackend):
         r"(?:^|\s|&&|\|\|)\s*source\s+(\S+)",
     ]
 
-    def parse(self, content: str, entry_args: list[str] | None) -> ScriptIR:
+    def parse(
+        self, content: str, entry_args: list[str] | None, *, diagnostics: dict | None = None,
+    ) -> ScriptIR:
         """解析 shell 脚本：P1 → P2/P3/P4 升级 → fail-closed 回退。
 
         逐级责任链：
@@ -437,11 +451,11 @@ class ShellBackend(LanguageBackend):
 
         if p1_safe:
             # P1: 现有 case/if 字面量裁剪（bind_positional_args + parse_case/parse_if）
-            case_out = parse_case(candidate, entry_args)
+            case_out = parse_case(candidate, entry_args, diagnostics=diagnostics)
             if case_out is not None and case_out != candidate:
                 resolved = True
                 candidate = case_out
-            if_out = parse_if(candidate, entry_args)
+            if_out = parse_if(candidate, entry_args, diagnostics=diagnostics)
             if if_out is not None and if_out != candidate:
                 resolved = True
                 candidate = if_out
@@ -451,13 +465,24 @@ class ShellBackend(LanguageBackend):
             bound = candidate
 
         # P2/P3/P4 升级：LiteSE 顺序执行器（只在 P1 未能裁剪时尝试，避免双实现）
+        if diagnostics is not None:
+            diagnostics.update(parser="shell_p1", p1_safe=p1_safe, child_extractor="regex")
         if not resolved:
             from .symbolic import symbolic_process
-            sym_out = symbolic_process(content, entry_args)
+            symbolic_diagnostics = {} if diagnostics is not None else None
+            sym_out = symbolic_process(content, entry_args, diagnostics=symbolic_diagnostics)
             if sym_out is not None and sym_out != content:
                 resolved = True
                 candidate = sym_out
                 bound = candidate  # bind 已在 symbolic 内完成
+            if diagnostics is not None and symbolic_diagnostics is not None:
+                diagnostics["parser"] = "shell_litese" if resolved else "shell_full"
+                diagnostics["symbolic"] = symbolic_diagnostics
+                if not resolved:
+                    diagnostics["fallback_reason"] = symbolic_diagnostics["fallback_reason"] or "no_pruning"
+                if sym_out is not None:
+                    length, digest = scan_fingerprint(sym_out)
+                    symbolic_diagnostics.update(output_bytes=length, output_sha256=digest)
 
         # 剔除不会执行的行（shebang / 整行注释）—— 见函数 docstring：
         # 否则 shebang 里的 /bin/bash 会被当"访问白名单外路径"，整脚本被误拦。

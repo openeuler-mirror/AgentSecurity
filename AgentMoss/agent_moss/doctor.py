@@ -18,8 +18,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
+import ssl
 import stat
 import sys
+import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -241,25 +245,87 @@ def _check_env(report: DoctorReport) -> None:
         report.add("环境变量", "ok", "未发现可疑取值")
 
 
-def _check_llm_connectivity(report: DoctorReport, config: dict) -> None:
-    """显式 ``--llm`` 才测：发一条最小请求验证 key/base_url/模型可用。"""
-    try:
-        from .infra.config import get_default_config
-        from .infra.llm_client import call_llm
+def _exception_chain(e: BaseException) -> str:
+    parts: list[str] = []
+    cur: BaseException | None = e
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen and len(parts) < 4:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}({str(cur).replace(chr(10), ' ')[:200]})")
+        cur = cur.__cause__ or cur.__context__
+    return " <- ".join(parts)
 
-        cfg = get_default_config()
-        if not cfg.llm.api_key and not os.getenv("AGENT_MOSS_LLM_API_KEY"):
-            report.add("LLM 连通性", "warn", "未配置 api_key，跳过")
+
+def _check_llm_connectivity(report: DoctorReport, config: dict) -> None:
+    """显式 ``--llm`` 才测：DNS → TCP → TLS → HTTP 分阶段定位。"""
+    from .infra.config import get_default_config
+    from .infra.llm_client import call_llm
+
+    cfg = get_default_config()
+    if not cfg.llm.api_key and not os.getenv("AGENT_MOSS_LLM_API_KEY"):
+        report.add("LLM 连通性", "warn", "未配置 api_key，跳过")
+        return
+    base_url = cfg.llm.base_url or "https://api.openai.com/v1"
+    try:
+        u = urlsplit(base_url)
+        host = u.hostname or ""
+        port = u.port or (443 if u.scheme == "https" else 80)
+        shown = f"{u.scheme or 'https'}://{host}{':' + str(u.port) if u.port else ''}{u.path or ''}"
+    except Exception as e:  # noqa: BLE001
+        report.add("LLM 地址", "fail", f"base_url 无法解析: {e}")
+        return
+    report.add("LLM 地址", "ok", shown)
+    proxies = [n for n in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY") if os.getenv(n)]
+    if proxies:
+        report.add("LLM 代理", "ok", "已设置: " + ", ".join(proxies) + "（直连阶段可能不代表实际链路）")
+    else:
+        report.add("LLM 代理", "ok", "未设置（直连）")
+
+    if not proxies:
+        t0 = time.monotonic()
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            report.add("LLM DNS", "ok", f"{host} → {len(infos)} 个地址（{(time.monotonic()-t0)*1000:.0f}ms）")
+        except Exception as e:  # noqa: BLE001
+            report.add("LLM DNS", "fail", f"{host} 解析失败: {_exception_chain(e)}")
             return
+        t0 = time.monotonic()
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=5.0)
+            report.add("LLM TCP", "ok", f"{host}:{port} 可连接（{(time.monotonic()-t0)*1000:.0f}ms）")
+        except Exception as e:  # noqa: BLE001
+            report.add("LLM TCP", "fail", f"{host}:{port} 连接失败: {_exception_chain(e)}")
+            return
+        if u.scheme == "https":
+            t0 = time.monotonic()
+            try:
+                ctx = ssl.create_default_context()
+                tls = ctx.wrap_socket(sock, server_hostname=host)
+                tls.close()
+                sock = None
+                report.add("LLM TLS", "ok", f"握手成功（{(time.monotonic()-t0)*1000:.0f}ms）")
+            except Exception as e:  # noqa: BLE001
+                report.add("LLM TLS", "fail", f"握手失败: {_exception_chain(e)}")
+                if sock is not None:
+                    sock.close()
+                return
+        else:
+            sock.close()
+            sock = None
+
+    t0 = time.monotonic()
+    try:
         result = call_llm("只回复两个字：正常", timeout=20.0, config=cfg.llm)
         report.add(
-            "LLM 连通性", "ok",
-            f"响应正常（{len(result.content)} 字符，tokens {result.prompt_tokens}/{result.completion_tokens}）",
+            "LLM HTTP", "ok",
+            f"响应正常（{len(result.content)} 字符，tokens {result.prompt_tokens}/{result.completion_tokens}，"
+            f"{(time.monotonic()-t0):.1f}s）",
         )
     except Exception as e:  # noqa: BLE001
         report.add(
-            "LLM 连通性", "fail", f"调用失败: {e}",
-            "检查 base_url / api_key / 网络；思考型模型可设 llm.extra_body 关闭思考",
+            "LLM HTTP", "fail", f"请求失败: {_exception_chain(e)}",
+            "若 DNS/TCP/TLS 均正常，重点查模型网关 429/5xx/主动断连；否则查网络/代理/证书",
         )
 
 
