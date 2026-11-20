@@ -130,8 +130,9 @@ class IfStmt(Stmt):
 
 
 class NotModeledStmt(Stmt):
-    def __init__(self, line: str):
+    def __init__(self, line: str, reason: str = "unsupported"):
         super().__init__(line, modelable=False)
+        self.reason = reason
 
 
 # ==================== 嵌套深度配对 ====================
@@ -247,11 +248,11 @@ def _split_statements(content: str) -> list[Stmt]:
             end_line = _find_loop_end(lines, i)
             if end_line != -1:
                 for k in range(i, end_line + 1):
-                    stmts.append(NotModeledStmt(lines[k]))
+                    stmts.append(NotModeledStmt(lines[k], "loop"))
                 i = end_line + 1
                 continue
             # 找不到配对 done → 该行保守 NotModeled
-            stmts.append(NotModeledStmt(ln))
+            stmts.append(NotModeledStmt(ln, "loop"))
             i += 1
             continue
 
@@ -261,10 +262,10 @@ def _split_statements(content: str) -> list[Stmt]:
             end_line = _find_fn_end(lines, i)
             if end_line != -1:
                 for k in range(i, end_line + 1):
-                    stmts.append(NotModeledStmt(lines[k]))
+                    stmts.append(NotModeledStmt(lines[k], "function"))
                 i = end_line + 1
                 continue
-            stmts.append(NotModeledStmt(ln))
+            stmts.append(NotModeledStmt(ln, "function"))
             i += 1
             continue
 
@@ -272,11 +273,11 @@ def _split_statements(content: str) -> list[Stmt]:
         if re.match(r"^\s*case\s+", stripped):
             end_line = _find_case_end(lines, i)
             if end_line == -1:
-                stmts.append(NotModeledStmt(ln))
+                stmts.append(NotModeledStmt(ln, "case_syntax"))
                 i += 1
                 continue
             block_text = "\n".join(lines[i:end_line + 1])
-            stmts.append(_parse_case_stmt(block_text) or NotModeledStmt(ln))
+            stmts.append(_parse_case_stmt(block_text) or NotModeledStmt(ln, "case_syntax"))
             i = end_line + 1
             continue
 
@@ -284,11 +285,11 @@ def _split_statements(content: str) -> list[Stmt]:
         if re.match(r"^\s*if\s+", stripped):
             end_line = _find_if_end(lines, i)
             if end_line == -1:
-                stmts.append(NotModeledStmt(ln))
+                stmts.append(NotModeledStmt(ln, "if_syntax"))
                 i += 1
                 continue
             block_text = "\n".join(lines[i:end_line + 1])
-            stmts.append(_parse_if_stmt(block_text) or NotModeledStmt(ln))
+            stmts.append(_parse_if_stmt(block_text) or NotModeledStmt(ln, "if_syntax"))
             i = end_line + 1
             continue
 
@@ -296,7 +297,7 @@ def _split_statements(content: str) -> list[Stmt]:
         # 注意：`set -e` 不改变位置参数，只匹配 `set --`（其后跟具体参数）；
         # `set --` 后是空格，`--` 末尾不能用 \b（- 非词字符，后无词边界）
         if re.search(r"\bshift\b|\bset\s+--(?:\s|$)|[\s;|&]read\b|^\s*read\b", stripped):
-            stmts.append(NotModeledStmt(ln))
+            stmts.append(NotModeledStmt(ln, "positional_mutation"))
             i += 1
             continue
 
@@ -307,7 +308,9 @@ def _split_statements(content: str) -> list[Stmt]:
             i += 1
             continue
 
-        stmts.append(NotModeledStmt(ln) if _not_modeled_if_contains(stripped) else Stmt(ln))
+        stmts.append(
+            NotModeledStmt(ln, "command_substitution") if _not_modeled_if_contains(stripped) else Stmt(ln)
+        )
         i += 1
 
     return stmts
@@ -526,17 +529,24 @@ def eval_numeric_compare(op: str, left: str, right: str) -> Optional[bool]:
 # ==================== if 条件求值 ====================
 
 
-def eval_condition(cond: str, env: dict[str, SVal]) -> Optional[bool]:
+def eval_condition(
+    cond: str, env: dict[str, SVal], *, diagnostics: dict | None = None,
+) -> Optional[bool]:
     """求值 if 条件。能确定返回 True/False；无法确定（符号/模式/文件谓词）返回 None。
 
     支持：字符串相等/不等（= == !=）、字符串匹配（=~ / glob）、数值比较（-gt 等）。
     fail-closed：任何不确定 → None → 调用方保留双分支。
     """
+    if diagnostics is not None:
+        diagnostics.pop("condition_operator", None)
+        diagnostics.pop("condition_failure", None)
     inner = cond.strip()
     # 剥外层 [ ] 或 [[ ]]（test 结构）
     inner = re.sub(r"^\[\[?|\]\]?$", "", inner).strip()
     # 文件谓词 / 非比较：返回 None
     if re.match(r"^-[A-Za-z]\s", inner) or inner.startswith("-d") or inner.startswith("-f"):
+        if diagnostics is not None:
+            diagnostics["condition_failure"] = "unsupported_predicate"
         return None
     # 剥引号
     inner_q = inner.replace('"', "").replace("'", "")
@@ -561,15 +571,26 @@ def eval_condition(cond: str, env: dict[str, SVal]) -> Optional[bool]:
         right = inner_q[opm.end():].strip()
         lv = _resolve_var_side(left)
         rv = _resolve_var_side(right)
+        if diagnostics is not None:
+            diagnostics["condition_operator"] = op
         if lv is None or rv is None:
+            if diagnostics is not None:
+                diagnostics["condition_failure"] = "unbound_operand"
             return None
-        return eval_numeric_compare(op, lv, rv)
+        result = eval_numeric_compare(op, lv, rv)
+        if result is None and diagnostics is not None:
+            diagnostics["condition_failure"] = "not_integer"
+        return result
 
     # 字符串相等/不等/匹配
     m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner_q)
     if not m:
+        if diagnostics is not None:
+            diagnostics["condition_failure"] = "unsupported_comparison"
         return None
     op = m.group(2)
+    if diagnostics is not None:
+        diagnostics["condition_operator"] = op
     left = m.group(1).strip()
     right = m.group(3).strip()
     lv = _resolve_var_side(left)
@@ -578,13 +599,19 @@ def eval_condition(cond: str, env: dict[str, SVal]) -> Optional[bool]:
         if right.startswith("/") and right.endswith("/"):
             right = right[1:-1]
         if lv is None:
+            if diagnostics is not None:
+                diagnostics["condition_failure"] = "unbound_operand"
             return None
         try:
             return bool(re.search(right, lv))
         except re.error:
+            if diagnostics is not None:
+                diagnostics["condition_failure"] = "invalid_regex"
             return None
     rv = _resolve_var_side(right)
     if lv is None or rv is None:
+        if diagnostics is not None:
+            diagnostics["condition_failure"] = "unbound_operand"
         return None
     if "*" in rv or "?" in rv or "[" in rv:
         import fnmatch
@@ -621,7 +648,9 @@ class Budget:
         return self.lines > self.max_lines or self.branches > self.max_branches
 
 
-def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str]:
+def symbolic_process(
+    content: str, entry_args: list[str] | None, *, diagnostics: dict | None = None,
+) -> Optional[str]:
     """LiteSE 顺序执行：返回"剪枝后的可达分支展开文本"；None = 无法处理（回退全文）。
 
     职责和 fail-closed：
@@ -630,28 +659,54 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
       - if 条件可确定 → 选 then/else。
       - 任何不确定 / 超预算 / 语法不识别 → 返回 None → 调用方 fail-closed 全文本。
     """
+    def record_result(reason: str, budget: Budget | None = None, variables: int = 0) -> None:
+        if diagnostics is not None:
+            diagnostics.update(
+                result="none" if reason else "text",
+                fallback_reason=reason,
+                lines=budget.lines if budget else 0,
+                branches=budget.branches if budget else 0,
+                variables=variables,
+            )
+
+    if diagnostics is not None:
+        diagnostics.update(line_limit=MAX_LINES, branch_limit=MAX_BRANCHES, variable_limit=MAX_VARS)
     if content is None:
+        record_result("empty")
         return None
     stmts = tokenize(content)
+    if diagnostics is not None:
+        diagnostics["statement_count"] = len(stmts)
+        # Even a script with no modeled statements may contain an unsupported block.
+        unsupported = next((s for s in stmts if isinstance(s, NotModeledStmt)), None)
+        if unsupported is not None:
+            diagnostics["unsupported"] = unsupported.reason
     if not any(isinstance(s, (CaseStmt, IfStmt, AssignStmt)) for s in stmts):
+        record_result("no_modeled_statements" if stmts else "empty")
         return None  # 没有可提升的结构，交给 P1 处理
 
     if any(not s.modelable for s in stmts):
+        record_result("unsupported_statement")
         return None  # 含不可建模语句 → 保守不剪
 
     budget = Budget()
     env = _init_env(entry_args)
     # 预算覆盖初始化入口（启动参数 + $@/$*）。超过上限 → 放弃精确分析、回退全文。
     if len(env) > MAX_VARS:
+        record_result("variable_budget", budget, len(env))
         return None
 
     # 组装可达文本：保留被选中的分支体，其余普通行原样保留
     out: list[str] = []
     modelable_encountered = False
+    choices = [] if diagnostics is not None else None
+    if diagnostics is not None:
+        diagnostics["choices"] = choices
 
     for s in stmts:
         budget.lines += 1
         if budget.over:
+            record_result("line_budget", budget, len(env))
             return None  # 超预算 → 降级
 
         if isinstance(s, AssignStmt):
@@ -659,6 +714,7 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
             # 环境表一路撑大（TS 侧同款保护，超限返回 None 回退全文匹配）。
             # 只限制“新增变量”；修改已有变量的值不增加表项，不应触发回退。
             if s.name not in env and len(env) >= MAX_VARS:
+                record_result("variable_budget", budget, len(env))
                 return None
             # 赋值：右值求值写入 env
             modelable_encountered = True
@@ -671,27 +727,43 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
             modelable_encountered = True
             budget.branches += len(s.branches)
             if budget.over:
+                record_result("branch_budget", budget, len(env))
                 return None
             sel_val = eval_expr(s.selector, env)
             check_val = fold(sel_val)
             if check_val.kind != "concrete":
                 # 符号 selector → 无法选择 → fail-closed
+                record_result("unbound_selector", budget, len(env))
                 return None
             concrete = check_val.value or ""
             selected_body: str | None = None
             fallback_body: str = ""
-            for pat, body, _end in s.branches:
+            selected_index = 0
+            selected_is_default = False
+            fallback_index = 0
+            for index, (pat, body, _end) in enumerate(s.branches, start=1):
                 pat_stripped = pat.strip()
                 if "*" in pat_stripped and not _HAS_GLOB.search(pat_stripped):
                     # 纯 * → 兜底
-                    fallback_body = body if not fallback_body else fallback_body
+                    if not fallback_body:
+                        fallback_index = index
+                        fallback_body = body
                     continue
                 if match_glob(pat_stripped, concrete):
                     selected_body = body
+                    selected_index = index
+                    selected_is_default = pat_stripped == "*"
                     break
             final = selected_body if selected_body is not None else (fallback_body or None)
             if final is None:
+                record_result("no_case_match", budget, len(env))
                 return None  # 未命中任何 → fail-closed
+            if choices is not None and len(choices) < 4:
+                if selected_body is None:
+                    choices.append(f"case_default:{fallback_index}")
+                else:
+                    label = "case_default" if selected_is_default else "case"
+                    choices.append(f"{label}:{selected_index}")
             out.append(f"case {s.selector} in\n{final}\nesac")
             continue
 
@@ -699,13 +771,18 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
             modelable_encountered = True
             budget.branches += 1
             if budget.over:
+                record_result("branch_budget", budget, len(env))
                 return None
-            truth = eval_condition(s.cond, env)
+            truth = eval_condition(s.cond, env, diagnostics=diagnostics)
             if truth is None:
+                record_result("condition_unresolved", budget, len(env))
                 return None  # 无法确定 → 保留双分支（fail-closed）
             chosen = s.then_body if truth else s.else_body
             if chosen is None:
+                record_result("missing_else", budget, len(env))
                 return None
+            if choices is not None and len(choices) < 4:
+                choices.append("then" if truth else "else")
             out.append(f"if {s.cond}; then\n{chosen}\nfi")
             continue
 
@@ -713,5 +790,7 @@ def symbolic_process(content: str, entry_args: list[str] | None) -> Optional[str
         out.append(s.line)
 
     if not modelable_encountered:
+        record_result("no_modeled_statements", budget, len(env))
         return None
+    record_result("", budget, len(env))
     return "\n".join(out)

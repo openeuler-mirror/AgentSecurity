@@ -14,7 +14,19 @@ Language Backend（Shell/Python/Node...）把源脚本解析成统一的 IR：
 - 所有字段可选，backend 无法解析时返回空 reachable（调用方回退全文本）。
 """
 
+import hashlib
 from dataclasses import dataclass, field
+
+
+def scan_fingerprint(content: str) -> tuple[int, str]:
+    """Return the UTF-8 byte count and digest without copying a whole script."""
+    digest = hashlib.sha256()
+    length = 0
+    for start in range(0, len(content), 4096):
+        encoded = content[start:start + 4096].encode("utf-8", errors="surrogatepass")
+        length += len(encoded)
+        digest.update(encoded)
+    return length, digest.hexdigest()
 
 
 @dataclass

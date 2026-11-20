@@ -257,6 +257,7 @@ def create_app() -> FastAPI:
         """Initialize config on startup (triggers config file auto-creation)."""
         from ..infra.config import get_default_config
         cfg = get_default_config()
+        app.state.script_diagnostics_enabled = False
         # ⚠️ 必须显式初始化日志（2026-11 发现）：setup_logger 此前**从未被调用**——
         # RotatingFileHandler 没挂上（agent_moss.log 一直是空/旧文件），日志级别
         # 也随 uvicorn 的 root 配置漂移。客户反馈「日志太少」有一部分原因是这个：
@@ -337,6 +338,15 @@ def create_app() -> FastAPI:
         # 这样线程池本身、以及 worker 线程里才会触发的惰性导入也一并热掉。
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _warm_up_engine)
+        if str(cfg.log_level).strip().upper() == "DEBUG":
+            from ..infra.script_diagnostics import start_script_diagnostics_writer
+
+            app.state.script_diagnostics_enabled = await loop.run_in_executor(
+                None, start_script_diagnostics_writer,
+            )
+            if not app.state.script_diagnostics_enabled:
+                logger.warning("脚本诊断写线程启动失败")
+
         # 事件循环延迟探针：同步阻塞最直接的观测指标（见 infra/loop_monitor.py）。
         from ..infra.loop_monitor import get_loop_monitor
 

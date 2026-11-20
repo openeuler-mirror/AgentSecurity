@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..infra.script_diagnostics import ScriptDiagnostics
     from ..profiles.base import OSProfile
 
 from ..infra.config import Config, get_agent_moss_setting, get_default_config, is_policy_gen_enabled
@@ -79,6 +80,7 @@ def analyze(
     prompt_history: list[dict[str, object]] | None = None,
     session_history: list[dict[str, object]] | None = None,
     instance_id: str = "",
+    script_diagnostics: "ScriptDiagnostics | None" = None,
 ) -> dict[str, str]:
     """
     分析 agent 的下一步动作是否在安全范围内，并在允许时生成最小 policy。
@@ -149,6 +151,7 @@ def analyze(
             prompt_history=prompt_history,
             session_history=session_history,
             instance_id=instance_id,
+            script_diagnostics=script_diagnostics,
         )
 
         if not judgment.allowed:

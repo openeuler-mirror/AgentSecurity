@@ -332,6 +332,53 @@ def test_off_mode_does_not_create_token(monkeypatch, tmp_path):
     assert not sp.auto_token_path().exists()
 
 
+def test_off_mode_ignores_bad_token_file(monkeypatch, tmp_path):
+    """显式关闭鉴权时，坏掉的 token 配置不应阻止启动/请求。"""
+    monkeypatch.setenv("AGENT_MOSS_AUTH_MODE", "off")
+    monkeypatch.setenv("AGENT_MOSS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_MOSS_AUTH_TOKEN_FILE", str(tmp_path / "missing-token"))
+    assert sp.auth_config_error() == ""
+    assert sp.auth_enabled() is False
+    assert sp.check_request_auth({}, "/api/v1/analyze") == (True, "")
+
+
+def test_auto_token_generation_failure_fails_closed(monkeypatch, tmp_path):
+    """数据目录不可写/不是目录时，自动 token 生成失败必须拒绝启动，不能无鉴权跑。"""
+    bad_root = tmp_path / "not-a-dir"
+    bad_root.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("AGENT_MOSS_AUTH_MODE", "auto")
+    monkeypatch.setenv("AGENT_MOSS_DATA_DIR", str(bad_root))
+    monkeypatch.delenv("AGENT_MOSS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_MOSS_AUTH_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("AGENT_MOSS_AUTH_TOKEN_FD", raising=False)
+
+    assert sp.auth_config_error()
+    assert sp.auth_enabled() is True
+    assert sp.check_request_auth({}, "/api/v1/analyze") == (False, "")
+    assert sp.check_request_auth({}, "/api/v1/health") == (True, "")
+    with pytest.raises(SystemExit):
+        sp.fail_fast_on_auth_error()
+
+
+def test_explicit_token_file_unreadable_fails_closed(monkeypatch, tmp_path):
+    """显式 token 文件读不到时，不能静默回退到自动 token。"""
+    missing = tmp_path / "missing-token"
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("AGENT_MOSS_AUTH_MODE", "auto")
+    monkeypatch.setenv("AGENT_MOSS_DATA_DIR", str(data_root))
+    monkeypatch.setenv("AGENT_MOSS_AUTH_TOKEN_FILE", str(missing))
+    monkeypatch.delenv("AGENT_MOSS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_MOSS_AUTH_TOKEN_FD", raising=False)
+
+    assert sp.auth_config_error()
+    assert sp.auth_enabled() is True
+    assert not (data_root / "auth_token").exists(), "显式文件错误时不应再生成自动 token"
+    assert sp.check_request_auth({}, "/api/v1/analyze") == (False, "")
+    assert sp.check_request_auth({}, "/api/v1/health") == (True, "")
+    with pytest.raises(SystemExit):
+        sp.fail_fast_on_auth_error()
+
+
 # ==================== token 走 fd（不落盘） ====================
 
 def test_auth_token_from_fd(monkeypatch):

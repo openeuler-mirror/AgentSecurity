@@ -7,11 +7,12 @@ import time
 import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from ..__version__ import __version__
 from ..engine.skill_engine import default_skills_dir
 from ..infra import security_policy as sp
+from ..infra.script_diagnostics import ScriptDiagnostics
 from .models import (
     AnalyzeRequest,
     AnalyzeResponse,
@@ -386,22 +387,17 @@ async def health(request: Request):
     if isinstance(_pct, (int, float)):
         if _pct >= 100:
             degraded.append(
-                f"【已降级】链状态时间线已满（{metrics.get('chain_nodes')}/"
-                f"{metrics.get('chain_capacity')} 节点）：新动作不再入链，"
-                "**L2.2 组合链检测已失效**（跨会话组合攻击可能漏判），L1/L2.1/L3 正常。"
-                "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
-                "→ agent-moss state reset --yes → systemctl start agent_moss；"
-                "或调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。详见 docs/UPGRADE_GUIDE.md"
+                f"【已降级】链状态缓存达到上限（{metrics.get('chain_nodes')}/"
+                f"{metrics.get('chain_capacity')} 节点）：系统会自动归档旧节点并保留最近窗口，"
+                "不需要手工 state reset；若持续出现，检查归档目录权限/磁盘空间。"
+                "L1/L2.1/L3 正常。详见 docs/deploy/UPGRADE_GUIDE.md"
             )
         elif _pct >= 90:
             degraded.append(
-                f"【预警】链状态时间线已用 {_pct}%（{metrics.get('chain_nodes')}/"
-                f"{metrics.get('chain_capacity')} 节点）：即将触顶，触顶后 L2.2 "
-                "组合链检测（跨会话组合攻击）将失效，L1/L2.1/L3 不受影响。"
-                "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
-                "→ 停服 → agent-moss state reset --yes → 起服；"
-                "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
-                "详见 docs/PERFORMANCE_TUNING.md 第 5 节"
+                f"【预警】链状态缓存已用 {_pct}%（{metrics.get('chain_nodes')}/"
+                f"{metrics.get('chain_capacity')} 节点）：达到上限后会自动归档旧节点并保留"
+                "最近窗口，不会导致组合链检测失效；无需手工 state reset。"
+                "详见 docs/deploy/PERFORMANCE_TUNING.md 第 5 节"
             )
     _circuit = metrics.get("llm_circuit") or {}
     if isinstance(_circuit, dict) and _circuit.get("state") == "open":
@@ -412,7 +408,7 @@ async def health(request: Request):
             "（fail_open 放行 / fail_closed 拒绝），L1/L2 正常。"
             f"处理：检查模型服务是否存活、网络是否通、api_key 是否有效；"
             f"修复后冷却 {_circuit.get('cooldown_sec')} 秒会自动放试探请求恢复，"
-            "无需重启。排查步骤见 docs/LLM_TROUBLESHOOTING.md"
+            "无需重启。排查步骤见 docs/deploy/LLM_TROUBLESHOOTING.md"
         )
     return HealthResponse(
         status="degraded" if degraded else "healthy",
@@ -426,7 +422,7 @@ async def health(request: Request):
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest, request: Request):
+async def analyze(req: AnalyzeRequest, request: Request, response: Response):
     try:
         from ..engine.analyzer import analyze as run_analysis
         from ..profiles import get_profile
@@ -588,6 +584,12 @@ async def analyze(req: AnalyzeRequest, request: Request):
             logger.info("已忽略请求携带的 metadata.llm_config（AGENT_MOSS_ALLOW_PER_REQUEST_LLM=0）")
             llm_config = None
         llm_log_path = req.metadata.get("llm_log_path") if req.metadata else None
+        diagnostics = None
+        if (
+            getattr(request.app.state, "script_diagnostics_enabled", False)
+            and a_next["action_type"].lower() == "bash"
+        ):
+            diagnostics = ScriptDiagnostics(session_id=session_id)
         # ⚠️ 必须用关键字参数调用 analyze：analyze 签名含 scenario_id（6abe6c6 在
         # llm_log_path 之前插入），此前按位置传参（14 实参对 15 形参）从第 12 位起
         # 全部右错一位——llm_log_path 被绑成 scenario_id（LLM_PROMPT 日志静默丢失，
@@ -658,6 +660,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
                 session_history=session_history,  # 多 session 历史（L2.2 跨会话验证）
                 instance_id=instance_id,  # 来源实例（仅展示层脱敏）
                 _req_id=_req_id,   # 仅在 executor 线程里恢复 contextvars 用
+                script_diagnostics=diagnostics,
             ),
         )
         duration_ms = (time.monotonic() - start) * 1000
@@ -831,7 +834,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
                         "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
                         "→ agent-moss state reset --yes → systemctl start agent_moss；"
                         "或调大 AGENT_MOSS_CHAIN_MAX_NODES 并重启。"
-                        "详见 docs/UPGRADE_GUIDE.md"
+                        "详见 docs/deploy/UPGRADE_GUIDE.md"
                     )
                 elif _pct >= 90:
                     _degraded.append(
@@ -842,7 +845,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
                         "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
                         "→ 停服 → agent-moss state reset --yes → 起服；"
                         "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
-                        "详见 docs/PERFORMANCE_TUNING.md 第 5 节"
+                        "详见 docs/deploy/PERFORMANCE_TUNING.md 第 5 节"
                     )
                 if inc["should_block"]:
                     j = inc["matched"] or (inc["exfil"][0] if inc["exfil"] else None)
@@ -873,7 +876,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
             except Exception as e:
                 logger.warning("stateful incremental 异常（不阻断响应）: %s", e)
 
-        return AnalyzeResponse(
+        analysis_response = AnalyzeResponse(
             decision=result["decision"],
             reason=result["reason"],
             risk_level=result.get("risk_level", "low"),
@@ -888,6 +891,9 @@ async def analyze(req: AnalyzeRequest, request: Request):
             degraded=_degraded,
             l3_outcome=str(result.get("l3_outcome", "") or ""),
         )
+        if diagnostics and await diagnostics.write_with_timeout(analysis_response.decision):
+            response.headers["X-AgentMoss-Diagnostic-Id"] = diagnostics.request_id
+        return analysis_response
     except HTTPException:
         raise  # 鉴权/越界等显式状态码不能被兜底 500 覆盖
     except Exception as e:

@@ -319,6 +319,7 @@ class ChainStateStore:
                     try:
                         self._conn.execute("BEGIN IMMEDIATE")
                         self._sync_in_tx(agent_id, t)
+                        self._rotate_if_needed(agent_id, t, in_tx=True)
                         r = t.advance(
                             a_next=a_next,
                             session_id=session_id,
@@ -648,6 +649,82 @@ class ChainStateStore:
                 self._conn.execute("DELETE FROM chain_meta WHERE agent_id=?", (agent_id,))
                 self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
 
+    # ---------------- 自动轮转（派生缓存，不是原始历史存储） ----------------
+
+    def _archive_dir(self) -> Path:
+        raw = os.getenv("AGENT_MOSS_CHAIN_ARCHIVE_DIR", "")
+        if raw:
+            return Path(raw)
+        return Path(self.db_path).parent / "chain-archive"
+
+    def _replace_in_tx(self, agent_id: str, tracker: StatefulChainTracker) -> None:
+        """事务内用轮转后的 tracker 整体替换该 agent 的持久化状态。"""
+        self._conn.execute("DELETE FROM chain_nodes WHERE agent_id=?", (agent_id,))
+        self._conn.execute("DELETE FROM chain_meta WHERE agent_id=?", (agent_id,))
+        self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
+        parts = tracker.to_snapshot_parts()
+        nodes = parts["nodes"]
+        rows = [
+            (
+                agent_id,
+                int(n.seq),
+                json.dumps(
+                    {k: (list(v) if k in ("resources", "instances") else v)
+                     for k, v in n.__dict__.items()},
+                    ensure_ascii=False,
+                ),
+            )
+            for n in nodes
+        ]
+        if rows:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO chain_nodes "
+                "(agent_id, seq, node_json) VALUES (?, ?, ?)",
+                rows,
+            )
+        meta = {k: v for k, v in parts.items() if k != "nodes"}
+        if isinstance(meta.get("seeded_keys"), set):
+            meta["seeded_keys"] = sorted(meta["seeded_keys"])
+        self._conn.execute(
+            "INSERT OR REPLACE INTO chain_meta (agent_id, meta_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            (agent_id, json.dumps(meta, ensure_ascii=False), time.time()),
+        )
+        self._persisted_nodes[agent_id] = len(nodes)
+        self._synced_seq[agent_id] = nodes[-1].seq if nodes else -1
+
+    def _rotate_if_needed(self, agent_id: str, tracker: StatefulChainTracker, *, in_tx: bool = False) -> bool:
+        """到达节点上限时自动归档旧节点并保留最近窗口。"""
+        from .stateful import _MAX_NODES
+        if len(tracker.nodes) < _MAX_NODES:
+            return False
+        try:
+            archived, path = tracker.rotate(self._archive_dir())
+        except Exception as exc:  # noqa: BLE001
+            logger.error("链状态轮转失败（保留现有数据，不丢新节点）: agent=%s err=%s", agent_id, exc)
+            return False
+        if archived <= 0:
+            return False
+        if in_tx:
+            self._replace_in_tx(agent_id, tracker)
+        else:
+            with self._db_lock:
+                self._conn.execute("BEGIN")
+                try:
+                    self._replace_in_tx(agent_id, tracker)
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+        logger.warning(
+            "链状态自动轮转: agent=%s 归档 %d 条 → %s，保留 %d 条",
+            agent_id, archived, path, len(tracker.nodes),
+        )
+        return True
+
     # ---------------- 应用层入口（供 server 用） ----------------
 
     def apply_action(
@@ -700,6 +777,7 @@ class ChainStateStore:
 
         with self._lock:
             t = self.load(agent_id) or StatefulChainTracker(agent_id=agent_id)
+            self._rotate_if_needed(agent_id, t)
             r = t.advance(
                 a_next=a_next,
                 session_id=session_id,

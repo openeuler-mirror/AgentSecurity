@@ -81,9 +81,9 @@
 | 端 | 共用 JSON | 其中 L3(skip) | 语言特有手写单测 | 总用例 | passed |
 |---|---|---|---|---|---|
 | **Python**（`pytest tests/test_all_cases.py`） | 1287 | 32 | 97 | 1384 | **1352** |
-| **TS**（`vitest`） | 1287 | 32 | 996 | 2283 | **2251** |
+| **TS**（`vitest`） | 1287 | 32 | 1002 | 2289 | **2257** |
 
-> 2026-11-18 实测（logic-66/67 加入后）：Python `test_all_cases.py` **1352 passed + 32 L3 skip**；TS 全量 vitest **2251 passed + 32 L3 skip**（json-cases 1287 + 手写 996）。手写单测精确列举随批次增长有漂移，以上为实测口径；两端共用 JSON 完全一致，因此规则覆盖口径相同。
+> 2026-11-19 实测：Python `test_all_cases.py` **1352 passed + 32 L3 skip**；TS 全量 vitest **2257 passed + 32 L3 skip**（json-cases 1287 + 手写 1002）。手写单测精确列举随批次增长有漂移，以上为实测口径；两端共用 JSON 完全一致，因此规则覆盖口径相同。
 
 > **2026-09 rm-root-recursion 降级（NEW-FP）**：新增 2 个 L1 用例（deny-132-rm-log-wildcard + allow-109-rm-log-dir 一拦一放）。A3 `rm -r /...` 规则从 high 降 medium（交 L2/L3 意图判断），`rm -rf /logs` 这类根下普通业务目录清理不再被当"删根"误伤；非临时通配 `rm -rf /logs/*` 仍由 wildcard+delete high 拦截（详见 SECURITY_RULES.md A3 节）。
 
@@ -118,13 +118,14 @@
 > 反弹 shell /dev/tcp、nc -e/-l、pip/npm/git clone \| bash 供应链、下载 .sh、命令替换 $()/反引号、
 > chmod setgid、nmap -sT、.zshrc 持久化、fork bomb、敏感路径换读法 strings/base64/grep/ssh-keygen、
 > 本地 HTTP 目标数据外传等），并修复 `cases_exec` 生成器把外部域名 URL 误判为 bank 白名单外
-> 路径的问题（详见 `tests/cases_exec/README.md`）——CMB bank **主集 deny 85 条、allow 81 条**
-> （URL 误判修复 + 场景 allow 误伤修复后的当前值；历史说法 "deny 44→79、allow 54→81" 是
-> 仅修 URL 误判时的中间值）。
+> 路径的问题（详见 `tests/cases_exec/README.md`）——CMB bank 2026-08 主集 deny 85 条、allow 81 条；
+> 2026-11-19 复核（用例集扩至 1287）为 **主集 deny 326 条、allow 215 条**（去重后；
+> 见 `tests/cases_exec/README.md` 的复核说明）。历史说法 "deny 44→79、allow 54→81" 是
+> 仅修 URL 误判时的中间值。
 
-**关于 Windows 覆盖**：已由 `tests/cases/os/windows/` 的 6 个 JSON 用例覆盖（`input.os_type: "windows"`，
-含危险命令与敏感路径的一拦一放）。另有 `os/macos/` 7 个、`os/harmony/` 7 个。这些用例双端都跑，
-但**不进客户交付集**（客户沙箱是麒麟/Linux）。新增平台规则见 `docs/MULTI_OS_EXTENSION_GUIDE.md`。
+**关于 Windows 覆盖**：已由 `tests/cases/os/windows/` 的 154 个 JSON 用例覆盖（`input.os_type: "windows"`，
+含危险命令与敏感路径的一拦一放）。另有 `os/macos/` 36 个、`os/harmony/` 23 个。这些用例双端都跑，
+但**不进客户交付集**（客户沙箱是麒麟/Linux）。新增平台规则见 `docs/process/MULTI_OS_EXTENSION_GUIDE.md`。
 
 ---
 
@@ -304,13 +305,13 @@
 - **Allow 用例**：`expected_decision: "Allow"`，用于防误报（合法运维不该被拦）。**L1/L2 用例会被强制禁 LLM 测试**，只测静态结果。
 - **对照用例**：强烈建议对每种风险配一个对应 Allow 对照（如 `chmod 777` Deny ↔ `chmod 644` Allow），防止规则过宽。
 - **risk_level**：L1/L2 用例被 TS 断言 risk_level，必须与引擎实际判定一致（不确定就跑一次看实际值再填）。
-- **action_detail 构造**：用真实命令，注意 `2>/dev/null`、`-o /dev/null`、引号内字面量等边界（这些是历史 FP/FN 重灾区，见 `docs/MAINTENANCE_WORKFLOW.md`）。
+- **action_detail 构造**：用真实命令，注意 `2>/dev/null`、`-o /dev/null`、引号内字面量等边界（这些是历史 FP/FN 重灾区，见 `docs/process/MAINTENANCE_WORKFLOW.md`）。
 
 ---
 
 ## 四、场景覆盖与分层分布
 
-> 场景归类为**人工整理的攻击面快照**（按攻击场景归类，非硬性口径）。当前用例集 355 个（Deny 199 / Allow 156），其中 18 个场景内 215 个（含 edge/inline 边界用例，统计时点 231 个时整理），另有 agent 专属用例 9 个、scenario 场景用例 9 个、以及部分边界用例未计入场景分类。下表为历史整理的攻击面视图（统计时点：用例集 231 个时），精确计数以第一章为准。用例随规则演进增删后，本表不再逐增逐改。
+> 场景归类为**人工整理的攻击面快照**（按攻击场景归类，非硬性口径）。本表整理时用例集 355 个（Deny 199 / Allow 156；当前 1287 个，见第一章），其中 18 个场景内 215 个（含 edge/inline 边界用例，统计时点 231 个时整理），另有 agent 专属用例 9 个、scenario 场景用例 9 个、以及部分边界用例未计入场景分类。下表为历史整理的攻击面视图（统计时点：用例集 231 个时），精确计数以第一章为准。用例随规则演进增删后，本表不再逐增逐改。
 
 按攻击场景归类，共 18 个场景，合计 215：
 
@@ -343,11 +344,11 @@
 
 ## 五、误报率与漏报率（基于整个 tests/cases）
 
-> **统计时点**：下表为**历史统计**（统计时点：用例集 231 个时）的实测结果，**精确计数以第一章为准**（当前 355 个，Deny 199 / Allow 156，非 L3 327 个）。口径与 §6.3 一致：对**非 L3 用例（203 个，历史时点）**逐一跑 `analyze()` 三档（不启用 / 仅 L1 / L1+L2），L3 用例（28 个）禁 LLM 时 skip（fail-open 放行，对应"漏报"），由 §6.2 的 LLM 真跑单独验证。用例增删后本节数字为历史快照，不随用例集自动更新；复现方法见 §6.3（脚本需在完整 pytest fixture 环境下才与 test_all_cases.py 同口径）。**2026-08 扩充的 53 个 + 2026-09 新增的 24 个 L1 用例（rm-root 降级 2 个 + 主目录删除根 + 主目录穿越拦截 2 个 + 定向清理放行 + chmod -R/-- 2 个 + setuid 组合位 + SSH/AWS 目录初始化放行 + 相对 temp 放行 + 敏感路径补空 1 个 + 审查批次2 的 6 个）均为静态可拦/可放行（已双端实测通过），不改变"L1+L2 零误报、L3 全通过"的结论**。
+> **统计时点**：下表为**历史统计**（统计时点：用例集 231 个时）的实测结果，**精确计数以第一章为准**（第一章当前 1287 个；本表整理时 355 个，Deny 199 / Allow 156，非 L3 327 个）。口径与 §6.3 一致：对**非 L3 用例（203 个，历史时点）**逐一跑 `analyze()` 三档（不启用 / 仅 L1 / L1+L2），L3 用例（28 个）禁 LLM 时 skip（fail-open 放行，对应"漏报"），由 §6.2 的 LLM 真跑单独验证。用例增删后本节数字为历史快照，不随用例集自动更新；复现方法见 §6.3（脚本需在完整 pytest fixture 环境下才与 test_all_cases.py 同口径）。**2026-08 扩充的 53 个 + 2026-09 新增的 24 个 L1 用例（rm-root 降级 2 个 + 主目录删除根 + 主目录穿越拦截 2 个 + 定向清理放行 + chmod -R/-- 2 个 + setuid 组合位 + SSH/AWS 目录初始化放行 + 相对 temp 放行 + 敏感路径补空 1 个 + 审查批次2 的 6 个）均为静态可拦/可放行（已双端实测通过），不改变"L1+L2 零误报、L3 全通过"的结论**。
 
-> **⚠️ 当前能力已超出本表（2026-09-11 更新）**：用例集已扩至 355 个，引擎新增 L2.2 形式化组合链 / 脚本引擎 / 内联分析等能力，本表数字**不再反映当前水平**。按同口径（§6.3 + 完整 pytest fixture 环境）实测：非 L3 的 317 个用例（182 应拦 / 135 应放）在 **L1+L2 档与 L1+L2+L3 档均零漏报、零误报**；另有 28 个语义类 L3 用例（14 应拦 / 11 应放）在全开档同样零漏报、零误报。L3 档此前残留的边界误报已按「误报改用例、非误报改引擎」的二分原则处置：`deny-10`（`git push --force`）属 L3 重复评估前置已降级为 medium 的已知风险 → 在 L3 模板补「不重复评估已知风险」原则修复；`allow-147`（`tar -xzf /tmp/... -C ~/.ssh`）属用例选了个来源即安全歧义的场景 → 改用用户自有备份目录作来源。**注意 L3 存在模型波动**：同一用例不同次跑判定可能翻转，单次数字仅供参考。最新对外数字见 `docs/ppt/tech_report_slides_content.md` 第 32 页。
+> **⚠️ 当前能力已超出本表（2026-09-11 更新）**：用例集当时已扩至 355 个（当前 1287 个），引擎新增 L2.2 形式化组合链 / 脚本引擎 / 内联分析等能力，本表数字**不再反映当前水平**。按同口径（§6.3 + 完整 pytest fixture 环境）实测：非 L3 的 317 个用例（182 应拦 / 135 应放）在 **L1+L2 档与 L1+L2+L3 档均零漏报、零误报**；另有 28 个语义类 L3 用例（14 应拦 / 11 应放）在全开档同样零漏报、零误报。L3 档此前残留的边界误报已按「误报改用例、非误报改引擎」的二分原则处置：`deny-10`（`git push --force`）属 L3 重复评估前置已降级为 medium 的已知风险 → 在 L3 模板补「不重复评估已知风险」原则修复；`allow-147`（`tar -xzf /tmp/... -C ~/.ssh`）属用例选了个来源即安全歧义的场景 → 改用用户自有备份目录作来源。**注意 L3 存在模型波动**：同一用例不同次跑判定可能翻转，单次数字仅供参考。最新对外数字见 `docs/outreach/ppt/tech_report_slides_content.md` 第 32 页。
 
-口径：对 203 个非 L3 用例逐一跑 `analyze()`，比较实际 `decision` 与期望 `expected_decision`。
+口径（历史时点）：对 203 个非 L3 用例逐一跑 `analyze()`，比较实际 `decision` 与期望 `expected_decision`。
 - **FP（误报）** = 期望 Allow 却 Deny
 - **FN（漏报）** = 期望 Deny 却 Allow
 - **通过** = 实际 == 期望；**失败** = FP + FN
@@ -461,7 +462,7 @@ for f in sorted(glob.glob("tests/cases/l*/*.json")):
 > （`os/windows` 154 + `os/macos` 36 + `os/harmony` 23，子目录名即 `input.os_type`；
 > macos / harmony 各含一条**继承 Linux** 的验证用例）。这些用例**不进客户交付集**
 > （`generate_bash_exc.py` 提取命令集时排除 `os/`，客户沙箱是麒麟/Linux，平台用例
-> 在那里判定必然失败）。新增平台规则请照 `docs/MULTI_OS_EXTENSION_GUIDE.md` 走。
+> 在那里判定必然失败）。新增平台规则请照 `docs/process/MULTI_OS_EXTENSION_GUIDE.md` 走。
 
 ---
 

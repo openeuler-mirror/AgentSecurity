@@ -478,7 +478,9 @@ class PythonBackend(LanguageBackend):
         r"(?:^|\s|&&|\|\|)\s*python3?\s+(\S+\.py)",
     ]
 
-    def parse(self, content: str, entry_args: list[str] | None) -> ScriptIR:
+    def parse(
+        self, content: str, entry_args: list[str] | None, *, diagnostics: dict | None = None,
+    ) -> ScriptIR:
         """解析 python 脚本：ast 控制流剪枝 + 子脚本调用提取；失败回退全文本。
 
         fail-closed 原则（与 ShellBackend 一致）：
@@ -491,9 +493,13 @@ class PythonBackend(LanguageBackend):
         env = _Env(argv=list(entry_args or []))
         lines: set = set()
         branches: list[BranchInfo] = []
+        if diagnostics is not None:
+            diagnostics.update(physical_lines=len(source_lines), line_limit=MAX_LINES)
 
         # 预算熔断：超行数直接全文本（保持性能红线）
         if len(source_lines) > MAX_LINES:
+            if diagnostics is not None:
+                diagnostics.update(parser="python_full", fallback_reason="line_budget", child_extractor="regex")
             calls = _extract_calls_regex(content)
             return ScriptIR(
                 reachable_content=content,
@@ -506,6 +512,8 @@ class PythonBackend(LanguageBackend):
             tree = ast.parse(content)
         except SyntaxError:
             # 残缺/混淆脚本：全文本 fail-closed，仍尽力提取子调用
+            if diagnostics is not None:
+                diagnostics.update(parser="python_full", fallback_reason="syntax_error", child_extractor="regex")
             calls = _extract_calls_regex(content)
             return ScriptIR(
                 reachable_content=content,
@@ -519,6 +527,14 @@ class PythonBackend(LanguageBackend):
 
         # 子脚本调用提取（AST 形式优先，正则兜底字符串形式；只取可达分支内的调用）
         calls = _extract_calls_ast(tree, content, reachable_lines=lines)
+        if diagnostics is not None:
+            diagnostics.update(
+                parser="python_ast",
+                child_extractor="ast" if calls else "regex",
+                retained_lines=len(lines),
+                branch_count=len(branches),
+                branch_reachable=[branch.reachable for branch in branches[:4]],
+            )
         if not calls:
             calls = _extract_calls_regex(content)
 

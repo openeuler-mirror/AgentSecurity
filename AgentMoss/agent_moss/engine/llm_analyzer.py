@@ -7,7 +7,9 @@
 import hashlib
 import json
 import logging
+import os
 import time
+from urllib.parse import urlsplit
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
@@ -38,6 +40,53 @@ logger = logging.getLogger(__name__)
 
 class LLMAnalysisFailure(Exception):
     """LLM 分析失败的异常"""
+
+
+def _masked_base_url(url: str) -> str:
+    """只保留协议/host/port/path，不打印 query（避免泄漏 key）。"""
+    try:
+        u = urlsplit(url or "")
+        if not u.hostname:
+            return "(default)"
+        port = f":{u.port}" if u.port else ""
+        return f"{u.scheme or 'https'}://{u.hostname}{port}{u.path or ''}"
+    except Exception:  # noqa: BLE001
+        return "(unparseable)"
+
+
+def _llm_error_detail(
+    error: Exception,
+    *,
+    config,
+    attempt: int,
+    max_retries: int,
+    elapsed: float,
+    prompt_chars: int,
+    timeout: float,
+) -> str:
+    """把 LLM 连接失败打成可定位的一行：异常链 / 阶段线索 / 配置 / 耗时。"""
+    chain: list[str] = []
+    cur: BaseException | None = error
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen and len(chain) < 4:
+        seen.add(id(cur))
+        msg = str(cur).replace("\n", " ")[:300]
+        chain.append(f"{type(cur).__name__}({msg})")
+        cur = cur.__cause__ or cur.__context__
+    cause = error.__cause__ or error.__context__
+    errno = getattr(cause, "errno", None) or getattr(error, "errno", None)
+    proxy = ",".join(
+        name for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+        if os.getenv(name)
+    ) or "none"
+    return (
+        f"attempt={attempt}/{max_retries} elapsed={elapsed:.1f}s "
+        f"timeout={timeout:.1f}s model={getattr(config, 'model', '?')} "
+        f"provider={getattr(config, 'provider', '?')} "
+        f"base_url={_masked_base_url(getattr(config, 'base_url', ''))} "
+        f"proxy={proxy} prompt_chars={prompt_chars} "
+        f"errno={errno} chain={' <- '.join(chain)}"
+    )
     pass
 
 
@@ -190,6 +239,15 @@ class LLMAnalyzer:
                     len(prompt_a_next["action_detail"]),
                 )
 
+        if logger.isEnabledFor(logging.DEBUG):
+            action_count = len(action_history or ())
+            logger.debug(
+                "L3 prompt_size actions_in=%d actions_kept=%d prompt_chars=%d "
+                "estimated_tokens=%d token_budget=%d",
+                action_count, min(action_count, max_items) if max_items > 0 else action_count,
+                len(judge_prompt), self._estimate_tokens(judge_prompt), max_prompt_tokens,
+            )
+
         # 4.5 打印 prompt 到日志文件（如果配置了 AGENT_MOSS_LOG_PATH）
         # 优先级：per-request 注入的 llm_log_path（来自调用方 env，bridge 子进程有
         # AGENT_MOSS_LOG_PATH 但服务进程不一定有，per-request 注入解决跨进程）>
@@ -283,6 +341,7 @@ class LLMAnalyzer:
 
         for attempt in range(1, max_retries + 1):
             call_timeout = min(single_call_timeout, remaining_budget())
+            _attempt_start = time.monotonic()
             try:
                 # 上下文管理器退出时会 wait=True，反而等完已超时的请求。
                 # HTTP 传输自身也使用预算内超时，超时返回不等待工作线程退出。
@@ -401,10 +460,17 @@ class LLMAnalyzer:
             except TimeoutError as e:
                 # call_llm 抛出的真正超时（网络/读取超时）
                 logger.warning(
-                    "LLM 调用网络超时: %s，第 %d/%d 次尝试",
+                    "LLM 调用网络超时: %s | %s",
                     e,
-                    attempt,
-                    max_retries,
+                    _llm_error_detail(
+                        e,
+                        config=llm_config_to_use,
+                        attempt=attempt,
+                        max_retries=max_retries,
+                        elapsed=time.monotonic() - _attempt_start,
+                        prompt_chars=len(judge_prompt),
+                        timeout=call_timeout,
+                    ),
                 )
                 if attempt < max_retries:
                     wait_for_retry()
@@ -448,17 +514,35 @@ class LLMAnalyzer:
                     )
                 else:
                     logger.warning(
-                        "LLM 安全分析第 %d/%d 次调用失败 [%s]: %s",
+                        "LLM 安全分析第 %d/%d 次调用失败 [%s]: %s | %s",
                         attempt,
                         max_retries,
                         error_type,
                         e,
+                        _llm_error_detail(
+                            e,
+                            config=llm_config_to_use,
+                            attempt=attempt,
+                            max_retries=max_retries,
+                            elapsed=time.monotonic() - _attempt_start,
+                            prompt_chars=len(judge_prompt),
+                            timeout=call_timeout,
+                        ),
                     )
                 if attempt < max_retries:
                     wait_for_retry()
                 else:
                     raise LLMAnalysisFailure(
-                        f"LLM 安全分析失败（{max_retries} 次）[{error_type}]: {e}"
+                        f"LLM 安全分析失败（{max_retries} 次）[{error_type}]: {e} | "
+                        + _llm_error_detail(
+                            e,
+                            config=llm_config_to_use,
+                            attempt=attempt,
+                            max_retries=max_retries,
+                            elapsed=time.monotonic() - _attempt_start,
+                            prompt_chars=len(judge_prompt),
+                            timeout=call_timeout,
+                        )
                     )
 
     def _parse_llm_response(self, response: str) -> SecurityJudgment:
@@ -542,6 +626,7 @@ class LLMAnalyzer:
             return "（未提供历史意图）"
 
         lines = []
+        longest_text_chars = 0
         for i, turn in enumerate(prompt_history, 1):
             if not isinstance(turn, dict):
                 continue
@@ -552,6 +637,7 @@ class LLMAnalyzer:
             if not text:
                 continue
             text = text[:max_text_chars]
+            longest_text_chars = max(longest_text_chars, len(text))
             line = f"  第{i}轮用户意图: {text}"
             actions = turn.get("actions")
             if actions and isinstance(actions, list):
@@ -566,6 +652,10 @@ class LLMAnalyzer:
                     line += f"  → 动作: {', '.join(action_types)}"
             lines.append(line)
 
+        logger.debug(
+            "L3 prompt_history turns_in=%d turns_kept=%d longest_text_chars=%d",
+            len(prompt_history), len(lines), longest_text_chars,
+        )
         if not lines:
             return "（未提供历史意图）"
         return "\n".join(lines)

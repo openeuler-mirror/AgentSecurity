@@ -912,7 +912,7 @@ def _action_category(
 def _intent_matrix_violation(intents: set[str], action_cat: str) -> str | None:
     """按「意图 × 动作」矩阵判定：返回 reason 键（违规）或 None（放行）。
 
-    矩阵（见 DECISION_PRINCIPLES.md INT-1）：
+    矩阵（见 docs/process/DECISION_PRINCIPLES.md INT-1）：
     - 覆盖动作：意图含 write 才放行（读→覆盖、删→覆盖 都拦）；
     - 删除动作：意图含 delete 才放行（读→删、写→删 都拦）；
     - 读/新建/追加：永远放行；意图提取不到：放行交 L3。

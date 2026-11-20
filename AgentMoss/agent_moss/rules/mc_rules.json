@@ -1,5 +1,5 @@
 {
-  "_comment": "L2.2 模型检测规则单一事实源（Python + TS 共用）。原子命题正则 + LTL 公式（前缀 AST）。公式在事件迹位置 0 处评估：LTL 公式满足 = 攻击存在。对应站点 detection-l2-2.html 的 9 条 LTL + 5 条 CTL 规则（2026-09 移除 2 条单动作冗余：mc-ltl-010 F(install_persistence) 与 mc-ctl-001 F(clear_logs) —— 它们误伤正常运维，且攻击场景已由链式规则 006/007/008 覆盖）（CTL 活性降级为 G(!φ) 安全不变量，见 docs/DETECTION_METHODS.md 5.4）。",
+  "_comment": "L2.2 模型检测规则单一事实源（Python + TS 共用）。原子命题正则 + LTL 公式（前缀 AST）。公式在事件迹位置 0 处评估：LTL 公式满足 = 攻击存在。对应站点 detection-l2-2.html 的 9 条 LTL + 5 条 CTL 规则（2026-09 移除 2 条单动作冗余：mc-ltl-010 F(install_persistence) 与 mc-ctl-001 F(clear_logs) —— 它们误伤正常运维，且攻击场景已由链式规则 006/007/008 覆盖）（CTL 活性降级为 G(!φ) 安全不变量，见 docs/security/DETECTION_METHODS.md 5.4）。",
   "ap_patterns": {
     "reads_credential": [
       "(?:cat|head|tail|less|more|sed|awk|strings|base64|dd)\\s+[^;&|\\n]*[~]?/\\.ssh(?:/[\\w.-]+)?\\b",

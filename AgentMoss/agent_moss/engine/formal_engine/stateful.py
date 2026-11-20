@@ -21,10 +21,14 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
 import logging
 import os
 import re
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +58,20 @@ def _max_nodes() -> int:
 
 
 _MAX_NODES = _max_nodes()
+
+
+def _retain_nodes() -> int:
+    """轮转后保留的最近节点数（默认上限的一半）。
+
+    AgentMoss 的链状态是派生缓存；到上限时自动归档旧节点并保留最近窗口，
+    不再丢新动作、也不要求客户手工 reset。
+    """
+    raw = os.getenv("AGENT_MOSS_CHAIN_RETAIN_NODES", "")
+    try:
+        n = int(raw) if raw else max(1, _MAX_NODES // 2)
+    except ValueError:
+        n = max(1, _MAX_NODES // 2)
+    return max(1, min(n, _MAX_NODES - 1))
 #: 容量分级预警阈值（达到即打一条 warning，每档只打一次）
 _CAPACITY_WARN_RATIOS = (0.7, 0.85, 0.95)
 
@@ -501,6 +519,77 @@ class StatefulChainTracker:
             exfil=exfil_violations,
         )
 
+    def _archive_nodes(self, nodes: list[StateNode], archive_dir: Path | None = None) -> Path:
+        """把旧节点写 gzip JSONL；写成功后才允许调用方删除/重置。"""
+        if archive_dir is None:
+            raw = os.getenv("AGENT_MOSS_CHAIN_ARCHIVE_DIR", "")
+            if raw:
+                archive_dir = Path(raw)
+            else:
+                from ...infra.paths import get_state_root
+                archive_dir = get_state_root() / "chain-archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(archive_dir, 0o700)
+        except OSError:
+            pass
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime())
+        path = archive_dir / f"chain-nodes-{self.agent_id or 'default'}-{stamp}-{int(time.time()*1000)%1000:03d}.jsonl.gz"
+        payload = "\n".join(
+            json.dumps(
+                {k: (list(v) if k == "resources" or k == "instances" else v)
+                 for k, v in n.__dict__.items()},
+                ensure_ascii=False,
+            )
+            for n in nodes
+        ) + "\n"
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(gzip.compress(payload.encode("utf-8")))
+        return path
+
+    def rotate(self, archive_dir: Path | None = None, retain: int | None = None) -> tuple[int, str]:
+        """归档旧节点并只保留最近窗口，重建链指针/taint 状态。
+
+        返回 ``(归档条数, 归档文件)``。归档失败抛异常，调用方不得丢状态。
+        """
+        keep = _retain_nodes() if retain is None else max(1, min(retain, _MAX_NODES - 1))
+        if len(self.nodes) <= keep:
+            return 0, ""
+        old = self.nodes[:-keep]
+        kept = self.nodes[-keep:]
+        path = self._archive_nodes(old, archive_dir)
+
+        # 重建为一棵新的时间线：保留节点重新编号，链指针/taint 从头 replay。
+        self.nodes = []
+        self._ptr = {}
+        self._tainted = set()
+        self._tainted_resources = set()
+        self._taint_parent = {}
+        self._taint_edge_label = {}
+        self._taint_origin = {}
+        self._alive_resources = {}
+        self._seeded_keys = set()
+        self._capacity_warned = set()
+        self.seq_next = 0
+        for n in kept:
+            action = {
+                "action_type": n.action_type,
+                "action_detail": n.action_detail,
+                "called_at": n.timestamp or "",
+                "agent_id": n.agent_id,
+                "instance_id": n.instance_id,
+            }
+            node = self._append(
+                action, n.session_id, is_error=n.is_error,
+                agent_id=n.agent_id, instance_id=n.instance_id,
+            )
+            if node is not None:
+                self._record_lifecycle(node)
+                self._advance_taint(node)
+                self._advance_chains(node)
+        return len(old), str(path)
+
     def _append(
         self,
         action: dict,
@@ -531,9 +620,8 @@ class StatefulChainTracker:
         # 触顶保护（硬上限）
         if len(self.nodes) >= _MAX_NODES:
             logger.warning(
-                "stateful 时间线达上限 %d（agent=%s），忽略新节点；"
-                "组合链检测已无法覆盖新动作，请用 `agent-moss state backup` 备份后 "
-                "`agent-moss state reset --yes` 重建",
+                "stateful 时间线达到兜底上限 %d（agent=%s），自动轮转未生效，忽略本次新节点；"
+                "请检查链状态归档目录权限/磁盘空间，不要用 state reset 清空历史",
                 _MAX_NODES, self.agent_id,
             )
             return None
@@ -565,9 +653,8 @@ class StatefulChainTracker:
                 self._capacity_warned.add(_ratio)
                 logger.warning(
                     "stateful 时间线已用 %d%%（%d/%d 节点，agent=%s）。"
-                    "达 100%% 后新动作将不再入链、组合链检测失效。"
-                    "建议：agent-moss state backup 备份后视情况 reset，"
-                    "或调大 AGENT_MOSS_CHAIN_MAX_NODES",
+                    "达到上限后会自动归档旧节点并保留最近窗口，不会丢新动作；"
+                    "无需手工 state reset。",
                     int(_ratio * 100), _n, _MAX_NODES, self.agent_id,
                 )
         return node

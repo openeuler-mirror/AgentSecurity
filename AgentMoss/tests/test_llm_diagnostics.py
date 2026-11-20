@@ -85,3 +85,48 @@ def test_dump_full_message_truncates_oversized():
     text = _dump_full_message(msg, limit=1000)
     assert len(text) < 1100
     assert "truncated" in text
+
+
+def test_llm_error_detail_includes_chain_and_masks_url(monkeypatch):
+    """连接失败日志必须带异常链/阶段线索，且 base_url 不能泄漏 query。"""
+    from types import SimpleNamespace
+    from agent_moss.engine.llm_analyzer import _llm_error_detail, _masked_base_url
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    cfg = SimpleNamespace(
+        model="qwen", provider="qwen", base_url="https://qwen.example/v1?api_key=SECRET"
+    )
+    try:
+        try:
+            raise OSError(111, "Connection refused")
+        except OSError as cause:
+            raise ConnectionError("Connection error.") from cause
+    except ConnectionError as err:
+        detail = _llm_error_detail(
+            err, config=cfg, attempt=1, max_retries=2,
+            elapsed=1.2, prompt_chars=1234, timeout=10.0,
+        )
+
+    assert "attempt=1/2" in detail
+    assert "errno=111" in detail
+    assert "ConnectionError(Connection error.)" in detail
+    assert "ConnectionRefusedError" in detail
+    assert "qwen.example" in detail
+    assert "HTTPS_PROXY" in detail
+    assert "SECRET" not in detail
+    assert _masked_base_url("https://qwen.example/v1?api_key=SECRET") == "https://qwen.example/v1"
+
+
+def test_doctor_exception_chain():
+    from agent_moss.doctor import _exception_chain
+
+    try:
+        try:
+            raise OSError(101, "Network is unreachable")
+        except OSError as cause:
+            raise ConnectionError("connect failed") from cause
+    except ConnectionError as err:
+        text = _exception_chain(err)
+    assert "ConnectionError(connect failed)" in text
+    assert "OSError" in text
+    assert "Network is unreachable" in text

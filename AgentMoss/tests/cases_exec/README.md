@@ -88,8 +88,8 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
   的 extra_command_patterns 正则 + `inline_analyzer.py::is_literal_text_command` 字面量
   豁免，直接内嵌搬运，见该模块头注释的"为什么存在"）。生成器顶层只 import 标准库，
   **不需要 agent_moss 包**；有 agent_moss 时可选 `--verify-static` 做更进一步校验。
-  已用引擎逐条验证：bank 模式 81 条主 allow 全放行、21 条被场景拦命令全拦截，与引擎
-  输出一致。**若上游改场景规则或字面量豁免逻辑，需同步更新 `scenario_rules.py`**。
+  2026-08 已用引擎逐条验证：bank 模式 81 条主 allow 全放行、21 条被场景拦命令全拦截，与引擎
+  输出一致（当前条数见下方「bank 模式」复核说明）。**若上游改场景规则或字面量豁免逻辑，需同步更新 `scenario_rules.py`**。
 - **`--agent xiaoo`**：在**通用集基础上追加** `tests/cases/agent/*.json`（且
   `input.agent_id == xiaoo`），同样透传 agent_id 做静态判定；其他 agent 用例剔除。
 - 两者可同时指定（`--scenario bank --agent xiaoo`）→ 通用集 + scenario/bank + agent
@@ -194,7 +194,12 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
 
 **bank 模式**（`--scenario bank`，通用集 + scenario/bank 用例，招行客户交付物）：
 
-- **主 `allow.sh` 81 条**：通用集 Allow 87 条中，**22 条被 bank 目录白名单/禁 ssh 场景规则
+> **2026-11-19 复核**：用例集扩至 1287 后，bank 模式生成结果为 主 `allow.sh` **215 条**、
+> 主 `deny.sh` **326 条**（均为去重后），另 `allow-root-only.sh` 16 条、
+> `deny-root-only.sh` 89 条、`deny-needs-context.sh` 8 条。以下 81/85 等明细为
+> 2026-08 盘点，保留用于说明分流逻辑。
+
+- **主 `allow.sh` 81 条（2026-08 盘点）**：通用集 Allow 87 条中，**22 条被 bank 目录白名单/禁 ssh 场景规则
   拦成 Deny 而移出**（scenario-blocks-allow），去重后剩 81 条普通用户可在 bank 沙箱真执行
   且放行的命令。
   - 被场景拦的 22 条包含：`cat /etc/passwd`、`cat /etc/group`、`ls -la /home`、
@@ -204,7 +209,7 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
   - **路径仅作字面量**的 allow 命令（`echo '/etc/shadow'`、`perl -e "print '/etc/shadow'"`
     等）**保留在主 allow.sh（9 条）**——引擎对字符串命令有语义豁免（纯文本字面量，
     未伴随读写操作），实测放行；生成器对场景 allow 也走引擎静态判定而非路径正则。
-- **主 `deny.sh` 85 条**（原始 88 条去重后）：通用集 82 条 + bank 场景用例 9 条里**命中
+- **主 `deny.sh` 85 条（2026-08 盘点）**（原始 88 条去重后）：通用集 82 条 + bank 场景用例 9 条里**命中
   场景规则进主集的 3 条**（`cat /etc/passwd`、`ssh root@10.0.0.5`、`cat /home/other/data.txt`）。
   通用集 deny 命令里凡**普通用户可真执行**的恶意命令（含 `curl -d @/etc/passwd` 数据外传、
   `wget --post-data=$(cat /etc/passwd)`、`tar /workspace` 打包、`os.system('rm -rf /home')`
@@ -258,7 +263,7 @@ python3 generate_bash_exc.py --json-dir ../cases --output-dir ./xiaoo --agent xi
 > 反弹 shell deny 命令回归 CMB 沙箱主集。(2) **场景模式的 allow 分流完全改用 AgentMoss 引擎
 > 静态判定**（透传 scenario_id 逐条 analyze），不再用路径字符串正则——字符串字面量命令
 > （引擎有语义豁免，实测 Allow）回归主 allow.sh；真被场景规则拦的 allow 命令（访问白名单外）
-> 按"被场景拦"移出主 allow.sh 而非 root-only。修复后 bank 模式：**主 allow.sh 72→81 条、
+> 按"被场景拦"移出主 allow.sh 而非 root-only。修复后 bank 模式（2026-08）：**主 allow.sh 72→81 条、
 > allow-root-only 31→5 条（只留真 root）、主 deny.sh 76→85 条**（新增 curl -d @/etc/passwd
 > 外传、tar 打包 /workspace、crontab 定时外传、os.system 删 /home/hkl 等 9 条应拦命令回归
 > 主集）。curl/wget 外传 + 反弹 shell deny 全部留在主集（普通用户可真执行、应被 AgentMoss 拦截）。

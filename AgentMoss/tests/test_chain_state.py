@@ -200,3 +200,45 @@ def test_review_reads_agentgate_sqlite_db(tmp_path, monkeypatch):
     assert r2.status_code == 200
     body2 = r2.json()
     assert body2["decision"] == "Deny", f"db_path 直读后当前 SCAN 应补全链 → Deny，实际 {body2}"
+
+def test_chain_state_auto_rotate_keeps_recent_and_archives_old(tmp_path, monkeypatch):
+    """到达节点上限时自动归档旧节点、保留最近窗口，不再丢新动作。"""
+    import gzip
+    import json
+    from agent_moss.engine.formal_engine import stateful
+
+    monkeypatch.setattr(stateful, "_MAX_NODES", 10)
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_RETAIN_NODES", "4")
+    archive_dir = tmp_path / "archive"
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_ARCHIVE_DIR", str(archive_dir))
+    db_path = str(tmp_path / "state.db")
+
+    store = ChainStateStore(db_path)
+    try:
+        # 前 10 条填满；第 11 条触发轮转 → 保留最近 4 条，再追加 1 条 = 5 条
+        for i in range(11):
+            store.apply_action(
+                "agent-rotate",
+                {"action_type": "execute", "action_detail": f"echo rotate-{i}"},
+                f"s-{i}",
+            )
+        store.flush()
+        assert len(store.load("agent-rotate").nodes) == 5
+    finally:
+        store.close()
+
+    files = list(archive_dir.glob("*.jsonl.gz"))
+    assert len(files) == 1
+    lines = gzip.decompress(files[0].read_bytes()).decode("utf-8").strip().split("\n")
+    assert len(lines) == 6
+    assert json.loads(lines[0])["action_detail"] == "echo rotate-0"
+
+    # 重启后仍然只有保留窗口，不会把归档旧节点重新加载
+    store2 = ChainStateStore(db_path)
+    try:
+        tracker = store2.load("agent-rotate")
+        assert tracker is not None
+        assert len(tracker.nodes) == 5
+        assert tracker.nodes[-1].action_detail == "echo rotate-10"
+    finally:
+        store2.close()
