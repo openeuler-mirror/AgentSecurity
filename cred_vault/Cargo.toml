@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/credstore",
+    "crates/credproxyd",
+    "crates/credclient",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

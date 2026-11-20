@@ -1,0 +1,16 @@
+[package]
+name = "credclient"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
+
+[dev-dependencies]
+credstore = { path = "../credstore" }
+credproxyd = { path = "../credproxyd" }
+tempfile = "3"
+libc = "0.2"
