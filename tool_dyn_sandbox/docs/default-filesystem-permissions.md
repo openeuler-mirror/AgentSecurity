@@ -8,9 +8,9 @@
 |------|------|--------|------|
 | `/` | tmpfs | `tmpfs` | — |
 | `/proc` | procfs | `proc` | `ro` |
-| `/usr` | bind mount | `/oldroot/usr` | `ro,nodev,nosuid,noexec` |
-| `/etc` | bind mount | `/oldroot/etc` | `ro,nodev,nosuid,noexec`（nsswitch.conf 覆盖为 `files dns`） |
-| `/sys` | bind mount | `/oldroot/sys` | `ro,nodev,nosuid,noexec`（非 fatal，失败仅警告） |
+| `/usr` | bind mount | `/oldroot/usr` | `ro,nodev,nosuid` |
+| `/etc` | bind mount | `/oldroot/etc` | `ro,nodev,nosuid,noexec`（原样透传；`resolv.conf` 另见下方说明） |
+| `/sys` | bind mount | `/oldroot/sys` | `ro,nodev,nosuid,noexec` |
 | `/dev` | tmpfs（根已为 tmpfs，/dev 直接建目录） | — | — |
 | `/dev/shm` | tmpfs | `tmpfs` | — |
 | `/tmp` | tmpfs | `tmpfs` | `mode=0777,size=256M`（默认） |
@@ -18,18 +18,18 @@
 | `/sbin` | symlink | → `usr/sbin` | — |
 | `/lib` | symlink | → `usr/lib` | — |
 | `/lib64` | symlink | → `usr/lib64` | — |
-| `/dev/null` | mknod | `1:3` | — |
-| `/dev/zero` | mknod | `1:5` | — |
-| `/dev/full` | mknod | `1:7` | — |
-| `/dev/random` | mknod | `1:8` | — |
-| `/dev/urandom` | mknod | `1:9` | — |
-| `/dev/tty` | mknod | `5:0` | — |
+| `/dev/null` | bind mount | `/oldroot/dev/null` | 宿主设备 `1:3` |
+| `/dev/zero` | bind mount | `/oldroot/dev/zero` | 宿主设备 `1:5` |
+| `/dev/full` | bind mount | `/oldroot/dev/full` | 宿主设备 `1:7` |
+| `/dev/random` | bind mount | `/oldroot/dev/random` | 宿主设备 `1:8` |
+| `/dev/urandom` | bind mount | `/oldroot/dev/urandom` | 宿主设备 `1:9` |
+| `/dev/tty` | bind mount | `/oldroot/dev/tty` | 宿主设备 `5:0` |
 
 > `/oldroot` 是 `pivot_root` 后原根文件系统的挂载点，用于 bind mount 宿主机路径。
 
 ## Landlock 权限集
 
-默认添加的 Landlock 规则（`setup_landlock_base()`，`sandbox-run.c:577-603`）：
+默认添加的 Landlock 规则（`setup_landlock_base()`，`dyn-sandbox.c:834`；规则表 `dyn-sandbox.c:862-889`）：
 
 ## 规则表
 

@@ -89,7 +89,7 @@ AI agent 场景下，用户（使用 agent 的终端用户）的核心矛盾：*
 | **性能** | 沙箱创建到 tool 执行开销 | 优于docker（当前无实际数据） |
 | **可用性** | 关键组件缺失时报错退出，不降级运行 | 退出码明确区分故障原因（见 3.3.2） |
 | **安全性** | 沙箱内进程无权篡改自身策略 | landlock_restrict_self() 不可逆，nftables 在子 netns 内不可改 |
-| | 沙箱内进程无权逃逸到宿主机 | user ns 隔离 uid，drop caps + NO_NEW_PRIVS |
+| | 沙箱内进程无权逃逸到宿主机 | user ns 隔离 uid + NO_NEW_PRIVS（沙箱内 cap 仅在该 user ns 内有效） |
 | | dyn_sandbox.ko 对访问者鉴权 | 拒绝非 dyn-sandbox 的二进制通过 `/dev/dyn-sandbox` 操作沙箱 |
 | **可观测性** | 工具执行过程可追踪 | dyn-sandbox 输出阶段日志，记录策略参数、沙箱创建耗时、命令退出码 |
 | | 权限拒绝事件可监控 | kprobe 捕获次数、动态放宽次数、ioctl 决策结果可导出 |
@@ -178,24 +178,24 @@ sequenceDiagram
 
     Agent->>Parent: exec dyn-sandbox [options] -- command
 
-    Note over Parent: Phase 0: 解析 CLI 参数
+    Note over Parent: 解析 CLI 参数（父进程 main）
     Parent-->>Child: raw_clone
 
     Note over Parent: 配置环境（uidmap）
     Note over Parent: waitpid(Child, WUNTRACED) 监护循环
 
-    Note over Child: Phase 1: 创建网络隔离环境
+    Note over Child: 创建网络隔离环境（阶段 2 child_setup_network）
     Child->>SK: ioctl(SANDBOX_NET_CREATE)
     Note over SK: 创建 veth + nftables 规则
     SK-->>Child: 子网信息 (child_ip, gateway)
     Note over Child: 配置 veth IP + 路由
-    Note over Child: Phase 2-4: 构建沙箱文件系统
-    Note over Child: Phase 5: Landlock
+    Note over Child: 构建沙箱文件系统（阶段 3 setup_filesystem）
+    Note over Child: 安装 Landlock ruleset（阶段 3 建规则，阶段 4 生效）
     Child->>Kernel: landlock_create/add/restrict_self
-    Note over Child: Phase 6: seccomp
+    Note over Child: 构建 seccomp BPF（阶段 3 构建，阶段 4 生效）
     Child->>Kernel: seccomp(SECCOMP_SET_MODE_FILTER)
-    Note over Child: Phase 7: 信号/fd/NO_NEW_PRIVS/drop caps
-    Note over Child: Phase 8: execve → tool
+    Note over Child: 清理 /oldroot + close fd + NO_NEW_PRIVS（阶段 4 child_finalize）
+    Note over Child: execve → tool（阶段 4）
     Child->>Child: tool cmd 在隔离环境中运行
     Child-->>Agent: stdout
     Child-->>Agent: stderr
@@ -214,7 +214,7 @@ sequenceDiagram
          ├── dup2 重定向 stdin/stdout/stderr → pipe
          └── eventfd 等待父进程写 uid_map 完成
 
-阶段 2 (child_setup_network): 网络环境创建 (仅 has_network)
+阶段 2 (child_setup_network): 网络环境创建 (仅 network_mode == filter)
          ├── ioctl(SANDBOX_NET_CREATE) → dyn_sandbox.ko 创建 veth + nftables
          ├── ip addr add child_ip dev veth_child
          ├── ip link set veth_child up
@@ -225,17 +225,16 @@ sequenceDiagram
          ├── setup_filesystem():
          │     ├── pivot_root_into_tmpfs()       — tmpfs 新根
          │     ├── setup_default_mounts()         — /usr, /etc, /sys bind
-         │     └── setup_virtual_fs()             — /proc(ro), /dev(mknod), /dev/shm, /tmp
+         │     └── setup_virtual_fs()             — /proc(ro), /dev(bind 设备节点), /dev/shm, /tmp
          ├── setup_resolv_conf()                  — 有网络时写 /etc/resolv.conf
          ├── setup_landlock_base()                — 创建基础 ruleset（未生效）
          ├── setup_user_mounts(cfg)               — 用户 --mount / --mount-tmpfs
          ├── setup_landlock_user(cfg, ruleset_fd) — 用户 landlock 权限
          └── build_seccomp_prog(cfg)              — 构建 BPF 程序（未生效）
 
-阶段 4 (child_finalize): 清理 + 降权 + 生效 + exec
+阶段 4 (child_finalize): 清理 + 生效 + exec
          ├── umount2("/oldroot", MNT_DETACH) + rmdir
-         ├── 信号重置（SIG_DFL）
-         ├── close 多余 fd（保留 sandbox_fd + landlock_fd）
+         ├── close 多余 fd（保留 landlock_fd；no_landlock 时全关）
          ├── chdir(cfg->workdir)
          ├── enable_sandbox():
          │     ├── prctl(PR_SET_NO_NEW_PRIVS)
@@ -255,7 +254,7 @@ sequenceDiagram
          │     ├── forward_fd: child stdout/stderr → 父进程
          │     ├── sandbox_fd POLLIN:
          │     │     ├── ioctl GET_BLOCKED → 被拦路径
-         │     │     ├── dprintf(AUTH_REQ) → stdout
+         │     │     ├── dprintf(2, AUTH_REQ) → stderr
          │     │     ├── fgets(stdin) 读决策回复
          │     │     ├── ioctl DECISION → 内核
          │     │     └── 日志输出 ALLOW/DENY
@@ -367,21 +366,21 @@ dyn-sandbox \
 
 **退出码与异常场景：**
 
-| 退出码 | 场景 | 触发点 | 行为 |
-|--------|------|--------|------|
-| 0 | tool 正常执行完毕 | — | 普通退出 |
-| 1 | tool 执行失败 | Phase 8 execve 后 | tool 返回非 0 退出码 |
-| 2 | Landlock 内核不支持 | Phase 5 | 报错退出 |
-| 2 | Landlock 规则创建失败 | Phase 5 | 报错退出 |
-| 3 | seccomp 内核不支持 | Phase 6 | 报错退出 |
-| 3 | seccomp profile 未找到 | Phase 6 | 报错退出 |
-| 4 | mount 源路径不存在 | Phase 4 | 报错退出 |
-| 4 | pivot_root 失败 | Phase 3 | 报错退出 |
-| 5 | namespace 创建失败 | Phase 1 | 报错退出 |
-| 5 | uid_map 写入失败 | Phase 1 | 报错退出 |
-| 6 | dyn_sandbox.ko 模块未加载 | Phase 5 (检查 /dev/dyn-sandbox) | 报错退出 |
-| 7 | 网络策略配置失败 | Phase 0 调用 dyn_sandbox.ko | 报错退出 |
-| — | tool 被 seccomp 杀死 | 运行中违反 syscall 白名单 | SIGSYS 信号 |
+| 退出码 | 场景 | 行为 |
+|--------|------|------|
+| 0 | tool 正常执行完毕 | 普通退出 |
+| 1 | tool 执行失败 | tool 返回非 0 退出码 |
+| 2 | Landlock 内核不支持 | 报错退出 |
+| 2 | Landlock 规则创建失败 | 报错退出 |
+| 3 | seccomp 内核不支持 | 报错退出 |
+| 3 | seccomp profile 未找到 | 报错退出 |
+| 4 | mount 源路径不存在 | 报错退出 |
+| 4 | pivot_root 失败 | 报错退出 |
+| 5 | namespace 创建失败 | 报错退出 |
+| 5 | uid_map 写入失败 | 报错退出 |
+| 6 | dyn_sandbox.ko 模块未加载 | 报错退出 |
+| 7 | 网络策略配置失败 | 报错退出 |
+| — | tool 触发 seccomp 拦截 | 该 syscall 返回 EPERM，tool 自行处理（进程不被杀死） |
 
 #### 4.1.2 dyn_sandbox.ko 驱动 ioctl 接口
 
@@ -400,7 +399,7 @@ dyn-sandbox \
 
 | 接口 | 说明 |
 |------|------|
-| UDP 监听地址 | 宿主机侧 veth IP + 自动探测端口（默认 53，被占用后随机） |
+| UDP 监听地址 | 宿主机侧 veth IP + 内核分配的高位随机端口 |
 | 上游 DNS | 读取 `/etc/resolv.conf` 获取宿主机上游 DNS |
 | ioctl 通知 | 解析到 IP 后通过 `SANDBOX_NET_REPORT_DNS` 将解析出的 IP 加入 @allowed set |
 
@@ -413,7 +412,14 @@ dyn-sandbox \
 
 `landlock_enable` 控制三件事：13 个文件 kretprobe 传感器、动态插规则（`sandbox_landlock_allow_path`）、DECISION ioctl 入口守卫。`trace_all` 与网络隔离不受其影响。
 
-**加载时决策（只由两个输入决定）**：参数显式值 + `lsm_names` 探测结果。内核模块通过 `kallsyms_lookup_name("lsm_names")` 解引用读启用 LSM 列表，`strstr(..., "landlock")` 判定 Landlock 是否**真正生效**——编译进内核 ≠ 启用；LSM 未进启用列表时 blob 未分配，`cred->security + lbs_cred` 是野指针。
+**加载时决策（只由两个输入决定）**：参数显式值 + LSM 探测结果。探测由 `sandbox_landlock_probe()` 完成，按内核版本分两条路径：
+
+| 内核版本 | 探测方式 |
+|---------|---------|
+| ≥ 7.0 | 全局符号 `lsm_names` 已移除：解引用 `lsm_idlist` + `lsm_active_cnt`，遍历启用列表比对 `idlist[i]->name == "landlock"` |
+| < 7.0（如 openEuler 6.6） | `kallsyms_lookup_name("lsm_names")` 解引用后 `strstr(..., "landlock")` |
+
+两条路径判定的都是 Landlock 是否**真正生效**——编译进内核 ≠ 启用；LSM 未进启用列表时 blob 未分配，`cred->security + lbs_cred` 是野指针。
 
 | 参数值 | 行为 |
 |--------|------|
@@ -447,11 +453,11 @@ Landlock policy（操作集）── 精确的允许操作
 ```
 沙箱内 /
 ├── /usr  → ro-bind 宿主 /usr     # 运行时（bash/python/动态库）
-├── /etc  → ro-bind 宿主 /etc     # 配置（nsswitch.conf 被覆盖为仅 files）
+├── /etc  → ro-bind 宿主 /etc     # 配置
 ├── /sys  → ro-bind 宿主 /sys     # 内核接口
 ├── /tmp  → tmpfs                 # 工具工作目录（大小可通过 --tmpfs-size 配置）
 ├── /proc → proc (MS_RDONLY)       # 只读 proc
-└── /dev  → tmpfs + mknod         # 最小设备节点（非 devtmpfs）
+└── /dev  → tmpfs + bind 宿主设备节点   # 6 个最小设备节点（userns 内无法 mknod）
     ├── null, zero, full, random, urandom, tty
     ├── shm/ (tmpfs)
     └── pts/
@@ -482,17 +488,17 @@ pivot_root_into_tmpfs():
 setup_default_mounts() — 从 /oldroot bind mount 必要目录
 
     /usr → ro (MS_REC, 带 merged-usr symlink: /bin→usr/bin, /lib→usr/lib 等)
-    /etc → ro (MS_REC; nsswitch.conf 被 /sandbox-nsswitch.conf 覆盖)
+    /etc → ro (MS_REC; 原样透传宿主 /etc)
     /sys → ro (MS_REC | MS_NODEV | MS_NOSUID | MS_NOEXEC, 非 fatal)
 
 setup_virtual_fs()
 
     /proc → proc (ro)
-    /dev  → tmpfs + mknod(6 个设备节点, 不用 devtmpfs)
+    /dev  → tmpfs + bind 宿主 /oldroot/dev 下 6 个设备节点 (userns 内无法 mknod)
     /dev/shm → tmpfs
     /tmp  → tmpfs (大小可通过 --tmpfs-size 配置)
 
-setup_resolv_conf() — 有网络策略时写 resolv.conf
+setup_resolv_conf() — isolate 不处理; share/filter bind 宿主 resolv.conf (filter 再覆盖为沙箱 DNS)
 
 最终挂载树:
 
@@ -501,7 +507,7 @@ setup_resolv_conf() — 有网络策略时写 resolv.conf
     ├── /etc (bind, ro)
     ├── /sys (bind, ro)
     ├── /proc (proc, ro)
-    ├── /dev (tmpfs, 6 个设备节点)
+    ├── /dev (tmpfs + bind, 6 个设备节点)
     ├── /dev/shm (tmpfs)
     └── /tmp (tmpfs, 独立 256MB)
 ```
@@ -522,12 +528,19 @@ CLI `--landlock` 参数中使用的权限名与内核 Landlock 权限位的映�
 
 #### 4.2.3 网络隔离
 
-dyn-sandbox 在 Phase 0 解析 CLI 参数中 --domain/--cidr 后标记 has_network=1。raw_clone 时通过 CLONE_NEWNET 使子进程拥有空的 netns，子进程在 Phase 1 统一完成网络环境创建：
+网络是否使能**不设独立标记**，一律由 `network_mode` 字段判定（CLI 为 `--domain/--cidr/--share-net`，yaml为 `network.mode`）：
+
+| network_mode | CLONE_NEWNET | 网络环境创建 | 效果 |
+|---|---|---|---|
+| `filter`（有 domains/cidrs） | 加 | 执行 | 空 netns + veth + nftables 白名单 |
+| `isolate`（默认） | 加 | 跳过 | 空 netns、无网卡，完全无网络 |
+| `share`（`--share-net`） | 不加 | 跳过 | 共享宿主网络命名空间与 DNS |
 
 ```
-raw_clone(CLONE_NEWNET) → 子进程自动拥有空的 netns
+raw_clone(CLONE_NEWNET)      # 仅 network_mode != share 时加该 flag
+  → 子进程自动拥有空的 netns
 
-子进程 Phase 1:
+child_setup_network()        # 仅 network_mode == filter 时进入, 否则直接返回
   1. ioctl(SANDBOX_NET_CREATE) → dyn_sandbox.ko 创建 veth pair + nftables 规则
   2. ip addr add child_ip dev veth_child
   3. ip link set veth_child up
@@ -582,11 +595,12 @@ dyn-sandbox 二进制内置预定义 seccomp-bpf profile：
 
 | profile | 覆盖工具 | syscall 数 | 说明 |
 |---------|---------|-----------|------|
-| default | 未匹配工具 | ~25 | 保守白名单：read, write, openat, close, mmap, brk, exit_group, stat 等 |
-| file_access | 文件读写工具 | ~18 | read/write/openat/close + 信号 + ioctl |
-| script | shell/Python 脚本执行 | ~70 | default 基础上 +execve, clone, socket, connect, epoll, futex 等 |
+| default | 未匹配工具 | 37 | 保守白名单：read, write, openat, close, mmap, brk, exit_group, stat 等 |
+| file_access | 文件读写工具 | 32 | read/write/openat/close + 信号 + ioctl |
+| script | shell/Python 脚本执行 | 93 | default 基础上 +execve, clone, socket, connect, epoll, futex 等 |
 
-- 默认动作 kill（违反策略 → 进程被 SIGSYS 杀死）
+- 表中计数为 x86_64 展开后的数组条目数（含 `GLIBC_STARTUP` 9 条）；aarch64 因 `access`/`vfork`/`poll`/`select`/`stat`/`readlink`/`time`/`arch_prctl` 等 syscall 不存在而略少
+- 默认动作 deny（`SECCOMP_RET_ERRNO | EPERM`，syscall 返回 EPERM，进程不被杀死）；`SECCOMP_RET_KILL_THREAD` 仅用于 ABI/arch 不匹配的兜底
 - 不做 syscall 参数级别过滤
 - 工具需要更宽 profile 时升档（file_access → script），而非逐个追加
 
@@ -596,7 +610,8 @@ dyn-sandbox 二进制内置预定义 seccomp-bpf profile：
 - `raw_clone(CLONE_NEWUSER)`（非 root 时）→ 子进程内部 uid=0，获得全套 cap（仅 ns 内有效）
 - 父进程写子进程的 /proc/pid/uid_map + gid_map 完成映射
 - 所有 mount / pivot_root 等需要 CAP_SYS_ADMIN 的操作在子进程 user ns 内完成
-- execve 前 drop 所有 cap + NO_NEW_PRIVS
+- execve 前设置 NO_NEW_PRIVS（`enable_sandbox()`）
+- 不额外 drop cap：`drop_privileges()`（`PR_CAPBSET_DROP` + `capset` 清零 + `SECBIT_NOROOT`）已实现但**当前无调用点**，因此工具仍持有其 user ns 内的全套 cap（该 ns 外无效）
 
 **安全边界：**
 
@@ -653,14 +668,15 @@ landlock:
     access: [read, write, remove, truncate]
 
 network:
-  enabled: true            # false = 不给网卡，完全无网络
-  domains:                  # DNS 域名白名单
+  mode: filter             # filter | isolate | share；省略则由 domains/cidrs 推导
+  domains:                 # DNS 域名白名单 —— 仅 mode: filter
     - api.github.com
-  cidrs:                    # IP CIDR 白名单
+  cidrs:                   # IP CIDR 白名单 —— 仅 mode: filter
     - 10.0.0.0/8
 
-seccomp: script              # 预置 profile: default / file_access / script
-  # 或自定义 syscall 列表:
+seccomp:
+  profile: script          # 预置 profile: default / file_access / script
+  # 或自定义 syscall 列表（与 profile 互斥）:
   # seccomp:
   #   syscalls:
   #     - read
@@ -668,11 +684,15 @@ seccomp: script              # 预置 profile: default / file_access / script
   #     - openat
 ```
 
+network 段字段：
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `enabled` | 布尔 | `false` = 不创建 veth 网卡，完全无网络。默认 true |
-| `domains` | 字符串列表 | DNS 域名白名单，dyn-sandbox-dns 仅放行匹配域名 |
-| `cidrs` | 字符串列表 | IP CIDR 白名单，直接加入 nftables 放行集合 |
+| `mode` | 枚举 | `filter` = 白名单过滤（建 veth + nftables）；`isolate` = 不建网卡，完全无网络；`share` = 共享宿主网络。省略时按列表推导：有 `domains`/`cidrs` → `filter`，否则 `isolate` |
+| `domains` | 字符串列表 | DNS 域名白名单，dyn-sandbox-dns 仅放行匹配域名（仅 `mode: filter`） |
+| `cidrs` | 字符串列表 | IP CIDR 白名单，直接加入 nftables 放行集合（仅 `mode: filter`） |
+
+`domains`/`cidrs` 与显式 `mode: isolate`/`mode: share` 互斥，同时出现时策略解析报错退出。
 
 ### 4.3 交付视图
 
@@ -764,7 +784,7 @@ seccomp: script              # 预置 profile: default / file_access / script
 
 | 依赖 | 版本/说明 | 用途 | openEuler 24.03 (LTS-SP4) |
 |------|---------|------|---------|
-| Linux 内核 | >= 5.13 | Landlock ABI 1，提供文件访问控制 | ✅ 6.6.0 |
+| Linux 内核 | >= 6.2 | Landlock ABI 3（`handled_access_fs` 含 TRUNCATE 位），提供文件访问控制；`--no-landlock` 时无此要求 | ✅ 6.6.0 |
 | `CONFIG_USER_NS=y` | 内核配置 | user ns 非 root 能力获取 | ✅ |
 | `CONFIG_NET_NS=y` | 内核配置 | 子 netns 网络隔离 | ✅ |
 | `CONFIG_SECCOMP=y`<br>`CONFIG_SECCOMP_FILTER=y` | 内核配置 | seccomp-bpf 系统调用过滤 | ✅ |
