@@ -1,0 +1,22 @@
+[package]
+name = "credstore"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "credstore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credstore"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "fs", "time", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
