@@ -466,6 +466,11 @@ class TestLayer1And2:
             # AgentMoss 自身配置保护：config.json（含 LLM api_key）读拦、.agentmoss/brain 写拦
             ("deny-104-agentmoss-config-read.json", dict(decision="Deny", risk_level="critical")),
             ("deny-105-agentmoss-brain-write.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11 AgentGate/AgentMoss 安全配置防篡改（映射被改即可绕过 L2；runtime 被改即可关检测）
+            ("deny-789-agentgate-toolname-map-write.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-790-agentgate-token-read.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-791-agentgate-db-write.json", dict(decision="Deny", risk_level="high")),
+            ("deny-792-agentmoss-runtime-write.json", dict(decision="Deny", risk_level="critical")),
             # 2026-10 安全加固：AgentMoss 自身资产的读保护（同机其他 agent 直接 cat 就能拿到）
             ("deny-260-agentmoss-auth-token-read.json", dict(decision="Deny", risk_level="critical")),
             ("deny-261-agentmoss-state-db-read.json", dict(decision="Deny", risk_level="critical")),
@@ -979,6 +984,9 @@ class TestLayer1And2:
             ("allow-80-agentmoss-runtime-read.json", dict(decision="Allow", risk_level="low")),
             # 配套 allow：新增 auth_token 的 deny_both 不能把 token 用量自查与 /tmp 普通文件误伤
             ("allow-263-agentmoss-token-stats-read.json", dict(decision="Allow", risk_level="low")),
+            # 配套 allow：deny_write 只拦写——读工具名映射（自查）与读网关日志（排障）放行
+            ("allow-1128-agentgate-toolname-map-read.json", dict(decision="Allow", risk_level="low")),
+            ("allow-1129-agentgate-db-log-read.json", dict(decision="Allow", risk_level="low")),
             ("allow-264-tmp-normal-file.json", dict(decision="Allow", risk_level="low")),
             ("allow-266-agentmoss-name-lookalike.json", dict(decision="Allow", risk_level="low")),
             # 脚本分支感知放行：bash deploy.sh backup 走安全分支，不再全文本误报（需 script_branch_cwd fixture 的 deploy.sh）

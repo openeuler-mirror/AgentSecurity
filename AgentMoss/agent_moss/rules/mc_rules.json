@@ -13,7 +13,7 @@
     "network_egress": [
       "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary|-T\\s+)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
       "\\b(?:curl|wget|ftp)\\b[^;&|\\n]*\\s(?:-T|--upload-file|--post-file|--post-data|put)\\b[^;&|\\n]*https?://(?!localhost|127\\.0\\.0\\.1)",
-      "[^;&|\\n]*\\|\\s*(?:nc|netcat)\\s+\\S+\\s+\\d{1,5}\\b",
+      "\\|\\s*(?:nc|netcat)\\s+\\S+\\s+\\d{1,5}\\b",
       "(?:requests|urllib(?:\\.request)?|aiohttp|httpx)\\.(?:post|put|request|send)\\s*\\(",
       "\\b(?:scp|sftp|rsync)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|id_dsa|credentials|\\S*secret\\S*|\\.ssh/)[^;&|\\n]*\\S+@\\S+:",
       "\\b(?:smtplib|ftplib|paramiko)\\s*\\."

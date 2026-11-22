@@ -228,7 +228,7 @@
         "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|credentials|[^\\s]*\\.db|secret[^\\s]*)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
         "\\bcurl\\b[^;&|\\n]*(?:-X\\s+POST\\s+|-d\\s+|-F\\s+|--data|--upload-file|--data-binary)[^;&|\\n]*https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)",
         "\\b(?:curl|wget)\\b[^;&|\\n]*\\s(?:-T|--upload-file)\\s+[^;&|\\n]*https?://(?!localhost|127\\.0\\.0\\.1)",
-        "[^;&|\\n]*\\|\\s*nc\\s+[^;&|\\n]*\\d{1,5}\\b",
+        "\\|\\s*nc\\s+[^;&|\\n]*\\d{1,5}\\b",
         "\\b(?:scp|sftp|rsync)\\s+[^;&|\\n]*(?:/etc/shadow|/etc/passwd|id_rsa|id_dsa|credentials|\\S*secret\\S*|\\.ssh/)[^;&|\\n]*\\S+@\\S+:",
         "\\bpython3?\\s+-c\\s+['\"][^'\"]*(?:requests|urllib(?:\\.request)?|aiohttp)\\.(?:post|put|request|send)\\s*\\([^'\"]*['\"]https?://(?!127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|\\[?::1\\]?)"
       ],

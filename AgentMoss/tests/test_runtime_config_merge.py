@@ -200,3 +200,69 @@ class TestWithL22View:
         # 无 L2_2 字段时原样返回，不报错。
         runtime = {"L1_rules": {}, "L2_rules": {}}
         assert _with_l2_2_view(runtime) is runtime
+
+
+class TestSensitivePathDedupAcrossOs:
+    """跨平台同名 path（.ssh / .aws / .agentmoss）去重时不能被另一平台顶掉。
+
+    去重（_merge_rules_from_dirs）发生在按平台过滤（_rules_for_os）之前。
+    历史上去重键只有 path，种子中 linux 条目先出现，把 windows 同名条目吃掉 →
+    Windows 真实运行时（有 runtime config 的部署）目录级删除拦截静默失效。
+    2026-11 修：去重键加 os（缺省按 linux 归一化）。
+    """
+
+    def test_windows_entries_survive_dedup(self):
+        from agent_moss.infra.runtime_config import (
+            generate_source_defaults,
+            get_enabled_l2_sensitive_paths_or_default,
+        )
+
+        rt = generate_source_defaults()
+        paths = {
+            p["path"]
+            for p in get_enabled_l2_sensitive_paths_or_default(rt, "windows")
+        }
+        # 跨平台同名 path 的 windows 版必须还在（被 linux 版去重掉过）
+        assert ".ssh" in paths
+        assert ".aws" in paths
+        assert ".agentmoss" in paths
+        # 新增的 AgentGate 安全配置保护
+        assert ".config\\agentgate\\tool_name_map.json" in paths
+
+    def test_linux_entries_include_agent_config_protection(self):
+        from agent_moss.infra.runtime_config import (
+            generate_source_defaults,
+            get_enabled_l2_sensitive_paths_or_default,
+        )
+
+        rt = generate_source_defaults()
+        paths = {
+            p["path"]
+            for p in get_enabled_l2_sensitive_paths_or_default(rt, "linux")
+        }
+        for expected in (
+            ".config/agentgate/auth_token",
+            ".config/agentgate/tool_name_map.json",
+            ".config/agentgate",
+            ".local/share/agent_gate",
+            ".config/agentmoss/agent_moss_runtime.json",
+        ):
+            assert expected in paths, f"缺少敏感路径保护: {expected}"
+
+    def test_dedup_keeps_same_path_per_os(self):
+        from agent_moss.infra.runtime_config import _dedup
+
+        rules = [
+            {"path": ".agentmoss", "os": "linux"},
+            {"path": ".agentmoss", "os": "windows"},
+            {"path": ".agentmoss", "os": "linux"},  # 同平台重复 → 只留一条
+        ]
+        out = _dedup(rules, "sensitive_path_access")
+        assert [(r.get("os") or "linux") for r in out] == ["linux", "windows"]
+
+    def test_dedup_missing_os_normalized_to_linux(self):
+        """无 os 字段的老条目与 os=linux 视为同一条（override 仍能覆盖内置）。"""
+        from agent_moss.infra.runtime_config import _dedup
+
+        rules = [{"path": ".x"}, {"path": ".x", "os": "linux"}]
+        assert len(_dedup(rules, "sensitive_path_access")) == 1

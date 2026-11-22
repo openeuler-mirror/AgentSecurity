@@ -216,8 +216,14 @@
 (?i)agent_moss/agents/
 (?i)agent_moss/scenarios/
 (?i)(?:^|[\s/\\'\"])\.config/agentmoss/config\.json\b
+(?i)\.config/agentmoss/agent_moss_runtime\.json
 (?i)\.config/agentmoss
+(?i)(?:^|[\s/\\'\"])\.config/agentgate/auth_token\b
+(?i)\.config/agentgate/tool_name_map\.json
+(?i)\.config/agentgate
+(?i)\.local/share/agent_gate
 (?i)\.agentmoss/brain
+(?i)\.agentmoss
 (?i)(?:^|[\s/\\'\"])\.pgpass\b
 (?i)(?:^|[\s/\\'\"])\.netrc\b
 (?i)(?:^|[\s/\\'\"])\.bash_history\b

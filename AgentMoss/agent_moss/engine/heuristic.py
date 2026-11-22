@@ -251,7 +251,18 @@ class SensitivePathChecker:
                         rf"(?:^|[\s/\\'\"]){re.escape(path)}(?:/|[\s'\"\\]|$)"
                     )
                 else:
-                    path_match = any(path in t for t in path_scan_texts)
+                    # 2026-11 对齐 TS pathMatches：deny_write 也用边界匹配，不再裸子串。
+                    # 裸子串会误报「文件名包含规则路径」的形态：`.agentmoss`
+                    # 命中 `project/.config.local.agentmosstest`、`/boot/` 命
+                    # `/boot-log`（TS 端一直是边界匹配，Python 裸子串=双端分叉）。
+                    escaped = re.escape(path)
+                    pub_excl = r"(?!\.pub)" if not path.endswith(".pub") else r""
+                    if path.startswith(".") or path.startswith("/"):
+                        path_match = _path_search(
+                            rf"(?:^|[\s/\\'\"]){escaped}{pub_excl}\b"
+                        )
+                    else:
+                        path_match = _path_search(rf"\b{escaped}{pub_excl}\b")
 
             if not path_match and raw_path.startswith("~"):
                 expanded = os.path.expanduser(raw_path)
@@ -502,6 +513,8 @@ class HomeDeletionChecker:
     # 同段赋值：VAR=(~ | ~/ | $HOME | $HOME/ | /home/xxx | 命令替换 $() 含根 ~/$HOME)。
     # 捕获整个赋值值（到下一个 shell 分隔符），由 _is_home_value 判定是否主目录根。
     _ASSIGN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.IGNORECASE)
+    # 只在 _ASSIGN_NAME_RE 给出的候选起点上做锚定匹配（见 ② 扫描循环）：
+    # 不再对整串反复 search，避免超长字母串上的 O(n²) 回溯（2026-11 修 N2）。
     _ASSIGN_RE = re.compile(
         r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
         r"(~[A-Za-z0-9_./-]*|\$HOME[A-Za-z0-9_./-]*|\$\{HOME\}[A-Za-z0-9_./-]*|/home/[^\s;|&]+"

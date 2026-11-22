@@ -1089,21 +1089,32 @@ _DEDUP_KEYS: dict[str, tuple[str, ...]] = {
     "dangerous_commands": ("pattern",),
     "password_modify_consent": ("pattern",),
     "user_deletion_consent": ("pattern",),
-    "sensitive_path_access": ("path",),
+    # ⚠️ 必须含 os：跨平台同名 path（.ssh / .aws / .agentmoss）各有独立条目。
+    # 去重发生在 _rules_for_os 之前，若键只有 path，linux 条目（种子中先出现）
+    # 会把 windows 同名条目顶掉 → Windows 真实运行时的目录级删除拦截静默失效
+    # （2026-11 修；TS 端同源 bug 同步修）。
+    "sensitive_path_access": ("path", "os"),
     "injection_detection": ("keyword", "lang"),
     "intent_consistency": ("intent_keywords", "reason"),
 }
 
 
 def _dedup(rules: list[dict], category: str) -> list[dict]:
-    """按类别去重键去重，**保留先出现的**（调用方已按优先级排好序）。"""
+    """按类别去重键去重，**保留先出现的**（调用方已按优先级排好序）。
+
+    ``os`` 键按平台归一化（缺省视为 ``linux``，与加载过滤 / 指纹口径一致）：
+    老 override/extra 条目不带 os 时仍能覆盖对应平台的同 path 内置条目。
+    """
     keys = _DEDUP_KEYS.get(category)
     if not keys:
         return rules
     seen: set[tuple] = set()
     out: list[dict] = []
     for r in rules:
-        k = tuple(str(r.get(x, "")) for x in keys)
+        k = tuple(
+            str(r.get("os") or "linux") if x == "os" else str(r.get(x, ""))
+            for x in keys
+        )
         if k in seen:
             continue
         seen.add(k)
