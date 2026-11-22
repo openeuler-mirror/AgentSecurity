@@ -523,6 +523,21 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
         # 本次判定的能力降级说明（空 = 全层都完整跑过）
         _degraded: list[str] = []
 
+        # 未识别工具名上报（AgentGate 归一化失败时经 metadata 带过来）：
+        # 未知动作不会进入任何安全动作白名单，但依赖 action_type 的 L2 规则
+        # （读后写 / 组合链 / 授权）对该工具可能降级——必须让调用方可见，
+        # 避免"看起来在防护、实际漏检"。L1（命令内容）与 L3 不受影响。
+        _unmapped_tool = ""
+        if isinstance(req.metadata, dict):
+            _unmapped_tool = str(req.metadata.get("unmapped_tool") or "")
+        if _unmapped_tool:
+            _degraded.append(
+                f"【已降级】工具名 '{_unmapped_tool}' 未识别为标准动作类型："
+                "依赖动作类型的 L2 规则（读后写 / 组合链 / 授权）可能未生效；"
+                "L1（命令内容）与 L3 正常。可在 AgentGate 配置 AGENT_GATE_TOOL_NAME_MAP "
+                f"补充映射（如 {{\"{_unmapped_tool}\": \"read\"}}）。"
+            )
+
         # 请求 ID：一次 analyze 的所有追踪事件共享，便于 grep 串起全过程
         _req_id = uuid.uuid4().hex[:12]
         # 排队时长（由 executor 线程回填，供慢请求日志做「排队 + 计算」分解）
