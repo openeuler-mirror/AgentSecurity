@@ -2,6 +2,8 @@
 
 AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服务**。基于 OS Profile 机制，自动适配 Linux/Windows 的 syscall 检测模式，提供三层防御安全分析（特征匹配 → 逻辑规则 → LLM 语义分析）。
 
+> **本场景规则范围**：只内置 `xiaoo` agent 定制规则；不包含 `opendesk` agent 规则和 `bank` 场景规则。
+
 > v2 更新：新增 OS Profile 系统（Linux/Windows 自适应）、两级快速放行白名单、rm 命令分级检测、脚本内容预扫描、LLM 结果缓存、Provider 自动识别与 Header 注入、fail-closed 安全原则。
 >
 > v0.4.0 新增：非交互式密码修改检测（passwd/chpasswd/newusers/lnewusers 等）、密码修改授权检测（ask_user_question 前置检查）、内置安全 Skill 白名单（xiaoo-guardian 直接放行）、系统信息命令快速放行（whoami/id/hostname 等 12 个命令）、shell 重定向写入检测。
@@ -12,7 +14,7 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 
 - [架构](#架构)
 - [快速开始](#快速开始)
-- [场景定制规则（客户沙箱）](#场景定制规则客户沙箱)
+- [场景与 Agent 定制规则（本场景范围）](#场景与-agent-定制规则本场景范围)
 - [LLM 配置](#llm-配置)
 - [openEuler 部署](#openeuler-部署)
 - [API 参考](#api-参考)
@@ -48,7 +50,7 @@ AgentMoss 是一个**可被任意 AI Agent 调用的独立通用安全分析服�
 │  完全安全 (ls/pwd/echo/whoami/hostname...) → 跳过 L2+L3     │
 │  只读敏感 (cat/grep/head...) → 跳过 L3，保留 L2              │
 │  内置安全 Skill (xiaoo-guardian) → 跳过 L2+L3                │
-│  ★ agent 定制白名单 (按 agent_id 加载，如 opendesk 的       │
+│  ★ agent 定制白名单 (按 agent_id 加载，如 xiaoo 的         │
 │    memory-*/todomgr-* 纯数据操作) → 跳过 L2+L3               │
 │  ★ 安全兜底: 完整命令管道尾部扫描，防止白名单绕过             │
 ├─────────────────────────────────────────────────────────────┤
@@ -184,7 +186,7 @@ agent-moss server --mode socket --config /etc/agent_moss/agent_moss.yaml
 > | `AGENT_MOSS_AUTH_MODE` | `auto`（默认，自动生成/读取 token）/ `off`（关闭鉴权） |
 > | `AGENT_MOSS_AUTH_TOKEN` | 显式指定全局 token |
 > | `AGENT_MOSS_AUTH_TOKEN_FILE` | 从文件读取全局 token |
-> | `AGENT_MOSS_AGENT_TOKENS` | 逐 agent token，如 `opendesk=tok-a,qwenpaw=tok-b`；启用后 `agent_id` 必须与 token 匹配 |
+> | `AGENT_MOSS_AGENT_TOKENS` | 逐 agent token，如 `xiaoo=tok-a,qwenpaw=tok-b`；启用后 `agent_id` 必须与 token 匹配 |
 >
 > 返回 401 时：检查请求头里的 token 与 AgentMoss 实际使用的 token 是否一致
 > （`/api/v1/health` 免鉴权，不能用它验证）。需要恢复旧行为：`AGENT_MOSS_AUTH_MODE=off`。
@@ -285,61 +287,15 @@ const result = await resp.json();
 }
 ```
 
-## 场景定制规则（客户沙箱）
+## 场景与 Agent 定制规则（本场景范围）
 
-**场景规则**是针对特定客户的**部署级**安全约束，如「沙箱用户只能读写这几个目录」「禁止 ssh」。
-出厂内置一个 `bank` 场景（银行沙箱）：
+本 openEuler 场景**只内置 `xiaoo` agent 定制规则**（`agent_moss/agents/xiaoo/rules.json`）。
 
-| 规则 | 级别 | 效果 |
-|---|---|---|
-| 路径白名单 | high | 只允许 `/home/sandbox`、`/opt/sandbox`、`/tmp`；**其余路径（含根目录 `/`）一律拦**，含 `..` 回溯、`~其它用户` 等逃逸写法 |
-| 禁 ssh | critical | 阻断远程访问 / 横向移动类命令 |
+- 不包含 `opendesk` agent 规则；
+- 不包含 `bank` 场景规则，因此 `AGENT_MOSS_SCENARIO=bank` 在本场景不会加载任何内置场景规则；
+- 通用 L1/L2/L3 规则不受影响。
 
-### ⚠️ 启用方式：环境变量（不设就完全不生效）
-
-```bash
-export AGENT_MOSS_SCENARIO=bank          # 多场景逗号分隔：bank,meow
-agent-moss server --port 9090            # 设好后**重启服务**
-```
-
-**注意三点**：
-
-1. **不设这个变量 = 场景规则一条都不跑**（不是「默认宽松」，是「形同虚设」）——
-   白名单外的路径会照常放行。这是**部署级**配置，改完必须**重启进程**。
-2. **HTTP 请求无法指定场景 id**（`/api/v1/analyze` 不接受该字段），
-   服务化部署只能靠这个环境变量。
-3. 控制台会在**未启用时隐藏「场景定制」页** —— 看不到该页 = 没启用。
-
-### 部署后请确认这行启动日志
-
-服务启动时会打印**部署自检**，直接告诉你场景有没有生效：
-
-```
-================ AgentMoss 部署自检 ================
-runtime 配置: /home/<user>/.config/agentmoss/agent_moss_runtime.json
-层级开关: L1_heuristic=on L2_logic_rules=on L3_llm_analysis=on agent_rules_enabled=on scenario_rules_enabled=on
-场景规则已启用: bank（来源：环境变量 AGENT_MOSS_SCENARIO）      ← 这一行
-==================================================
-```
-
-**没设**的话那行会变成醒目告警：
-
-```
-⚠️  场景规则【未启用】—— 环境变量 AGENT_MOSS_SCENARIO 未设置。
-    场景定制规则（如银行沙箱的目录白名单 / 禁 ssh）**不会生效**，白名单外的路径会被放行。
-    启用方式：设 AGENT_MOSS_SCENARIO=<场景id>（如 bank；多场景逗号分隔）后**重启本服务**。
-```
-
-### 静态规则的边界
-
-场景规则是**静态闸门**（看命令文本判断），下面两类挡不住，必须靠执行侧沙箱
-（AgentMoss 生成的 Landlock / namespace 策略）兜底：
-
-- **软链逃逸**：白名单目录里放一个指向 `/etc` 的软链，再 `cat /tmp/link/passwd`
-- **运行时才确定的命令**：`X=$(cat /tmp/cmd.txt); $X`
-
-新增客户场景：在 `agent_moss/scenarios/<id>/rules.json` 加规则，用例放 `tests/cases/scenario/<id>/`，
-详见 [docs/MAINTENANCE_WORKFLOW.md](docs/MAINTENANCE_WORKFLOW.md)。
+如需为客户增加场景规则，在 `agent_moss/scenarios/<id>/rules.json` 添加，并同步更新本场景的投影清单。
 
 ## LLM 配置
 
@@ -612,7 +568,7 @@ AGENT_MOSS_INSTANCE=xiaoo agent-moss status
 
 > **instance 隔离「进程识别 + token 消耗」，不隔离规则配置。** 同机所有实例共享同一份 `~/.config/agentmoss/agent_moss_runtime.json`（除非显式设 `AGENT_MOSS_RUNTIME_CONFIG_PATH` 指向不同文件）。通用 L1/L2/L3 规则全局一致；不同 agent 的定制规则在文件内按 `agent_rules.<agent_id>` 分区天然隔离。任意 console 修改都写入共享文件，其他实例同步生效。
 
-> **token 消耗按实例隔离**：设了 `AGENT_MOSS_INSTANCE=<name>` 时，token 统计文件落在 `<data_root>/<instance>/agent_moss_token_stats.json`（如 `opendesk` → `~/.config/agentmoss/opendesk/...`），各 agent 只读写自己实例的文件；未设则用默认 `~/.config/agentmoss/agent_moss_token_stats.json`。「最近调用」(console `token-stats/recent`) 读同一文件，随之隔离。详见 `docs/ENV_VARS.md`。
+> **token 消耗按实例隔离**：设了 `AGENT_MOSS_INSTANCE=<name>` 时，token 统计文件落在 `<data_root>/<instance>/agent_moss_token_stats.json`（如 `xiaoo` → `~/.config/agentmoss/xiaoo/...`），各 agent 只读写自己实例的文件；未设则用默认 `~/.config/agentmoss/agent_moss_token_stats.json`。「最近调用」(console `token-stats/recent`) 读同一文件，随之隔离。详见 `docs/ENV_VARS.md`。
 
 ### 防火墙（HTTP 模式需要）
 
@@ -673,7 +629,7 @@ sudo firewall-cmd --reload
 | `reason` | string | 否 | 执行理由 |
 | `os_type` | string | 否 | `"linux"` / `"windows"`，留空自动检测 |
 | `cwd` | string | 否 | 当前工作目录 |
-| `agent_id` | string | 否 | 调用方 agent 标识（如 `xiaoo` / `opendesk`）。留空走通用模式。详见 [SECURITY_RULES.md「三方 agent 定制规则」](SECURITY_RULES.md#三方-agent-定制规则agent_mossagentsidrulesjson) |
+| `agent_id` | string | 否 | 调用方 agent 标识（如 `xiaoo`）。留空走通用模式。详见 [SECURITY_RULES.md「三方 agent 定制规则」](SECURITY_RULES.md#三方-agent-定制规则agent_mossagentsidrulesjson) |
 | `instance_id` | string | 否 | agent 安装实例标识，仅用于展示层脱敏 |
 | `metadata` | object | 否 | 扩展元数据（`llm_config`/`llm_log_path`/`stateful_incremental`/`is_error` 等） |
 
@@ -845,7 +801,7 @@ AgentMoss/
 │   ├── adapters/  # 适配器层 (observable)
 │   ├── skills/    # 安全 Skill 规则 (Markdown)
 │   ├── templates/ # Prompt 模板 + policy_mapping
-│   ├── agents/    # 三方 agent 定制化扩展 (xiaoO / opendesk) — rules.json 单一事实源，py+ts 共享
+│   ├── agents/    # 三方 agent 定制化扩展 (xiaoO) — rules.json 单一事实源，py+ts 共享
 │   └── brain/     # 规则自学习/存储
 │
 ├── ts/                       # TypeScript 实现 (npm: @kenhkl/agent-moss) — 功能与 Python 对等

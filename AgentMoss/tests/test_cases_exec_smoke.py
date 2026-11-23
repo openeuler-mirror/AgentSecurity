@@ -32,6 +32,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import pytest
 from pathlib import Path
 
 CASES_EXEC = Path(__file__).resolve().parent / "cases_exec"
@@ -406,8 +408,15 @@ def _gen_with_home(tmp: str, home: str, *extra: str) -> str:
     return proc.stdout + proc.stderr
 
 
+def _bank_rules_available() -> bool:
+    from agent_moss.scenarios import get_scenario_extensions
+    return get_scenario_extensions("bank") is not None
+
+
 def test_scenario_dropped_allow_commands_are_reported():
     """家目录不在场景白名单内时：必须报出剔除条数与「与家目录有关」的成因。"""
+    if not _bank_rules_available():
+        pytest.skip("本场景未下发 bank 场景规则")
     with tempfile.TemporaryDirectory(prefix="am_sd_out_") as t:
         out = _gen_with_home(t, "/home/not-the-sandbox-user",
                              "--scenario", "bank", "--layer", "l1")
@@ -421,6 +430,8 @@ def test_scenario_dropped_allow_commands_are_reported():
 
 def test_scenario_warning_has_no_home_section_when_home_is_whitelisted():
     """家目录就在白名单内时（生产沙箱 /home/sandbox），不该出现「与家目录有关」那段。"""
+    if not _bank_rules_available():
+        pytest.skip("本场景未下发 bank 场景规则")
     with tempfile.TemporaryDirectory(prefix="am_sd_in_") as t:
         out = _gen_with_home(t, "/home/sandbox", "--scenario", "bank", "--layer", "l1")
     assert "与**本机家目录**有关" not in out, (

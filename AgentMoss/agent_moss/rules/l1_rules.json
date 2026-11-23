@@ -1,25 +1,25 @@
 {
   "dangerous_commands": [
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+/(?!\\w)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!\\w)",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到递归强制删除根目录 (rm -rf /)"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\s+/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*[rf][a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到删除关键系统目录"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\\b)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*r[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\\b)",
       "risk_level": "medium",
       "risk_type": "script_execution",
       "reason": "检测到递归删除操作 (rm -r /...)"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*f[a-zA-Z]*\\s+/(?!tmp/|var/tmp/|run/|dev/shm/)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*f[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!tmp/|var/tmp/|run/|dev/shm/)",
       "risk_level": "medium",
       "risk_type": "script_execution",
       "reason": "检测到强制删除文件 (rm -f /...)"
@@ -2110,6 +2110,13 @@
       "scope": "home"
     },
     {
+      "path": ".config/agentmoss/agent_moss_runtime.json",
+      "risk_level": "critical",
+      "desc": "AgentMoss 控制台运行时配置（规则启停/层级开关），写=agent 自行关闭安全检测",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
       "path": ".config/agentmoss",
       "risk_level": "high",
       "desc": "AgentMoss 自身配置目录（runtime 规则/token 用量），agent 可读但不可写（防篡改关闭安全检测）",
@@ -2117,9 +2124,44 @@
       "scope": "home"
     },
     {
+      "path": ".config/agentgate/auth_token",
+      "risk_level": "critical",
+      "desc": "AgentGate 访问 token（拿到即可冒充 agent 调用网关、篡改审计/判定）",
+      "deny_mode": "deny_both",
+      "scope": "home"
+    },
+    {
+      "path": ".config/agentgate/tool_name_map.json",
+      "risk_level": "critical",
+      "desc": "AgentGate 工具名映射文件（写=把危险工具伪装成只读/执行，绕过 L2 规则）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".config/agentgate",
+      "risk_level": "high",
+      "desc": "AgentGate 自身配置目录（token/工具名映射等），agent 可读但不可写（防篡改安全策略）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".local/share/agent_gate",
+      "risk_level": "high",
+      "desc": "AgentGate 数据库与归档目录（判定记录/审计），agent 可读但不可写（防篡改记录与归档）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
       "path": ".agentmoss/brain",
       "risk_level": "high",
       "desc": "AgentMoss Brain 数据（rules.json/skill_meta.json 自学习成果），agent 可读自查但不可写（防投毒）",
+      "deny_mode": "deny_write",
+      "scope": "home"
+    },
+    {
+      "path": ".agentmoss",
+      "risk_level": "high",
+      "desc": "AgentMoss 状态根目录（链状态库/instance 子目录/备份），agent 可读但不可写（防篡改判定链状态）",
       "deny_mode": "deny_write",
       "scope": "home"
     },
@@ -2358,6 +2400,78 @@
       "desc": "AWS 配置目录（Windows）——整目录删除拦截，目录创建/权限设置放行",
       "deny_mode": "deny_write",
       "dir_del_only": true,
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentmoss\\auth_token",
+      "risk_level": "critical",
+      "desc": "AgentMoss 访问 token（Windows），拿到即可冒充调用分析接口/篡改判定",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentmoss\\config.json",
+      "risk_level": "critical",
+      "desc": "AgentMoss 主配置（Windows），写=关闭安全检测",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentmoss\\agent_moss_runtime.json",
+      "risk_level": "critical",
+      "desc": "AgentMoss 控制台运行时配置（Windows），写=agent 自行关闭安全检测",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentmoss",
+      "risk_level": "high",
+      "desc": "AgentMoss 自身配置目录（Windows），agent 可读但不可写（防篡改关闭安全检测）",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentgate\\auth_token",
+      "risk_level": "critical",
+      "desc": "AgentGate 访问 token（Windows），拿到即可冒充 agent 调用网关、篡改审计",
+      "deny_mode": "deny_both",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentgate\\tool_name_map.json",
+      "risk_level": "critical",
+      "desc": "AgentGate 工具名映射文件（Windows），写=把危险工具伪装成只读，绕过 L2 规则",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".config\\agentgate",
+      "risk_level": "high",
+      "desc": "AgentGate 自身配置目录（Windows），agent 可读但不可写（防篡改安全策略）",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".local\\share\\agent_gate",
+      "risk_level": "high",
+      "desc": "AgentGate 数据库与归档目录（Windows），agent 可读但不可写（防篡改判定记录）",
+      "deny_mode": "deny_write",
+      "scope": "home",
+      "os": "windows"
+    },
+    {
+      "path": ".agentmoss",
+      "risk_level": "high",
+      "desc": "AgentMoss 状态根目录（Windows），agent 可读但不可写（防篡改判定链状态）",
+      "deny_mode": "deny_write",
       "scope": "home",
       "os": "windows"
     },

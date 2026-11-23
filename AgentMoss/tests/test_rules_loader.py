@@ -72,7 +72,12 @@ def test_l1_counts_stable():
     # 98 = 94 + 4（2026-10 威胁模型补齐：内置检测逻辑不可读 ——
     # rules/ skills/ agents/ scenarios/ 四个目录 deny_read，
     # 补的是"agent 读走规则即可反向构造绕过"的洞，对应设计说明书 14.4.1）。
-    assert len(l1["sensitive_path_access"]) == 98
+    # 113 = 98 + 15（2026-11 AgentMoss/AgentGate 安全配置防篡改：
+    # Linux 6 条 —— agentgate 目录/token/映射、agent_gate 数据目录、
+    #   agent_moss_runtime.json 精确条目、.agentmoss 根目录兜底；
+    # Windows 9 条 —— agentmoss 目录/token/config.json/runtime、
+    #   agentgate 目录/token/映射、agent_gate 数据目录、.agentmoss 兜底）
+    assert len(l1["sensitive_path_access"]) == 113
     # 注：以下为历史累计说明（84 的构成）——
     # +3: HarmonyOS 敏感路径（/data/app、/data/service/el1/public/param、/data/log）；+6: macOS；+20: Windows（SAM/SECURITY/SYSTEM/RegBack/LSA/NTDS/repair/GroupPolicy + 注册表 HKLM\SAM|SECURITY|SYSTEM + .ssh\id_rsa|id_ed25519|authorized_keys + .aws\credentials + .ssh/.aws 目录级 + ProgramData），原 windows.py 硬编码迁入并补 deny_mode
 

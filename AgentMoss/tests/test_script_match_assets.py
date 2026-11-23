@@ -13,6 +13,7 @@
 这个测试把漂移变成红灯：改了引擎规则却忘了重跑提取器 → 这里直接失败。
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -41,9 +42,12 @@ def test_rules_txt_matches_engine(tmp_path):
     dst = tmp_path / "script_match"
     shutil.copytree(src, dst)
 
+    # 场景仓里测试目录会被复制到临时目录，提取器的 parents[3] 找不到场景根，
+    # 会回退到 ~/gitcode/AgentMoss（基线）——必须显式指向当前仓根。
+    env = dict(os.environ, AGENT_MOSS_ROOT=str(Path(__file__).resolve().parents[1]))
     proc = subprocess.run(
         [sys.executable, str(dst / "extract_rules.py")],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True, text=True, timeout=300, env=env,
     )
     assert proc.returncode == 0, f"提取器失败：{proc.stderr[-800:]}"
 

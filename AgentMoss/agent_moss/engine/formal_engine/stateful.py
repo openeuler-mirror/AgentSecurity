@@ -72,6 +72,86 @@ def _retain_nodes() -> int:
     except ValueError:
         n = max(1, _MAX_NODES // 2)
     return max(1, min(n, _MAX_NODES - 1))
+
+
+def cleanup_chain_archives(
+    archive_dir: Path,
+    max_bytes: int | None = None,
+    max_age_days: int | None = None,
+) -> tuple[int, int, int]:
+    """清理链归档目录：先按年龄、再按总大小删最老的 ``chain-nodes-*.jsonl.gz``。
+
+    默认按总大小 512MB 滚动删除（``AGENT_MOSS_CHAIN_ARCHIVE_MAX_MB``），
+    按时间默认关闭（``AGENT_MOSS_CHAIN_ARCHIVE_MAX_AGE_DAYS=0``）。
+    与 TS ``cleanupChainArchives`` 对称。返回 ``(删除数, 剩余文件数, 剩余字节)``。
+    """
+    if max_bytes is None or max_age_days is None:
+        try:
+            mb = max(0, int(os.getenv("AGENT_MOSS_CHAIN_ARCHIVE_MAX_MB", "512")))
+        except ValueError:
+            mb = 512
+        try:
+            days = max(0, int(os.getenv("AGENT_MOSS_CHAIN_ARCHIVE_MAX_AGE_DAYS", "0")))
+        except ValueError:
+            days = 0
+        if max_bytes is None:
+            max_bytes = mb * 1024 * 1024
+        if max_age_days is None:
+            max_age_days = days
+    try:
+        files = sorted(
+            (p for p in archive_dir.iterdir()
+             if p.name.startswith("chain-nodes-") and p.name.endswith(".jsonl.gz")),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return 0, 0, 0
+    removed = 0
+    if max_age_days > 0:
+        cutoff = time.time() - max_age_days * 86400
+        kept = []
+        for p in files:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+                else:
+                    kept.append(p)
+            except OSError:
+                kept.append(p)
+        files = kept
+    total = 0
+    for p in files:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    if max_bytes > 0:
+        # 至少保留最新 1 个归档（单个文件本身超限时不删，2026-11 修 N1）
+        for idx, p in enumerate(files):
+            if total <= max_bytes:
+                break
+            if idx == len(files) - 1:
+                break
+            try:
+                size = p.stat().st_size
+                p.unlink()
+                total -= size
+                removed += 1
+            except OSError:
+                continue
+    remain_files = remain_bytes = 0
+    try:
+        for p in archive_dir.iterdir():
+            if p.name.startswith("chain-nodes-") and p.name.endswith(".jsonl.gz"):
+                remain_files += 1
+                try:
+                    remain_bytes += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed, remain_files, remain_bytes
 #: 容量分级预警阈值（达到即打一条 warning，每档只打一次）
 _CAPACITY_WARN_RATIOS = (0.7, 0.85, 0.95)
 
@@ -546,6 +626,16 @@ class StatefulChainTracker:
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(gzip.compress(payload.encode("utf-8")))
+        # 归档成功后再滚动清理旧归档（只写不删会无限膨胀）；清理失败不影响轮转。
+        try:
+            removed, remain_files, remain_bytes = cleanup_chain_archives(archive_dir)
+            if removed:
+                logger.info(
+                    "chain-archive 清理: 删除 %d 个旧归档（剩余 %d 个 / %d 字节）",
+                    removed, remain_files, remain_bytes,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chain-archive 清理失败（继续）: %s", exc)
         return path
 
     def rotate(self, archive_dir: Path | None = None, retain: int | None = None) -> tuple[int, str]:

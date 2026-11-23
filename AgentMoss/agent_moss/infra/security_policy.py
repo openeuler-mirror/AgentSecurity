@@ -472,7 +472,9 @@ def review_roots() -> list[Path]:
     默认放行 AgentGate 的标准位置 —— 标准部署不用改任何配置。
     """
     roots: list[Path] = [Path("~/.local/share/agent_gate").expanduser()]
-    for env in ("AGENT_GATE_DB", "AGENT_GATE_JSON_PATH"):
+    # AGENT_GATE_DATA_DIR：JSON 模式的数据目录（OpenDesk/鸿蒙真实用法）。
+    # 缺了它，归档后「刷新 AgentMoss 派生状态」必然 403（2026-11 修）。
+    for env in ("AGENT_GATE_DB", "AGENT_GATE_JSON_PATH", "AGENT_GATE_DATA_DIR"):
         val = _env(env)
         if val:
             p = Path(val).expanduser()

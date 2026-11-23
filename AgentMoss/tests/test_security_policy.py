@@ -196,6 +196,18 @@ def test_review_roots_default_cover_agent_gate():
     assert any("agent_gate" in r for r in roots)
 
 
+def test_review_roots_include_agent_gate_data_dir(tmp_path, monkeypatch):
+    """JSON 模式真实用法（OpenDesk/鸿蒙）：AGENT_GATE_DATA_DIR 必须在白名单内。
+
+    缺了它，归档后「刷新 AgentMoss 派生状态」必然 403（2026-11 修）。
+    """
+    data_dir = tmp_path / "json-data"
+    data_dir.mkdir()
+    monkeypatch.setenv("AGENT_GATE_DATA_DIR", str(data_dir))
+    roots = [str(p) for p in sp.review_roots()]
+    assert str(data_dir) in roots
+
+
 def test_review_rejects_outside_path():
     client = TestClient(create_app())
     r = client.post("/api/v1/review", json={"agent_id": "x", "db_path": "/etc/passwd"})
