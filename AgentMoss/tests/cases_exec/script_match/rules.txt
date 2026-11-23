@@ -1,7 +1,7 @@
-(?i)\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/(?!\w)
-(?i)\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\s;|&\"']|$))
-(?i)\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\b)
-(?i)\brm\s+-[a-zA-Z]*f[a-zA-Z]*\s+/(?!tmp/|var/tmp/|run/|dev/shm/)
+(?i)\brm[ \t]+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*(?:[ \t]+(?:-[a-zA-Z]+|--[\w=-]*))*[ \t]+[\"']?/(?!\w)
+(?i)\brm[ \t]+-[a-zA-Z]*[rf][a-zA-Z]*(?:[ \t]+(?:-[a-zA-Z]+|--[\w=-]*))*[ \t]+[\"']?/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\s;|&\"']|$))
+(?i)\brm[ \t]+-[a-zA-Z]*r[a-zA-Z]*(?:[ \t]+(?:-[a-zA-Z]+|--[\w=-]*))*[ \t]+[\"']?/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\b)
+(?i)\brm[ \t]+-[a-zA-Z]*f[a-zA-Z]*(?:[ \t]+(?:-[a-zA-Z]+|--[\w=-]*))*[ \t]+[\"']?/(?!tmp/|var/tmp/|run/|dev/shm/)
 (?i)\bln\s+(-[a-zA-Z]+\s+)*(?:--\s+)?-s[a-zA-Z]*\s+(?:--\s+)?(/(?![a-zA-Z0-9._~])|~/\.\.(?:\s|$|\"|'|;|&|\)|\]|/)|~/(?![.a-zA-Z0-9_~-])|~/$|~(?:\s|$|\"|'|;|&|\)|\])|\$HOME/\.\.(?:\s|$|\"|'|;|&|\)|\]|/)|\$HOME/(?![.a-zA-Z0-9_~-])|\$HOME/$|\$HOME(?:\s|$|\"|'|;|&|\)|\]))
 (?i)chmod\s+(?:(?:-[a-zA-Z]*|--)\s+)*[0-7]{0,3}7\b
 (?i)chmod\s+(?:(?:-[a-zA-Z]*|--)\s+)*[2-7][0-7]{3}\b

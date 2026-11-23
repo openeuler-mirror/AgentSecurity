@@ -1,25 +1,25 @@
 {
   "dangerous_commands": [
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+/(?!\\w)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!\\w)",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到递归强制删除根目录 (rm -rf /)"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\s+/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*[rf][a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?:etc|var(?!/tmp)|usr|boot|root|opt|srv|sys|proc|home(?:/|/[A-Za-z0-9_.-]+/?)?(?=[\\s;|&\\\"']|$))",
       "risk_level": "critical",
       "risk_type": "script_execution",
       "reason": "检测到删除关键系统目录"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*\\s+/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\\b)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*r[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!tmp|var/tmp|run|dev/shm|mnt|media)(?:/|\\b)",
       "risk_level": "medium",
       "risk_type": "script_execution",
       "reason": "检测到递归删除操作 (rm -r /...)"
     },
     {
-      "pattern": "\\brm\\s+-[a-zA-Z]*f[a-zA-Z]*\\s+/(?!tmp/|var/tmp/|run/|dev/shm/)",
+      "pattern": "\\brm[ \\t]+-[a-zA-Z]*f[a-zA-Z]*(?:[ \\t]+(?:-[a-zA-Z]+|--[\\w=-]*))*[ \\t]+[\\\"']?/(?!tmp/|var/tmp/|run/|dev/shm/)",
       "risk_level": "medium",
       "risk_type": "script_execution",
       "reason": "检测到强制删除文件 (rm -f /...)"
