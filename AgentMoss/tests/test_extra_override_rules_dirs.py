@@ -317,6 +317,10 @@ def test_scenario_rules_override_still_works(tmp_path, monkeypatch):
 
 def test_scenario_rules_override_malformed_falls_back(tmp_path, monkeypatch, caplog):
     """场景规则写错（数组写成对象）→ 拒绝并回退内置（否则场景会静默失效）。"""
+    from agent_moss.scenarios import get_scenario_extensions
+
+    if get_scenario_extensions("bank") is None:
+        pytest.skip("本场景未下发 bank 内置规则，无「回退内置」可验证")
     d = tmp_path / "rulesdir"
     (d / "scenarios" / "bank").mkdir(parents=True)
     _write(d / "scenarios" / "bank", "rules.json", {

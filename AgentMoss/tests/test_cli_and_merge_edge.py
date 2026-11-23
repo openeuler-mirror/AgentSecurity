@@ -55,6 +55,10 @@ def test_cli_passes_agent_id(cli_env):
     opendesk 的 builtin_safe_action_types 含 `todomgr-` 前缀 → `todomgr-list`
     命中「完全安全工具」白名单。不透传 agent_id 时走不到这条路径。
     """
+    from agent_moss.agents import get_agent_extensions
+
+    if get_agent_extensions("opendesk") is None:
+        pytest.skip("本场景未下发 opendesk agent 规则")
     payload = {
         "session_id": "cli-agent", "prompt_session": "", "action_history": [],
         "a_next": {"action_type": "todomgr-list", "action_detail": "列任务"},

@@ -2779,6 +2779,8 @@ class TestCoordinator:
         from agent_moss.agents import get_agent_extensions
         # 加载 xiaoO 专属规则（含 xiaoo-guardian builtin_safe_skills 白名单）
         xiaoo_ext = get_agent_extensions("xiaoo")
+        if xiaoo_ext is None:
+            pytest.skip("本场景未下发 xiaoo agent 规则（boostkit 只保留 bank）")
         self.bot = AgentMossBot(profile=linux_profile, agent_ext=xiaoo_ext)
         self.config = default_config
         self.profile = linux_profile
