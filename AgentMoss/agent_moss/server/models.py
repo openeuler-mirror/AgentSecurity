@@ -135,7 +135,7 @@ class ReviewRequest(BaseModel):
     """
     agent_id: str = Field(default="", description="目标 agent 标识（决定状态库分桶）")
     db_path: str = Field(default="", description="AgentGate 本地存储路径（SQLite 文件 或 tool_calls JSON 目录）；为空则用 sessions")
-    sessions: list[dict] = Field(default_factory=list, description="多 session 历史动作（替代/兜底 db_path）")
+    sessions: list[dict] = Field(default_factory=list, description="多会话历史动作。指定路径缺失或读空时可用作备用历史；路径缺失且无有效备用动作则返回 404")
     a_next: Optional[ActionItem] = Field(default=None, description="可选：连同当前动作一起判定（seed 之后 advance）")
     is_error: bool = Field(default=False, description="当前动作执行是否失败（用于生命周期 never_activated）")
     output_pending: bool = Field(default=False, description="返回前序链清单 pending_prefixes")

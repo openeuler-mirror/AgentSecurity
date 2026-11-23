@@ -14,9 +14,10 @@
    注意：仅对 python -c 等真正的内联脚本代码做此检测。
 6. 否则（无目录遍历读写组合） → Allow
 
-凭据文件不进此判定（coordinator 层 is_credential 直接 Deny）。
+L1 暂缓禁读规则时，confirms_inline_read 可提前确认同一路径的简单读取。
 """
 
+import ast
 import logging
 import re
 import shlex
@@ -174,6 +175,61 @@ def _build_redirect_to_sensitive_re(profile):
         r">{1,2}\s*(" + "|".join(re.escape(p) for p in paths) + r")",
         re.IGNORECASE,
     )
+
+
+def _literal_shell_word(raw: str, value: str) -> bool:
+    """POSIX shell 中，单个参数会原样传入，无展开或额外命令。"""
+    return (raw == shlex.quote(value)
+            or (raw == f"'{value}'" and "'" not in value)
+            or (raw == f'"{value}"' and not re.search(r'["\\$`]', value)))
+
+
+def confirms_inline_read(command: str, path: str) -> bool:
+    """只复核已有禁读命中，要求简单 Python 语句实际打开相同的字面路径。"""
+    if len(command) > 8192 or not path or path.startswith("~"):
+        return False
+    if "/" in path and not path.startswith("/"):
+        return False
+    wrapper = re.fullmatch(r"python3?[ \t]+-c[ \t]+(.+)", command.strip(" \t\n"), re.DOTALL)
+    if not wrapper:
+        return False
+    try:
+        args = shlex.split(wrapper[1])
+        if len(args) != 1 or not _literal_shell_word(wrapper[1], args[0]):
+            return False
+        body = ast.parse(args[0]).body
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+    binding = None
+    match body:
+        case [ast.Import(names=[ast.alias(name="os", asname=None)]), ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=ast.Name(id="os"), attr="system"),
+            args=[ast.Constant(value=str() as child)], keywords=[],
+        ))]:
+            cat = re.fullmatch(r"cat[ \t]+(.+)", child.strip(" \t\n"), re.DOTALL)
+            return bool(cat and not path.startswith("-") and _literal_shell_word(cat[1], path))
+        case [ast.Assign(targets=[ast.Name(id=name)], value=ast.Constant(value=value)), ast.Expr(value=expr)]:
+            if value != path or name in ("open", "print", "__debug__"):
+                return False
+            binding = name
+        case [ast.Expr(value=expr)]:
+            pass
+        case _:
+            return False
+
+    match expr:
+        case ast.Call(func=ast.Name(id="print"), args=[argument], keywords=[]):
+            expr = argument
+    match expr:
+        case ast.Call(func=ast.Attribute(value=receiver, attr="read"), args=[], keywords=[]):
+            expr = receiver
+    match expr:
+        case ast.Call(func=ast.Name(id="open"), keywords=[],
+                      args=[target] | [target, ast.Constant(value="r" | "rt" | "rb")]):
+            return ((isinstance(target, ast.Constant) and target.value == path)
+                    or (isinstance(target, ast.Name) and target.id == binding))
+    return False
 
 
 def _extract_inline_code(command: str) -> str:

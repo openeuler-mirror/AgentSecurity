@@ -633,10 +633,18 @@ def chain_detail_mode() -> str:
     return (_env("AGENT_MOSS_CHAIN_DETAIL", "redacted") or "redacted").lower()
 
 
+def _chain_node_visible(instance_id, session_id, current_instance_id, current_session_id, session_alias) -> bool:
+    if instance_id:
+        return bool(current_instance_id and str(instance_id) == str(current_instance_id))
+    return bool(session_id and str(session_id) in (current_session_id, session_alias))
+
+
 def redact_graph(
     graph,
     current_instance_id: str = "",
     current_session_id: str = "",
+    *,
+    session_alias: str = "",
 ) -> dict | None:
     """结构化攻击链图的脱敏：同实例不隐藏，跨实例/跨会话隐藏命令原文。
 
@@ -651,20 +659,23 @@ def redact_graph(
     if chain_detail_mode() == "full":
         return graph
     nodes = []
-    for n in graph.get("nodes", []) or []:
+    hidden = set()
+    for index, n in enumerate(graph.get("nodes", []) or []):
         m = dict(n)
-        inst = str(m.get("instance_id", "") or "")
-        sid = str(m.get("session_id", "") or "")
-        same_instance = bool(inst and current_instance_id and inst == str(current_instance_id))
-        same_session_fallback = bool(
-            not inst and current_session_id and sid == str(current_session_id)
-        )
-        if not (same_instance or same_session_fallback):
+        if not _chain_node_visible(m.get("instance_id"), m.get("session_id"),
+                                   current_instance_id, current_session_id, session_alias):
+            hidden.add(index)
             m["session_id"] = "<other-session>"
             m["action_detail"] = "<已隐藏>"
             m["resources"] = []
         nodes.append(m)
-    out: dict = {"nodes": nodes, "edges": graph.get("edges", []) or []}
+    # 数据边的 label 是共享资源路径。关联隐藏节点时只保留边的结构。
+    edges = []
+    for edge in graph.get("edges", []) or []:
+        if "label" in edge and (edge.get("from") in hidden or edge.get("to") in hidden):
+            edge = {**edge, "label": ""}
+        edges.append(edge)
+    out: dict = {"nodes": nodes, "edges": edges}
     # 性质元信息/表达式只含性质名与节点索引，不含命令原文，脱敏时必须保留
     # （否则前端无法展示"违反了哪条性质"与表达式对应关系）。
     for key in ("property_id", "property_short", "property_name", "property_expression"):
@@ -677,6 +688,9 @@ def redact_chain(
     chain,
     current_instance_id: str = "",
     current_session_id: str = "",
+    *,
+    graph: dict | None = None,
+    session_alias: str = "",
 ) -> list:
     """跨会话节点只保留结构，去掉命令原文与会话标识。
 
@@ -689,16 +703,22 @@ def redact_chain(
     if chain_detail_mode() == "full":
         return list(chain)
     out = []
-    for step in chain:
+    nodes = (graph or {}).get("nodes") or []
+    for index, step in enumerate(chain):
         if isinstance(step, (list, tuple)) and len(step) >= 3:
-            sid, seq, detail = step[0], step[1], step[2]
+            sid, seq = step[:2]
             ts = step[3] if len(step) > 3 else ""
-            inst = str(step[5]) if len(step) > 5 else ""
-            same_instance = bool(inst and current_instance_id and inst == str(current_instance_id))
-            same_session_fallback = bool(
-                not inst and current_session_id and str(sid) == str(current_session_id)
-            )
-            if same_instance or same_session_fallback:
+            inst = step[5] if len(step) > 5 else ""
+            # 静态反例多为三元组，仅配套图的同一节点携带实例身份。
+            if not inst and index < len(nodes):
+                node = nodes[index]
+                detail = node.get("action_detail", "")
+                if ((sid, seq) != (node.get("session_id"), node.get("seq"))
+                        or step[2] not in (detail, detail[:60])):
+                    out.append(["<other-session>", seq, "<已隐藏>", ts])
+                    continue
+                inst = node.get("instance_id")
+            if _chain_node_visible(inst, sid, current_instance_id, current_session_id, session_alias):
                 out.append(list(step))
             else:
                 out.append(["<other-session>", seq, "<已隐藏>", ts])

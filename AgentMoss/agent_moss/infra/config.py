@@ -554,6 +554,16 @@ def get_llm_action_detail_max_chars() -> int:
     return _get_int_setting("AGENT_MOSS_LLM_ACTION_DETAIL_MAX_CHARS", 500)
 
 
+def get_llm_prompt_history_max_turns() -> int:
+    """L3 prompt 最多注入最近多少轮历史用户意图（0 = 不限，默认 20）。
+
+    与 ``get_llm_history_max_items`` 同理：调用方可能提交整段会话的
+    ``prompt_history``，只保留最近 N 轮可避免 prompt 随会话长度无限膨胀。
+    超出窗口的早期意图不再进入 L3；需要更长记忆时提高本配置。
+    """
+    return max(0, _get_int_setting("AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS", 20))
+
+
 def get_llm_max_prompt_tokens() -> int:
     """L3 输入 prompt 的 token 总预算（0 = 不限，默认 0）。
 

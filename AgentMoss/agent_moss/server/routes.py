@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from ..__version__ import __version__
 from ..engine.skill_engine import default_skills_dir
+from ..engine.types import RISK_PRIORITY
 from ..infra import security_policy as sp
 from ..infra.script_diagnostics import ScriptDiagnostics
 from .models import (
@@ -41,6 +42,87 @@ def _internal_error(exc: Exception) -> HTTPException:
 
 
 # ==================== Stateful incremental (L2.2 有状态) ====================
+
+def _merge_stateful_denial(result: dict, finding: dict) -> tuple[dict, bool]:
+    """归并已确认的增量风险，同时返回该风险是否成为主因。"""
+    level = finding.get("risk_level", "high")
+    outcome = result.get("l3_outcome")
+    stateful_wins = (
+        result["decision"] != "Deny"
+        or result.get("source") in ("llm_failure_fallback", "llm_circuit_open", "llm_failure_with_violation")
+        or RISK_PRIORITY.get(level, 0) > RISK_PRIORITY.get(result.get("risk_level"), -1)
+    )
+    merged = dict(result)
+    if stateful_wins:
+        reason = finding.get("reason") or "有状态增量链判定：组合攻击链命中"
+        merged.update(
+            decision="Deny",
+            reason=reason,
+            risk_level=level,
+            risk_type="formal_verification",
+            source="formal_engine",
+            confidence=90,
+            policy="",
+            violated_policy=f"[formal_verification] {reason}",
+        )
+    layers = result.get("violated_layers", [])
+    merged["violated_layers"] = list(dict.fromkeys([*layers, "L2.2-stateful"]))
+    if outcome in ("fail_open", "fail_closed"):
+        merged["l3_outcome"] = "failed_but_blocked"
+    logger.info(
+        "stateful 增量拦截: property=%s risk=%s final_risk=%s",
+        finding.get("property_id", "?"), level, merged.get("risk_level"),
+    )
+    return merged, stateful_wins
+
+
+def _public_formal_result(result: dict, finding: dict | None, instance_id: str, session_id: str,
+                          session_history: list[dict]) -> dict:
+    """主因与反例可来自不同规则。先选定它们，再为响应和审计生成可见证据。"""
+    graph = result.get("violation_graph")
+    chain = result.get("violation_chain")
+    property_id = (graph or {}).get("property_id")
+    static_evidence = bool(chain or graph)
+    if not finding and not static_evidence:
+        return result
+    if finding:
+        result, stateful_wins = _merge_stateful_denial(result, finding)
+        if stateful_wins:
+            property_id = finding.get("property_id")
+        incremental_graph = finding.get("graph") or {}
+        # 同级命中可用增量反例补全缺失的图；链和图必须共同选取并按同一来源脱敏。
+        fills_missing_graph = (
+            not graph and finding.get("risk_level", "high") == result.get("risk_level")
+            and finding.get("path") and incremental_graph.get("nodes")
+        )
+        if stateful_wins or not static_evidence or fills_missing_graph:
+            chain, graph = finding.get("path"), incremental_graph
+            static_evidence = False
+
+    # 静态引擎用 current 指代本次会话；持久化节点总是使用真实会话 ID。
+    # 历史会话同名时无法区分，继续按真实会话/实例判定。
+    alias = ""
+    if static_evidence:
+        if not any(s.get("session_id") == "current" for s in session_history):
+            alias = "current"
+        elif session_id == "current":
+            session_id = ""
+    public_graph = sp.redact_graph(graph, instance_id, session_id, session_alias=alias)
+    result = dict(result)
+    result["violation_chain"] = sp.redact_chain(chain, instance_id, session_id, graph=graph, session_alias=alias)
+    result["violation_graph"] = public_graph
+    if property_id == "sensitive-data-flow" and sp.chain_detail_mode() != "full":
+        # 旧快照的 reason 可能引用反例以外的来源，仅使用本次可见的节点。
+        nodes = (public_graph or {}).get("nodes", [])
+        reason = "敏感数据传播外传：检测到经共享载体外发"
+        if len(nodes) >= 2:
+            src, dst = nodes[0], nodes[-1]
+            reason = (f"敏感数据传播外传：{src['session_id']}#{src['seq']} → "
+                      f"{dst['session_id']}#{dst['seq']} 经共享载体外发")
+        result["reason"] = reason
+        result["violated_policy"] = f"[formal_verification] {reason}"
+    return result
+
 
 def _chain_state_for_agent(agent_id: str):
     """拿到链状态仓储。
@@ -540,8 +622,6 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
 
         # 请求 ID：一次 analyze 的所有追踪事件共享，便于 grep 串起全过程
         _req_id = uuid.uuid4().hex[:12]
-        # 排队时长（由 executor 线程回填，供慢请求日志做「排队 + 计算」分解）
-        _queue_info = {"queued_ms": 0.0}
         try:
             from ..infra.trace_log import set_request_id
 
@@ -617,13 +697,11 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
             ``run_in_executor`` 的线程**不继承** contextvars，不恢复的话
             引擎层的 L1/L2/L3 trace 事件都没有 req_id，串不起一次请求。
 
-            同时记录**排队时长**（2026-11）：从请求进入路由到真正开始执行
-            在 executor 里等了多久。客户 TPS < 1 时，这个数字能直接区分
-            "算得慢" 还是 "排不上队"。
+            主分析和增量任务依次执行，各自从提交到工作线程开工的等待计入同一请求。
             """
+            nonlocal queued_ms
             _t_start_exec = time.monotonic()
-            self_queued_ms = (_t_start_exec - start) * 1000
-            _queue_info["queued_ms"] = self_queued_ms
+            queued_ms = (_t_start_exec - analysis_submitted) * 1000
             try:
                 from ..infra.trace_log import set_request_id
 
@@ -633,14 +711,14 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
             try:
                 from ..infra import metrics as _m
 
-                _m.ANALYZE_QUEUE_WAIT.observe(max(0.0, self_queued_ms / 1000.0))
+                _m.ANALYZE_QUEUE_WAIT.observe(max(0.0, queued_ms / 1000.0))
             except Exception:  # noqa: BLE001
                 pass
             # 排队超过 1 秒就单独记一条：说明线程池/事件循环是瓶颈，不是计算
-            if self_queued_ms >= 1000:
+            if queued_ms >= 1000:
                 logger.warning(
                     "分析请求排队 %.0fms（线程池可能已满，检查 AGENT_MOSS_EXECUTOR_WORKERS）",
-                    self_queued_ms,
+                    queued_ms,
                 )
             try:
                 return run_analysis(**_kwargs)
@@ -655,6 +733,8 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 except Exception:  # noqa: BLE001
                     pass
 
+        queued_ms = 0.0
+        analysis_submitted = time.monotonic()
         result = await loop.run_in_executor(
             None,
             lambda: _run_analysis_with_req_id(
@@ -678,6 +758,69 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 script_diagnostics=diagnostics,
             ),
         )
+        # ========== L2.2 stateful incremental（有状态实时判定，可选启用） ==========
+        # 调用方在 metadata.stateful_incremental=true 时启用：把当前动作推入该 agent
+        # 的持久化时间线，若当前动作补全某组合链（跨 session/长时距前序已就位）→ Deny。
+        # 不启用则行为与现状一致（零回归）。有状态违例参与最终风险比较。
+        metadata = req.metadata or {}
+        finding = None
+        if str(metadata.get("stateful_incremental", "") or "").lower() in ("1", "true", "yes", "on"):
+            try:
+                # ⚠️ 必须在 executor 里跑（2026-11 修）：apply_incremental 是
+                # 「SQLite 全量读 → json.loads → 重建所有节点 → 追加 → 全量
+                # json.dumps → 全量写回」，O(节点数)。跑在事件循环上时，时间线
+                # 一长就每次占住几十到几百毫秒，console / 其它 analyze 全排不上。
+                # 放线程池后事件循环不受影响（线程内串行由 ChainStateStore 的
+                # RLock + 单连接保证）。
+                _inc_state = _chain_state_for_agent(agent_id)
+
+                def _apply_incremental():
+                    nonlocal queued_ms
+                    queued_ms += (time.monotonic() - incremental_submitted) * 1000
+                    return _inc_state.apply_incremental(
+                        a_next,
+                        session_id=session_id,
+                        is_error=bool(metadata.get("is_error", False)),
+                        # 来源：真实 agent（不是桶 key），仅用于链路径取证/展示
+                        source_agent=agent_id,
+                        instance_id=instance_id,
+                    )
+
+                incremental_submitted = time.monotonic()
+                inc = await loop.run_in_executor(None, _apply_incremental)
+                # 能力状态两档（2026-11，用户要求「先预警、后降级」）：
+                #   >=90%  → 预警：还能完整判定，但很快会触顶，请尽快处理
+                #   >=100% → 降级：本次动作确实没参与 L2.2，如实告知
+                _pct = inc.get("usage_pct") or 0
+                if inc.get("at_capacity"):
+                    _degraded.append(
+                        f"【已降级】链状态时间线已满（{inc.get('node_count')}/"
+                        f"{inc.get('capacity')} 节点）：**本次动作未参与 L2.2 组合链检测**"
+                        "（L1/L2.1/L3 不受影响，仍在正常工作）。"
+                        "影响：跨会话组合攻击（如先下载后执行、先读凭据后外传）可能漏判。"
+                        "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
+                        "→ agent-moss state reset --yes → systemctl start agent_moss；"
+                        "或调大 AGENT_MOSS_CHAIN_MAX_NODES 并重启。"
+                        "详见 docs/deploy/UPGRADE_GUIDE.md"
+                    )
+                elif _pct >= 90:
+                    _degraded.append(
+                        f"【预警】链状态时间线已用 {_pct}%（{inc.get('node_count')}/"
+                        f"{inc.get('capacity')} 节点）：**本次判定完整**，但即将触顶。"
+                        f"触顶后 L2.2 组合链检测（跨会话组合攻击）将失效，"
+                        "L1/L2.1/L3 不受影响。"
+                        "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
+                        "→ 停服 → agent-moss state reset --yes → 起服；"
+                        "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
+                        "详见 docs/deploy/PERFORMANCE_TUNING.md 第 5 节"
+                    )
+                if inc["should_block"]:
+                    candidates = ([inc["matched"]] if inc["matched"] else []) + inc["exfil"]
+                    finding = max(candidates, key=lambda v: RISK_PRIORITY.get(v.get("risk_level", "high"), 0))
+            except Exception as e:
+                logger.warning("stateful incremental 异常（不阻断响应）: %s", e)
+
+        result = _public_formal_result(result, finding, instance_id, session_id, session_history)
         duration_ms = (time.monotonic() - start) * 1000
 
         # ========== L3 结局 → 能力说明（2026-11）==========
@@ -703,8 +846,10 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 "拦截原因是「分析不可用」而非「确认有风险」。修复模型服务后重试可能放行。"
             )
         elif _l3_outcome == "circuit_open":
+            # 前序层或有状态规则确认风险时，reason 描述该风险，不是熔断原因。
+            circuit_detail = f"（{_l3_fail_msg}）" if result.get("source") == "llm_circuit_open" else ""
             _degraded.append(
-                f"【已降级】LLM 熔断器打开，本次**未发起 L3 请求**（{_l3_fail_msg}）："
+                f"【已降级】LLM 熔断器打开，本次**未发起 L3 请求**{circuit_detail}："
                 "L1/L2 正常，语义层缺失。检查模型服务与网络，冷却后自动试探恢复。"
             )
         # 注意：``skipped``（L3 未启用）**不**写 degraded —— 那是部署方的既有
@@ -744,9 +889,9 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 l3_outcome=str(result.get("l3_outcome", "") or ""),
             )
             _m.ANALYZE_DURATION.observe(max(0.0, duration_ms / 1000.0), decision=_decision)
-            for _layer in result.get("violated_layers", []) or []:
-                # "L2.2-stateful" -> "L2.2"；便于按层聚合
-                _m.LAYER_HIT_TOTAL.inc(layer=str(_layer).split("-")[0])
+            # 静态与增量 L2.2 都命中时，同一次请求只计入该层一次。
+            for _layer in {str(layer).split("-")[0] for layer in result.get("violated_layers", [])}:
+                _m.LAYER_HIT_TOTAL.inc(layer=_layer)
         except Exception:  # noqa: BLE001
             pass
 
@@ -759,8 +904,7 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
         if _slow_ms > 0 and duration_ms >= _slow_ms:
             # 分解：排队（等线程）+ 计算（引擎）。客户 TPS 低时这两个数字决定
             # 是加线程池还是优化算法。
-            _queued_ms = _queue_info["queued_ms"]
-            _work_ms = max(0.0, duration_ms - _queued_ms)
+            _work_ms = max(0.0, duration_ms - queued_ms)
             _qdepth = None
             try:
                 from .app import _executor_queue_depth
@@ -772,7 +916,7 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 "慢请求: 总 %.0fms = 排队 %.0fms + 计算 %.0fms（阈值 %.0fms）"
                 " action_type=%s agent=%s decision=%s 线程池队列=%s",
                 duration_ms,
-                _queued_ms,
+                queued_ms,
                 _work_ms,
                 _slow_ms,
                 a_next.get("action_type", ""),
@@ -811,86 +955,6 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
         except Exception:
             pass
 
-        # ========== L2.2 stateful incremental（有状态实时判定，可选启用） ==========
-        # 调用方在 metadata.stateful_incremental=true 时启用：把当前动作推入该 agent
-        # 的持久化时间线，若当前动作补全某组合链（跨 session/长时距前序已就位）→ Deny。
-        # 不启用则行为与现状一致（零回归）。提交的违例作为补充判定覆盖 L1-L3 结果。
-        metadata = req.metadata or {}
-        if str(metadata.get("stateful_incremental", "") or "").lower() in ("1", "true", "yes", "on"):
-            try:
-                # ⚠️ 必须在 executor 里跑（2026-11 修）：apply_incremental 是
-                # 「SQLite 全量读 → json.loads → 重建所有节点 → 追加 → 全量
-                # json.dumps → 全量写回」，O(节点数)。跑在事件循环上时，时间线
-                # 一长就每次占住几十到几百毫秒，console / 其它 analyze 全排不上。
-                # 放线程池后事件循环不受影响（线程内串行由 ChainStateStore 的
-                # RLock + 单连接保证）。
-                _inc_state = _chain_state_for_agent(agent_id)
-                inc = await loop.run_in_executor(
-                    None,
-                    lambda: _inc_state.apply_incremental(
-                        a_next,
-                        session_id=session_id,
-                        is_error=bool(metadata.get("is_error", False)),
-                        # 来源：真实 agent（不是桶 key），仅用于链路径取证/展示
-                        source_agent=agent_id,
-                        instance_id=instance_id,
-                    ),
-                )
-                # 能力状态两档（2026-11，用户要求「先预警、后降级」）：
-                #   >=90%  → 预警：还能完整判定，但很快会触顶，请尽快处理
-                #   >=100% → 降级：本次动作确实没参与 L2.2，如实告知
-                _pct = inc.get("usage_pct") or 0
-                if inc.get("at_capacity"):
-                    _degraded.append(
-                        f"【已降级】链状态时间线已满（{inc.get('node_count')}/"
-                        f"{inc.get('capacity')} 节点）：**本次动作未参与 L2.2 组合链检测**"
-                        "（L1/L2.1/L3 不受影响，仍在正常工作）。"
-                        "影响：跨会话组合攻击（如先下载后执行、先读凭据后外传）可能漏判。"
-                        "处理：agent-moss state backup <备份目录> → systemctl stop agent_moss "
-                        "→ agent-moss state reset --yes → systemctl start agent_moss；"
-                        "或调大 AGENT_MOSS_CHAIN_MAX_NODES 并重启。"
-                        "详见 docs/deploy/UPGRADE_GUIDE.md"
-                    )
-                elif _pct >= 90:
-                    _degraded.append(
-                        f"【预警】链状态时间线已用 {_pct}%（{inc.get('node_count')}/"
-                        f"{inc.get('capacity')} 节点）：**本次判定完整**，但即将触顶。"
-                        f"触顶后 L2.2 组合链检测（跨会话组合攻击）将失效，"
-                        "L1/L2.1/L3 不受影响。"
-                        "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
-                        "→ 停服 → agent-moss state reset --yes → 起服；"
-                        "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
-                        "详见 docs/deploy/PERFORMANCE_TUNING.md 第 5 节"
-                    )
-                if inc["should_block"]:
-                    j = inc["matched"] or (inc["exfil"][0] if inc["exfil"] else None)
-                    if j is not None:
-                        violated = list(result.get("violated_layers", []))
-                        if "L2.2-stateful" not in violated:
-                            violated.append("L2.2-stateful")
-                        result = dict(result)
-                        result.update(
-                            decision="Deny",
-                            reason=j.get("reason", "有状态增量链判定：组合攻击链命中"),
-                            risk_level=j.get("risk_level", "high"),
-                            risk_type="formal_verification",
-                            violated_layers=violated,
-                            # 反例路径：每步 [session_id, seq, action_detail, timestamp]
-                            # 安全（2026-10）：跨会话节点脱敏 —— 这条时间线按 agent_id
-                            # 共享，别人能往里写；原样返回等于把别人的命令原文递出去。
-                            # 当前会话的节点保持原样（本来就是调用方自己的数据）。
-                            violation_chain=sp.redact_chain(
-                                j.get("path", []) or [], instance_id, session_id),
-                            violation_graph=sp.redact_graph(
-                                j.get("graph"), instance_id, session_id),
-                        )
-                        logger.info(
-                            "stateful 增量拦截: agent=%s property=%s risk=%s",
-                            agent_id or "-", j.get("property_id", "?"), j.get("risk_level", "?"),
-                        )
-            except Exception as e:
-                logger.warning("stateful incremental 异常（不阻断响应）: %s", e)
-
         analysis_response = AnalyzeResponse(
             decision=result["decision"],
             reason=result["reason"],
@@ -902,7 +966,7 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
             confidence=result.get("confidence", 100),
             analysis_duration_ms=duration_ms,
             violation_chain=result.get("violation_chain", []) or [],
-            violation_graph=sp.redact_graph(result.get("violation_graph"), instance_id, session_id),
+            violation_graph=result.get("violation_graph"),
             degraded=_degraded,
             l3_outcome=str(result.get("l3_outcome", "") or ""),
         )
@@ -931,19 +995,10 @@ async def review(req: ReviewRequest):
     ——跑在事件循环上时，招行现场表现为「analyze 一多，console 就打不开、
     随后 503」。与 analyze 同样的处理：整体丢进线程池。
 
-    安全校验（路径越界 403）留在事件循环里：纯字符串判断，微秒级，
-    且能在真正开始读盘之前就把请求挡掉。
+    路径解析与允许目录校验也在工作线程中执行，校验通过后才打开历史文件。
     """
-    if req.db_path and not sp.path_within(req.db_path, sp.review_roots()):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "db_path 不在允许读取的目录内；标准 AgentGate 部署无需配置，"
-                "自定义路径请加入 AGENT_MOSS_REVIEW_PATHS"
-            ),
-        )
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: _run_review(req))
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _run_review, req)
 
 
 def _review_seed_limit(store) -> int:
@@ -1004,15 +1059,53 @@ def _trim_review_sessions(sessions: list[dict], limit: int) -> tuple[list[dict],
     return out, total - limit
 
 
-def _run_review(req: ReviewRequest) -> ReviewResponse:
-    """``/review`` 的同步主体（在 executor 线程里执行，绝不阻塞事件循环）。
+def _load_review_sessions(req: ReviewRequest) -> list[dict]:
+    if not req.db_path:
+        return req.sessions
 
-    db_path 的越界校验已上移到 async 入口（读盘前先挡掉），这里不再重复。
-    """
+    from .agent_gate_reader import load_agent_gate_sessions
+
+    source_path = os.path.realpath(os.path.expanduser(req.db_path))
+    if not sp.path_within(source_path, sp.review_roots()):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "db_path 不在允许读取的目录内；标准 AgentGate 部署无需配置，"
+                "自定义路径请加入 AGENT_MOSS_REVIEW_PATHS"
+            ),
+        )
+    try:
+        sessions = load_agent_gate_sessions(source_path)
+    except FileNotFoundError:
+        sessions = None
+    if sessions:
+        return sessions
+
+    # A missing or empty source can only use actions supplied in this request.
+    backup = []
+    for session in req.sessions:
+        history = session.get("action_history")
+        if not isinstance(history, list):
+            continue
+        actions = [
+            action for action in history
+            if isinstance(action, dict) and isinstance(action.get("action_detail"), str)
+            and action["action_detail"].strip()
+        ]
+        if actions:
+            backup.append({**session, "action_history": actions})
+    if sessions is None:
+        if not backup:
+            raise HTTPException(status_code=404, detail="指定的回顾路径不存在")
+        logger.warning("回顾路径不存在，使用请求中的 sessions: agent=%s", req.agent_id or "default")
+    return backup
+
+
+def _run_review(req: ReviewRequest) -> ReviewResponse:
+    """在线程池中选择历史来源、更新链状态并验证。"""
     try:
         from ..engine.formal_engine import FormalEngine
         from ..engine.formal_engine.chain_state import get_chain_state_store
-        from .agent_gate_reader import load_agent_gate_sessions
 
         agent_id = req.agent_id or "default"
         _review_t0 = time.monotonic()
@@ -1028,16 +1121,8 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
             )
         except Exception:  # noqa: BLE001
             pass
+        sessions = _load_review_sessions(req)
         store = get_chain_state_store()
-
-        # 1. 读取历史（db_path 直读 > 显式 sessions）
-        sessions: list[dict] = []
-        if req.db_path:
-            sessions = load_agent_gate_sessions(req.db_path)
-            if not sessions:
-                sessions = req.sessions if req.sessions else []
-        else:
-            sessions = req.sessions if req.sessions else []
         # 限制单次 seed 的规模（可配置 + 按时间线水位自适应收紧）
         _seed_limit = _review_seed_limit(store)
         sessions, _dropped = _trim_review_sessions(sessions, _seed_limit)
@@ -1066,31 +1151,22 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
         except Exception:  # noqa: BLE001
             pass
 
-        # 2. 全量 FormalEngine 验证（跨会话组合链 / 敏感数据传播）
-        #    用"本次 seed 的 sessions（多 session 原始结构）+ 当前已累积节点"构建
-        #    多 session 行为图，正确跨越 session 边界匹配链。
+        # 只有未指定来源的回顾可从已有链状态重建验证历史。
+        verify_sessions = sessions
+        if not req.db_path and not sessions and tracker.nodes:
+            # 旧状态与本次 seed 用同一动作上限，避免验证整条时间线。
+            nodes = tracker.nodes[-_seed_limit:] if _seed_limit > 0 else tracker.nodes
+            verify_sessions = [{
+                "session_id": tracker.agent_id,
+                "action_history": [
+                    {"action_type": n.action_type, "action_detail": n.action_detail} for n in nodes
+                ],
+            }]
+
         verified = True
         violations: list[dict] = []
-        if sessions or tracker.nodes:
-            eng = FormalEngine()
-            # 历史用本次 seed 的 sessions（多 session）；若 db 直读则用读出来的 sessions。
-            #
-            # ⚠️ **必须限制规模**（2026-11 实测）：FormalEngine.verify 的耗时是
-            # 超线性的 —— 1000 条 203ms、5000 条 1.5s、20000 条 **14s**。
-            # 原先 sessions 为空时拿 tracker.nodes 全量去验证，6 万节点就是
-            # 一分钟以上；而 AgentGate 每 100 次 analyze 就触发一次 review，
-            # 线程池会被这一个接口吃干。这里与 seed 用同一个上限。
-            if sessions:
-                verify_sessions = sessions
-            else:
-                _nodes = tracker.nodes[-_seed_limit:] if _seed_limit > 0 else tracker.nodes
-                verify_sessions = [
-                    {"session_id": tracker.agent_id, "action_history": [
-                        {"action_type": n.action_type, "action_detail": n.action_detail}
-                        for n in _nodes
-                    ]}
-                ]
-            full = eng.verify(
+        if verify_sessions or (req.db_path and req.a_next):
+            full = FormalEngine().verify(
                 sessions=verify_sessions,
                 a_next=(
                     {"action_type": req.a_next.action_type, "action_detail": req.a_next.action_detail}
@@ -1115,7 +1191,7 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
         if sessions:
             from ..engine.formal_engine.pattern_miner import mine_dangerous_patterns
             discovered = mine_dangerous_patterns(
-                verify_sessions if sessions else [],
+                sessions,
                 min_sup=2,
             )
 

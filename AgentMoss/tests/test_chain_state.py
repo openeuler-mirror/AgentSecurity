@@ -11,6 +11,11 @@
 累积节点、violations 带 path），引擎语义一致性由 `formal-stateful.test.ts` 覆盖。
 """
 
+import sys
+from threading import Event
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 from agent_moss.engine.formal_engine.chain_state import ChainStateStore
@@ -110,7 +115,234 @@ def test_analyze_stateful_incremental_denies_when_chain_completes():
     # stateful 有状态增量判定是本用例的独立依据：层里必须含 L2.2-stateful
     # （静态 L1 可能也拦 nc 扫描，但 stateful 补充判定必须真实触发）
     assert "L2.2-stateful" in (body.get("violated_layers") or []), body
-    assert body.get("risk_type") == "formal_verification", body
+    assert body["violation_graph"]["property_id"] == "cross-listener-exec-scan"
+
+
+@pytest.mark.parametrize(
+    ("decision", "risk", "outcome", "exfil", "expected_reason", "expected_risk", "expected_outcome"),
+    [
+        ("Deny", "critical", "ok", False, "engine", "critical", "ok"),
+        ("Deny", "high", "reasoning_fallback", False, "engine", "high", "reasoning_fallback"),
+        ("Deny", "high", "ok", True, "flow", "critical", "ok"),
+        ("Allow", "low", "fail_open", False, "chain", "high", "failed_but_blocked"),
+        ("Allow", "low", "circuit_open", False, "chain", "high", "circuit_open"),
+        ("Deny", "high", "failed_but_blocked", False, "chain", "high", "failed_but_blocked"),
+    ],
+)
+def test_stateful_response_and_audit_follow_highest_denial(
+    monkeypatch, decision, risk, outcome, exfil, expected_reason, expected_risk, expected_outcome,
+):
+    from agent_moss.engine import analyzer
+    from agent_moss.infra import metrics
+    from agent_moss.server import routes
+
+    observed = outcome == "failed_but_blocked"
+    prior_layers = ["L2.2"] if observed else (["L1.1"] if decision == "Deny" else [])
+    monkeypatch.setattr(analyzer, "analyze", Mock(return_value={
+        "source": "llm_failure_with_violation" if observed else "engine",
+        "decision": decision, "risk_level": risk, "risk_type": "" if observed else "engine",
+        "reason": "model failed" if observed else "engine",
+        "violated_policy": "engine", "violated_layers": prior_layers, "confidence": 76,
+        "policy": "allow policy" if decision == "Allow" else "", "l3_outcome": outcome,
+    }))
+    chain = {"risk_level": "high", "reason": "chain", "graph": {"property_id": "chain"}}
+    flow = {"risk_level": "critical", "reason": "flow", "graph": {"property_id": "flow"}}
+    state = Mock()
+    state.apply_incremental.return_value = {
+        "should_block": True, "matched": chain, "exfil": [flow] if exfil else [],
+    }
+    monkeypatch.setattr(routes, "_chain_state_for_agent", lambda agent_id: state)
+    counter = Mock()
+    monkeypatch.setattr(metrics, "ANALYZE_TOTAL", counter)
+    reported = Event()
+    audit = Mock(side_effect=lambda **fields: reported.set())
+    monkeypatch.setitem(
+        sys.modules, "agent_moss.infra.actrail", SimpleNamespace(report_enforcement_event=audit),
+    )
+
+    with TestClient(create_app()) as client:
+        response = client.post("/api/v1/analyze", json={
+            "session_id": "sample", "a_next": {"action_type": "fixture", "action_detail": "sample"},
+            "metadata": {"stateful_incremental": True},
+        })
+        assert reported.wait(timeout=2)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "Deny"
+    assert body["risk_level"] == expected_risk
+    assert body["reason"] == expected_reason
+    assert body["l3_outcome"] == expected_outcome
+    assert body["violated_layers"] == prior_layers + ["L2.2-stateful"]
+    assert body["risk_type"] == ("engine" if expected_reason == "engine" else "formal_verification")
+    assert body["confidence"] == (76 if expected_reason == "engine" else 90)
+    assert body["policy"] == ""
+    assert body["violation_graph"]["property_id"] == ("flow" if exfil else "chain")
+    counter.inc.assert_called_once_with(
+        decision="Deny", risk_level=expected_risk, l3_outcome=expected_outcome,
+    )
+    assert audit.call_args.kwargs["decision"] == "deny"
+    for field in ("risk_level", "risk_type", "reason", "confidence", "violated_layers"):
+        assert audit.call_args.kwargs[field] == body[field]
+
+
+@pytest.mark.parametrize("static_wins", [True, False], ids=["static-tie", "incremental-higher"])
+@pytest.mark.parametrize("detail_mode", ["redacted", "full"])
+def test_analyze_redacts_selected_flow_across_sessions(monkeypatch, static_wins, detail_mode):
+    from agent_moss.engine import analyzer
+    from agent_moss.server import routes
+
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_DETAIL", detail_mode)
+    sid, command, resource = "private-session", "private-note", "/records/private"
+    raw_reason = f"敏感数据传播外传：{sid}#0 访问 {resource} → mine#2 经共享载体外发"
+
+    def finding(marker, static):
+        nodes = [
+            {"session_id": sid, "seq": 0, "instance_id": "other", "action_detail": command, "resources": [resource]},
+            {"session_id": "sibling", "seq": 1, "instance_id": "here", "action_detail": marker, "resources": []},
+            {"session_id": "mine", "seq": 2, "instance_id": "", "action_detail": "own note", "resources": []},
+        ]
+        path = [[n["session_id"], n["seq"], n["action_detail"]] for n in nodes]
+        if not static:
+            path = [step + ["", "agent", n["instance_id"]] for step, n in zip(path, nodes)]
+        return {
+            "property_id": "sensitive-data-flow", "risk_level": "critical", "reason": raw_reason,
+            "path": path, "graph": {
+                "property_id": "sensitive-data-flow", "nodes": nodes,
+                "edges": [{"from": 0, "to": 1, "type": "data", "label": resource},
+                          {"from": 1, "to": 2, "type": "data", "label": "visible label"}],
+                "property_expression": [{"token": "CRED", "node_index": 0}],
+            },
+        }
+
+    static = finding("static evidence", static=True)
+    flow = finding("incremental evidence", static=False)
+    if not static_wins:
+        static["graph"]["property_id"] = "cross-sample"
+        static["reason"] = "组合链"
+    result = {
+        "decision": "Deny", "source": "formal_engine", "risk_type": "formal_verification",
+        "risk_level": "critical" if static_wins else "high", "reason": static["reason"],
+        "violated_policy": f"[formal_verification] {static['reason']}", "violated_layers": ["L2.2"],
+        "violation_chain": static["path"], "violation_graph": static["graph"],
+    }
+    monkeypatch.setattr(analyzer, "analyze", Mock(return_value=result))
+    state = Mock()
+    state.apply_incremental.return_value = {
+        "should_block": True, "matched": {"reason": "组合链", "risk_level": "high"}, "exfil": [flow],
+    }
+    monkeypatch.setattr(routes, "_chain_state_for_agent", lambda agent_id: state)
+    reported = Event()
+    audit = Mock(side_effect=lambda **fields: reported.set())
+    monkeypatch.setitem(sys.modules, "agent_moss.infra.actrail", SimpleNamespace(report_enforcement_event=audit))
+
+    with TestClient(create_app()) as client:
+        response = client.post("/api/v1/analyze", json={
+            "session_id": "mine", "instance_id": "here",
+            "a_next": {"action_type": "fixture", "action_detail": "own note"},
+            "metadata": {"stateful_incremental": True},
+        })
+        assert response.status_code == 200, response.text
+        assert reported.wait(timeout=2)
+    body = response.json()
+    graph = body["violation_graph"]
+    marker = "static evidence" if static_wins else "incremental evidence"
+    assert body["violation_chain"][1][2] == graph["nodes"][1]["action_detail"] == marker
+    assert body["violation_chain"][2][2] == graph["nodes"][2]["action_detail"] == "own note"
+    assert graph["edges"][1]["label"] == "visible label"
+    assert graph["property_expression"] == [{"token": "CRED", "node_index": 0}]
+    assert body["violated_policy"] == f"[formal_verification] {body['reason']}"
+    assert audit.call_args.kwargs["reason"] == body["reason"]
+    if detail_mode == "redacted":
+        for private in (sid, command, resource):
+            assert private not in response.text
+        assert graph["edges"][0]["label"] == ""
+        assert "<other-session>#0" in body["reason"]
+    else:
+        assert body["reason"] == raw_reason
+        assert body["violation_chain"][0][2] == command
+        assert graph["edges"][0]["label"] == resource
+
+
+@pytest.mark.parametrize(("risk", "use_incremental_graph"), [("high", True), ("critical", False)])
+def test_analyze_supplements_path_only_static_denial_on_equal_risk(monkeypatch, risk, use_incremental_graph):
+    from agent_moss.engine import analyzer
+    from agent_moss.server import routes
+
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_DETAIL", "redacted")
+    static_chain = [["current", 1, "static note"]]
+    monkeypatch.setattr(analyzer, "analyze", Mock(return_value={
+        "decision": "Deny", "source": "formal_engine", "risk_level": risk, "risk_type": "formal_verification",
+        "reason": "static rule", "violated_policy": "[formal_verification] static rule", "violated_layers": ["L2.2"],
+        "violation_chain": static_chain, "violation_graph": None,
+    }))
+    path = [["current", 5, "foreign note"], ["mine", 7, "local note"]]
+    graph = {
+        "property_id": "sensitive-data-flow",
+        "nodes": [{"session_id": sid, "seq": seq, "action_detail": detail} for sid, seq, detail in path],
+        "edges": [{"from": 0, "to": 1, "type": "data", "label": "foreign resource"}],
+    }
+    state = Mock()
+    state.apply_incremental.return_value = {
+        "should_block": True, "matched": None,
+        "exfil": [{"property_id": graph["property_id"], "risk_level": "high", "reason": "incremental rule",
+                   "path": path, "graph": graph}],
+    }
+    monkeypatch.setattr(routes, "_chain_state_for_agent", lambda agent_id: state)
+
+    with TestClient(create_app()) as client:
+        response = client.post("/api/v1/analyze", json={
+            "session_id": "mine", "a_next": {"action_type": "fixture", "action_detail": "local note"},
+            "metadata": {"stateful_incremental": True},
+        })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["decision"] == "Deny"
+    assert body["risk_level"] == risk
+    assert body["reason"] == "static rule"
+    assert body["violated_policy"] == "[formal_verification] static rule"
+    assert body["violated_layers"] == ["L2.2", "L2.2-stateful"]
+    if use_incremental_graph:
+        visible_graph = body["violation_graph"]
+        assert visible_graph["property_id"] == graph["property_id"]
+        assert body["violation_chain"] == [["<other-session>", 5, "<已隐藏>", ""], path[1]]
+        assert [node["action_detail"] for node in visible_graph["nodes"]] == ["<已隐藏>", "local note"]
+        assert visible_graph["edges"][0]["label"] == ""
+    else:
+        assert body["violation_graph"] is None
+        assert body["violation_chain"] == static_chain
+
+
+@pytest.mark.parametrize(("incremental", "historical_current", "session_id", "visible"), [
+    (False, False, "actual-session", True),
+    (False, True, "actual-session", False),
+    (False, True, "current", False),
+    (True, False, "actual-session", False),
+])
+def test_legacy_current_alias_only_identifies_unambiguous_static_nodes(
+    monkeypatch, incremental, historical_current, session_id, visible,
+):
+    from agent_moss.server.routes import _public_formal_result
+
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_DETAIL", "redacted")
+    graph = {"nodes": [{"session_id": "current", "seq": 3, "action_detail": "sample"}]}
+    chain = [["current", 3, "sample"]]
+    base = {"decision": "Deny", "risk_level": "high", "violation_chain": chain, "violation_graph": graph}
+    finding = {"risk_level": "critical", "path": chain, "graph": graph} if incremental else None
+    history = [{"session_id": "current"}] if historical_current else []
+    result = _public_formal_result(base, finding, "", session_id, history)
+    detail = "sample" if visible else "<已隐藏>"
+    assert result["violation_chain"][0][2] == detail
+    assert result["violation_graph"]["nodes"][0]["action_detail"] == detail
+
+
+def test_static_chain_does_not_inherit_visibility_from_different_command(monkeypatch):
+    from agent_moss.infra import security_policy as sp
+
+    monkeypatch.setenv("AGENT_MOSS_CHAIN_DETAIL", "redacted")
+    graph = {"nodes": [{"session_id": "same", "seq": 0, "instance_id": "here", "action_detail": "own"}]}
+    assert sp.redact_chain([["same", 0, "foreign"]], "here", "same", graph=graph) == [
+        ["<other-session>", 0, "<已隐藏>", ""],
+    ]
 
 
 def test_analyze_stateful_off_no_change():
@@ -242,3 +474,39 @@ def test_chain_state_auto_rotate_keeps_recent_and_archives_old(tmp_path, monkeyp
         assert tracker.nodes[-1].action_detail == "echo rotate-10"
     finally:
         store2.close()
+
+
+def test_fingerprint_normalizes_time_alias_and_truncation():
+    """实时微秒/DB 秒、工具别名、落库截断必须生成同一 seed 指纹。"""
+    from agent_moss.engine.formal_engine.stateful import _fingerprint
+
+    full = "echo " + "x" * 100
+    truncated = full[:20] + "…[truncated 84B sha256:" + __import__("hashlib").sha256(
+        full.encode()
+    ).hexdigest()[:16] + "]"
+
+    realtime = _fingerprint(
+        "s", "executeBash", full, "2026-11-23T12:00:00.123456+00:00",
+    )
+    review = _fingerprint(
+        "s", "terminal-executeBash", truncated, "2026-11-23 12:00:00",
+    )
+    assert realtime == review
+
+
+def test_seed_skips_same_action_across_time_precision_and_alias():
+    """同一动作第二次 seed（秒级/别名形态）不再新增节点。"""
+    from agent_moss.engine.formal_engine.stateful import StatefulChainTracker
+
+    tracker = StatefulChainTracker(agent_id="dedupe")
+    first = {"session_id": "s", "action_history": [{
+        "action_type": "executeBash", "action_detail": "echo hi",
+        "called_at": "2026-11-23T12:00:00.999999+00:00",
+    }]}
+    second = {"session_id": "s", "action_history": [{
+        "action_type": "terminal-executeBash", "action_detail": "echo hi",
+        "called_at": "2026-11-23 12:00:00",
+    }]}
+    assert tracker.seed([first]) == 1
+    assert tracker.seed([second]) == 0
+    assert len(tracker.nodes) == 1

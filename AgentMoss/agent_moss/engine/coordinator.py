@@ -38,9 +38,11 @@ from .heuristic import (
     is_fully_safe_bash_command, is_readonly_sensitive_bash_command,
     is_inline_script_command, build_path_context,
 )
-from .inline_analyzer import analyze_inline_script, has_inline_danger_evidence, is_literal_text_command
+from .inline_analyzer import (
+    analyze_inline_script, confirms_inline_read, has_inline_danger_evidence, is_literal_text_command,
+)
 from .llm_analyzer import LLMAnalyzer
-from .logic_rules import LogicRulesChecker
+from .logic_rules import LogicRulesChecker, _SHELL_FULL_READ_CMDS, _split_shell_segments
 from .script_content_analyzer import (
     analyze_script_content,
     scan_script_chain_with_l2,
@@ -61,6 +63,23 @@ logger = logging.getLogger(__name__)
 # 各宿主 agent 的专属内置安全 Skill 通过 agent_ext.builtin_safe_skills 注入，
 # 例如 xiaoO 的 xiaoo-guardian 由 agent_moss/agents/xiaoo/rules.json 提供。
 TRUSTED_SKILLS = frozenset()
+
+
+def _independent_file_command(command: str, profile: "OSProfile") -> str:
+    """仅复核和内联脚本并列的一条普通命令，复杂 shell 继续原暂缓流程。"""
+    if profile.os_type == "windows" or any(mark in command for mark in ("\\", "#", "<<", "<(", ">(", "`", "$")):
+        return ""
+    parts = _split_shell_segments(command)
+    if len(parts) != 2:
+        return ""
+    ordinary = [part for part in parts if not is_inline_script_command(part)]
+    if len(ordinary) != 1:
+        return ""
+    part = ordinary[0]
+    name = part.split()[0]
+    if name in _SHELL_FULL_READ_CMDS or any(rule.fullmatch(name) for rule in profile.write_command_res):
+        return part
+    return ""
 
 
 class AgentMossBot:
@@ -220,8 +239,23 @@ class AgentMossBot:
                         and heuristic_result.risk_type == "file_access")
                     or (heuristic_result.risk_level == "medium"
                         and heuristic_result.risk_type == "resource_exhaustion")
-                ) and not skip_inline_file_access
-                if should_deny_l1:
+                )
+                if (
+                    should_deny_l1 and skip_inline_file_access and is_inline_script_cmd
+                    and a_next.get("action_type", "").lower() in ("bash", "executebash", "terminal-executebash")
+                ):
+                    detail = a_next.get("action_detail", "")
+                    command = _independent_file_command(detail, self._profile)
+                    if command:
+                        hit = self._heuristic_detector.detect(
+                            {**a_next, "action_detail": command}, reason, prompt_session,
+                        )
+                        if hit.hit and hit.risk_type == "file_access" and hit.risk_level in ("medium", "high", "critical"):
+                            heuristic_result = hit
+                            skip_inline_file_access = False
+                    elif self._profile.os_type != "windows" and heuristic_result.denied_read_path:
+                        skip_inline_file_access = not confirms_inline_read(detail, heuristic_result.denied_read_path)
+                if should_deny_l1 and not skip_inline_file_access:
                     violated_layers.append("L1.1")
                     logger.info(
                         "特征匹配检测拦截: risk_level=%s, reason=%s",

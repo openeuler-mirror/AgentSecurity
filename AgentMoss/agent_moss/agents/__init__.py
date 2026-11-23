@@ -75,6 +75,11 @@ def get_agent_extensions(agent_id: str) -> AgentExtensions | None:
     if not is_safe_id(agent_id):
         logger.warning("非法 agent_id 已忽略（含路径字符或超长）: %.120r", agent_id)
         return None
+    # 场景包交付范围：即使老 runtime_config 里残留已裁掉的 agent 分区，也拒绝加载。
+    from ..infra.edition_scope import is_allowed
+    if not is_allowed("agents", agent_id):
+        logger.debug("agent %s 不在本场景交付范围内，忽略", agent_id)
+        return None
     from ..infra.runtime_config import _READONLY_RUNTIME
     readonly = _READONLY_RUNTIME.get() is not None
     # 缓存键来自调用方自报，穷举不同 id 会撑大缓存（下面的 None 分支同样会写缓存）

@@ -3,6 +3,9 @@
 from dataclasses import dataclass, field
 
 
+RISK_PRIORITY = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
 @dataclass
 class SecurityJudgment:
     """AgentMoss 安全判断结果"""
@@ -71,10 +74,10 @@ class HeuristicResult:
     reason: str = ""
     risk_type: str = ""
     confidence: int = 100  # 0-100，置信度；<80 时不立即 Deny，转交 Layer 2/3 分析
-    # 敏感路径检测搬到 L1 后携带：是否命中凭据文件（deny_both，无论读写都拦截，
-    # 不进 inline 跳过）；以及命中规则名（供 coordinator 日志/Brain/LLM prompt 用）
+    # 凭据文件规则禁止读写；命中规则名供 coordinator 日志/Brain/LLM prompt 用。
     is_credential: bool = False
     violated_rule: str = ""
+    denied_read_path: str = ""  # 原命中的路径规则明确禁止读取时赋值
 
 
 @dataclass

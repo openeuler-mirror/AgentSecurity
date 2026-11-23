@@ -297,6 +297,10 @@ def test_unknown_category_and_missing_field_skipped(tmp_path, monkeypatch, caplo
 
 def test_scenario_rules_override_still_works(tmp_path, monkeypatch):
     """场景规则仍可应急替换（scenarios/<id>/rules.json，按路径寻址）。"""
+    from agent_moss.infra.edition_scope import is_allowed
+
+    if not is_allowed("scenarios", "bank"):
+        pytest.skip("本场景未下发 bank 场景规则")
     d = tmp_path / "rulesdir"
     (d / "scenarios" / "bank").mkdir(parents=True)
     _write(d / "scenarios" / "bank", "rules.json", {
