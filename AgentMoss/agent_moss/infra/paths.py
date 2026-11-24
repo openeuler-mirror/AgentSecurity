@@ -64,6 +64,12 @@ def get_rules_root() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def asset_root() -> Path:
+    """规则资产根目录（``AGENT_MOSS_RULES_ROOT`` 或包内 ``agent_moss/``）。"""
+    root = get_rules_root()
+    return root if root is not None else _PACKAGE_ASSET_ROOT
+
+
 def asset_dir(name: str) -> Path:
     """解析资产目录：``rules`` / ``skills`` / ``scenarios`` / ``agents``。
 

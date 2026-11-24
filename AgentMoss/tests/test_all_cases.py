@@ -504,6 +504,20 @@ class TestLayer1And2:
             ("deny-795-rm-root-quoted-options.json", dict(decision="Deny", risk_level="critical")),
             ("deny-796-rm-sensitive-options.json", dict(decision="Deny", risk_level="critical")),
             ("deny-797-rm-hidden-root-options.json", dict(decision="Deny", risk_level="critical")),
+            # 2026-11 鸿蒙真机复验：rm 分离选项/非递归形态也必须拦截根目录
+            ("deny-798-rm-force-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-799-rm-recursive-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-800-rm-separate-options-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-801-rm-force-recursive-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-802-rm-force-hidden-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-803-rm-recursive-hidden-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-804-rm-force-verbose-root.json", dict(decision="Deny", risk_level="critical")),
+            # 绝对路径的 . / .. 解析与同命令变量赋值（2026-11 对抗矩阵）
+            ("deny-805-rm-traversal-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-806-rm-traversal-etc.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-807-rm-traversal-var.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-808-rm-var-root.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-809-rm-var-traversal-etc.json", dict(decision="Deny", risk_level="critical")),
             # 2026-10 安全加固：AgentMoss 自身资产的读保护（同机其他 agent 直接 cat 就能拿到）
             ("deny-260-agentmoss-auth-token-read.json", dict(decision="Deny", risk_level="critical")),
             ("deny-261-agentmoss-state-db-read.json", dict(decision="Deny", risk_level="critical")),
@@ -1023,6 +1037,12 @@ class TestLayer1And2:
             # rm 附加选项不能导致临时目录定向清理被误拦（一拦一放配套）
             ("allow-1130-rm-temp-options.json", dict(decision="Allow", risk_level="low")),
             ("allow-1131-rm-temp-short-options.json", dict(decision="Allow", risk_level="low")),
+            # 新增根目录 critical 规则的配套放行：常见临时/业务目录不能被误拦
+            ("allow-1132-rm-temp-file-force.json", dict(decision="Allow", risk_level="low")),
+            ("allow-1133-rm-logs-dir.json", dict(decision="Allow", risk_level="low")),
+            ("allow-1134-rm-var-tmp.json", dict(decision="Allow", risk_level="low")),
+            ("allow-1135-rm-traversal-logs.json", dict(decision="Allow", risk_level="low")),
+            ("allow-1136-rm-var-temp.json", dict(decision="Allow", risk_level="low")),
             ("allow-264-tmp-normal-file.json", dict(decision="Allow", risk_level="low")),
             ("allow-266-agentmoss-name-lookalike.json", dict(decision="Allow", risk_level="low")),
             # 脚本分支感知放行：bash deploy.sh backup 走安全分支，不再全文本误报（需 script_branch_cwd fixture 的 deploy.sh）

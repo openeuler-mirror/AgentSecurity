@@ -176,6 +176,10 @@ def test_cold_ignores_user_skill_and_brain(cold_env, tmp_path):
 
 
 def test_cold_scenario_rules_dir_override(cold_env):
+    from agent_moss.infra.edition_scope import is_allowed
+
+    if not is_allowed("scenarios", "bank"):
+        pytest.skip("本场景未下发 bank 场景规则")
     _, rules_dir = cold_env
     scen = rules_dir / "scenarios" / "bank"
     scen.mkdir(parents=True)

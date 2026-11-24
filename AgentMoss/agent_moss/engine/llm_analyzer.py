@@ -19,6 +19,7 @@ from ..infra.config import (
     get_llm_action_detail_max_chars,
     get_llm_history_max_items,
     get_llm_max_prompt_tokens,
+    get_llm_prompt_history_max_turns,
     get_llm_timeout,
     get_log_path,
 )
@@ -616,18 +617,25 @@ class LLMAnalyzer:
     def _format_prompt_history(
         prompt_history: list[dict[str, object]] | None,
         max_text_chars: int = 500,
+        max_turns: int | None = None,
     ) -> str:
-        """格式化交错历史 prompt 为 LLM 可读文本。
+        """格式化最近提交的历史轮次，保留原轮号。
 
-        每轮输出 "第 N 轮用户意图: <text>"，若该轮带 actions 则附上动作类型
-        （动作详情截断，避免撑爆 context）。空/None 返回占位。
+        窗口内的非空意图按字符截断，附带动作只显示类型。默认只保留最近
+        ``AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS``（20）轮，避免 prompt
+        随会话长度无限膨胀；0 表示不限制。空/None 返回占位。
         """
         if not prompt_history:
             return "（未提供历史意图）"
 
+        if max_turns is None:
+            max_turns = get_llm_prompt_history_max_turns()
+        first_turn_index = (
+            max(0, len(prompt_history) - max_turns) if max_turns > 0 else 0
+        )
         lines = []
         longest_text_chars = 0
-        for i, turn in enumerate(prompt_history, 1):
+        for i, turn in enumerate(prompt_history[first_turn_index:], start=first_turn_index + 1):
             if not isinstance(turn, dict):
                 continue
             text = turn.get("text", "")
@@ -653,8 +661,9 @@ class LLMAnalyzer:
             lines.append(line)
 
         logger.debug(
-            "L3 prompt_history turns_in=%d turns_kept=%d longest_text_chars=%d",
-            len(prompt_history), len(lines), longest_text_chars,
+            "L3 prompt_history turns_in=%d turns_kept=%d window=%d longest_text_chars=%d",
+            len(prompt_history), len(lines), max_turns or len(prompt_history),
+            longest_text_chars,
         )
         if not lines:
             return "（未提供历史意图）"

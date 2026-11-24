@@ -120,6 +120,10 @@ def _patterns(ext) -> list[str]:
 
 def test_agent_rules_edit_is_hot(hot_env):
     """手改 agent_rules 后，get_agent_extensions 下一次调用自动重载。"""
+    from agent_moss.infra.edition_scope import is_allowed
+
+    if not is_allowed("agents", "xiaoo"):
+        pytest.skip("本场景未下发 xiaoo agent 规则")
     cfg = hot_env
     _write(cfg, _agent_config(r"echo\s+agent-hot-one"))
 
@@ -161,6 +165,10 @@ def _scenario_config(pattern: str) -> dict:
 
 def test_scenario_rules_edit_is_hot(hot_env):
     """手改 scenario_rules 后，get_scenario_extensions 下一次调用自动重载。"""
+    from agent_moss.infra.edition_scope import is_allowed
+
+    if not is_allowed("scenarios", "bank"):
+        pytest.skip("本场景未下发 bank 场景规则")
     cfg = hot_env
     _write(cfg, _scenario_config(r"echo\s+scenario-hot-one"))
 

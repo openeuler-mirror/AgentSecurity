@@ -699,6 +699,7 @@ sudo firewall-cmd --reload
 | `AGENT_MOSS_LLM_TIMEOUT` | LLM 单次调用超时（秒）| `300` |
 | `AGENT_MOSS_LLM_RETRIES` | LLM 调用重试次数 | `2`（共 3 次尝试） |
 | `AGENT_MOSS_LLM_HISTORY_MAX_ITEMS` | L3 prompt 最多注入多少条历史动作（0 = 不限）| `20` |
+| `AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS` | L3 prompt 最多注入最近多少轮历史用户意图（0 = 不限）| `20` |
 | `AGENT_MOSS_LLM_ACTION_DETAIL_MAX_CHARS` | L3 prompt 中单条历史动作详情最多保留字符数（0 = 不截断）| `500` |
 | `AGENT_MOSS_LLM_MAX_PROMPT_TOKENS` | L3 输入 prompt 的 token 总预算（0 = 不限），超限逐级压缩历史 | `0` |
 | `AGENT_MOSS_LLM_FAIL_MODE` | LLM 失败策略：`fail_open`（默认 Allow+warn）/ `fail_closed`（Deny）| `fail_open` |

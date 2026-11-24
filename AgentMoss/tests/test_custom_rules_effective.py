@@ -145,6 +145,6 @@ def test_builtin_rules_unaffected_by_user_custom_merge(clean_runtime):
     pats = runtime_config.get_enabled_l1_command_patterns(
         runtime_config.load_runtime_config(), "linux",
     )
-    assert len(pats) == 163, len(pats)   # Linux 内置危险命令条数（+10：编码混淆 2 + 内网探测 5 + python 内联 3，NEW-FN-K/L/N/Q）
+    assert len(pats) == 164, len(pats)   # Linux 内置危险命令条数（+11：编码混淆 2 + 内网探测 5 + python 内联 3 + rm 根目录选项顺序 1）
     assert _analyze("ls -la")["decision"] == "Allow"
     assert _analyze("cat ~/.ssh/id_rsa")["decision"] == "Deny"

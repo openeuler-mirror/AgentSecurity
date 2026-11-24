@@ -8,6 +8,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -58,6 +61,53 @@ def test_analyze_response_schema(client):
         assert field in body, f"响应缺少字段: {field}"
         assert isinstance(body[field], typ), f"{field} 类型变了: {type(body[field])}"
     assert body["decision"] in ("Allow", "Deny")
+
+
+@pytest.mark.parametrize("incremental", ["off", "on", "error"])
+def test_slow_request_subtracts_all_executor_waits(client, monkeypatch, caplog, incremental):
+    from agent_moss.engine import analyzer
+    from agent_moss.server import routes
+
+    now = 0.0
+    waits = iter([2.0] if incremental == "off" else [2.0, 3.0])
+
+    def submit(executor, job, *args):
+        wait = next(waits, 0.0)
+
+        def run():
+            nonlocal now
+            now += wait
+            return job(*args)
+
+        return asyncio.get_running_loop().run_in_executor(executor, run)
+
+    def analyze(**kwargs):
+        nonlocal now
+        now += 0.5
+        return {"decision": "Allow", "reason": "fixture"}
+
+    def apply_incremental(*args, **kwargs):
+        nonlocal now
+        now += 0.25
+        if incremental == "error":
+            raise RuntimeError("fixture")
+        return {"should_block": False}
+
+    monkeypatch.setenv("AGENT_MOSS_SLOW_REQUEST_MS", "1")
+    monkeypatch.setattr(routes, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(routes, "asyncio", SimpleNamespace(
+        get_event_loop=lambda: SimpleNamespace(run_in_executor=submit),
+    ))
+    monkeypatch.setattr(analyzer, "analyze", analyze)
+    monkeypatch.setattr(routes, "_chain_state_for_agent", lambda _: SimpleNamespace(apply_incremental=apply_incremental))
+    response = client.post("/api/v1/analyze", json={
+        "session_id": "queue-timing", "a_next": {"action_type": "read", "action_detail": "notes.txt"},
+        "metadata": {"stateful_incremental": incremental != "off"},
+    })
+    assert response.status_code == 200
+    queued, work = (2000, 500) if incremental == "off" else (5000, 750)
+    slow, = [record for record in caplog.records if record.msg.startswith("慢请求:")]
+    assert slow.args[:3] == (queued + work, queued, work)
 
 
 def test_deny_response_schema(client):

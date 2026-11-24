@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import gzip
+import datetime
 import hashlib
 import json
 import logging
@@ -35,13 +36,60 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+_TRUNCATED_DETAIL_RE = re.compile(r"…\[truncated \d+B sha256:([0-9a-f]{16})\]$")
+_SHELL_ACTION_ALIASES = {
+    "executebash": "bash",
+    "terminal-executebash": "bash",
+    "execute_bash": "bash",
+    "terminal_execute_bash": "bash",
+}
+
+
+def _canonical_action_type(action_type: str) -> str:
+    """工具别名归一：AgentGate 实时链路归一化，review 读 DB 原始名，必须同键。"""
+    low = str(action_type or "").strip().lower()
+    return _SHELL_ACTION_ALIASES.get(low, low)
+
+
+def _canonical_detail(action_detail: str) -> str:
+    """命令内容归一：落库截断保留全文 sha256，实时与 review 用同一摘要。"""
+    detail = str(action_detail or "")
+    m = _TRUNCATED_DETAIL_RE.search(detail)
+    digest = m.group(1) if m else hashlib.sha256(
+        detail.encode("utf-8", "surrogatepass")
+    ).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
+def _canonical_called_at(called_at: str) -> str:
+    """时间归一：实时是微秒 ISO，SQLite 是秒级；统一到 UTC epoch 秒。"""
+    value = str(called_at or "").strip()
+    if not value:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return str(int(dt.timestamp()))
+    except (ValueError, OverflowError):
+        return value
+
+
 def _fingerprint(session_id: str, action_type: str, action_detail: str, called_at: str) -> str:
     """动作指纹（seed 去重用）。
 
     只对**带 called_at 的动作**生成 —— 同一 session 里重复执行同一命令是
     合法行为，没有时间戳就无法区分，宁可不作为也不误去重。
+
+    实时与 review 的同一动作必须同键：时间统一到秒、工具名过别名归一化、
+    命令用全文 sha256（截断记录里保留了原摘要）。
     """
-    raw = "\x00".join((str(session_id), str(action_type), str(action_detail), str(called_at)))
+    raw = "\x00".join((
+        str(session_id),
+        _canonical_action_type(action_type),
+        _canonical_detail(action_detail),
+        _canonical_called_at(called_at),
+    ))
     return hashlib.blake2b(raw.encode("utf-8", "replace"), digest_size=8).hexdigest()
 
 # 时间线上限（安全相关节点；平凡动作即便不单独建安全语义节点也会被 append，
@@ -1078,17 +1126,16 @@ class StatefulChainTracker:
         }
         self._taint_edge_label = {}  # 旧快照无此字段：边标签缺失，图结构不受影响
         # seed 去重指纹（旧快照没有这个字段：从已有节点重建，保证升级后
-        # 第一次 review 不会把历史再追加一遍）
+        # 第一次 review 不会把历史再追加一遍）。
+        # 无论是否有旧 keys，都用新指纹补一遍当前节点：指纹算法从 2026-11 起
+        # 对时间/别名/截断做归一，旧 keys 可能对不上当前节点的规范键。
         _keys = snapshot.get("seeded_keys")
-        if _keys:
-            self._seeded_keys = {str(k) for k in _keys}
-        else:
-            self._seeded_keys = set()
-            for n in self.nodes:
-                if getattr(n, "timestamp", ""):
-                    self._seeded_keys.add(
-                        _fingerprint(n.session_id, n.action_type, n.action_detail, n.timestamp)
-                    )
+        self._seeded_keys = {str(k) for k in _keys} if _keys else set()
+        for n in self.nodes:
+            if getattr(n, "timestamp", ""):
+                self._seeded_keys.add(
+                    _fingerprint(n.session_id, n.action_type, n.action_detail, n.timestamp)
+                )
         # 重建 taint 资源反索引：由染毒节点的 resources 推导（并集 all）
         self._tainted_resources = set()
         for i in self._tainted:

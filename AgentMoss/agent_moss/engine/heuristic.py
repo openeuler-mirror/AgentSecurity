@@ -11,6 +11,7 @@
 import ast
 import json
 import os
+import posixpath
 import re
 import shlex
 from pathlib import Path
@@ -300,6 +301,7 @@ class SensitivePathChecker:
                         reason=f"访问敏感路径: {sp.desc} ({sp.path})",
                         risk_type="file_access",
                         is_credential=True,
+                        denied_read_path=sp.path,
                         violated_rule="sensitive_path_access",
                     )
                 # read_only 路径：只拦截读取操作，写入/删除放行（如 /dev/random：
@@ -313,6 +315,7 @@ class SensitivePathChecker:
                         risk_level=sp.risk_level,
                         reason=f"读取敏感路径: {sp.desc} ({sp.path})",
                         risk_type="file_access",
+                        denied_read_path=sp.path,
                         violated_rule="sensitive_path_access",
                     )
                 # dir_del_only 目录级条目（.ssh/.aws）独立于 is_write 判定：
@@ -1228,6 +1231,112 @@ def strip_search_pattern_literals(action_detail: str) -> str:
     return "".join(parts)
 
 
+_RM_ASSIGN_RE = re.compile(
+    r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|]+)\s*"""
+)
+_RM_VAR_RE = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
+_RM_SEGMENT_SEPARATORS = {"&&", "||", "|", ";", "&"}
+_RM_COMMAND_PREFIXES = {"sudo", "env", "command", "builtin", "exec", "nohup", "time"}
+_RM_SENSITIVE_FIRST = {"etc", "usr", "boot", "root", "opt", "srv", "sys", "proc", "home"}
+
+
+def _rm_expand_vars(token: str, env: dict[str, str]) -> str:
+    """展开同一命令段/前置段里可静态确定的变量；未知变量保持原样（不猜）。"""
+    def repl(match: re.Match[str]) -> str:
+        name = (match.group(1) or match.group(2)).lower()
+        return env.get(name, match.group(0))
+
+    for _ in range(3):
+        expanded = _RM_VAR_RE.sub(repl, token)
+        if expanded == token:
+            break
+        token = expanded
+    return token
+
+
+def _rm_resolved_dangerous(resolved: str) -> bool:
+    """解析后的绝对路径是否命中根目录/根下隐藏路径/关键系统目录。"""
+    if resolved == "/" or resolved.startswith("/."):
+        return True
+    first = resolved.split("/", 2)[1] if resolved.count("/") >= 1 else ""
+    if first == "home":
+        # 只把 /home 与 /home/<user> 本身当敏感目标；更深的业务子路径交给 L2
+        # （意图一致性等），否则 `rm /home/u/src/app.ts` 会被 L1 抢成 critical。
+        parts = [x for x in resolved.split("/") if x]
+        return len(parts) <= 2
+    if first in _RM_SENSITIVE_FIRST:
+        return True
+    # /var/tmp 是允许的临时目录；/var 及其它子目录仍按系统目录处理
+    if first == "var" and not (resolved == "/var/tmp" or resolved.startswith("/var/tmp/")):
+        return True
+    return False
+
+
+def _check_rm_resolved_targets(text: str) -> HeuristicResult | None:
+    """词法解析 rm 目标：处理 ``.``/``..`` 与同命令变量赋值，堵路径穿越绕过。
+
+    只处理能静态确定的绝对路径；相对路径、未知变量不猜（交给既有规则/L3），
+    避免把普通业务目录误判。解析目标为根目录、根下隐藏路径或关键系统目录时
+    直接返回 critical，保证无 LLM 时也不会 fail-open。
+    """
+    env: dict[str, str] = {}
+    for segment in _split_command_segments(text):
+        segment = segment.strip()
+        if not segment or segment in _RM_SEGMENT_SEPARATORS:
+            continue
+
+        # 收集段首赋值：ROOT=/; rm -rf $ROOT / export TARGET=/etc; ...
+        while True:
+            m = _RM_ASSIGN_RE.match(segment)
+            if not m:
+                break
+            name = m.group(1).lower()
+            value = m.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            env[name] = _rm_expand_vars(value, env)
+            segment = segment[m.end():]
+
+        try:
+            parts = shlex.split(segment, posix=True)
+        except ValueError:
+            parts = segment.split()
+        if not parts:
+            continue
+
+        idx = 0
+        while idx < len(parts) and parts[idx].lower() in _RM_COMMAND_PREFIXES:
+            idx += 1
+        if idx >= len(parts):
+            continue
+        command_word = parts[idx].rsplit("/", 1)[-1].lstrip("\\").lower()
+        if command_word != "rm":
+            continue
+
+        options_done = False
+        for token in parts[idx + 1:]:
+            if token == "--":
+                options_done = True
+                continue
+            if not options_done and token.startswith("-"):
+                continue
+            target = _rm_expand_vars(token, env)
+            if not target.startswith("/"):
+                continue
+            resolved = posixpath.normpath(target)
+            if _rm_resolved_dangerous(resolved):
+                return HeuristicResult(
+                    hit=True,
+                    matched_patterns=["rm-resolved-root"],
+                    risk_level="critical",
+                    reason=f"检测到删除根目录/关键系统目录（解析后目标 {resolved}）",
+                    risk_type="script_execution",
+                )
+    return None
+
+
 class CommandPatternScanner:
     """子检测器：关键命令正则扫描（从 OSProfile 获取模式）
 
@@ -1375,9 +1484,15 @@ class CommandPatternScanner:
             )
         ]
         if not hits:
-            return HeuristicResult(hit=False)
+            # 既有规则没命中时，才用 rm 路径解析补充（不覆盖已有 high/critical
+            # 判定的 risk_type，避免把提权/敏感路径误标成 script_execution）。
+            return _check_rm_resolved_targets(scan_text) or HeuristicResult(hit=False)
 
         top = max(hits, key=lambda p: _RISK_PRIORITY.get(p["risk_level"], 0))
+        if top["risk_level"] not in ("high", "critical"):
+            rm_resolved = _check_rm_resolved_targets(scan_text)
+            if rm_resolved is not None:
+                return rm_resolved
         return HeuristicResult(
             hit=True,
             matched_patterns=[p["pattern"] for p in hits],
@@ -1885,6 +2000,10 @@ class HeuristicDetector:
         result = self._sensitive_path_checker.check(a_next)
         if result.hit:
             best = _merge_heuristic_hit(best, result)
+            # 同级文件风险保留先命中的主因，实际读取的路径由内联复核确认。
+            if (best is not result and result.denied_read_path
+                    and best.risk_type == "file_access" and best.risk_level == result.risk_level):
+                best.denied_read_path = result.denied_read_path
 
         # 5. 危险操作模式检测（从 L2 搬入）：通配符+删除、重定向覆盖关键目录
         # 已按内容语言处理的写工具调用跳过（content 里的 rm/*/重定向是数据）；

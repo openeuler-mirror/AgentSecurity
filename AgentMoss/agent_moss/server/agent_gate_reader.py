@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +48,20 @@ def read_agent_gate_sessions(
     limit: int = 100000,
 ) -> list[dict]:
     """从 AgentGate SQLite 读全量 tool_calls → sessions 结构。"""
-    path = db_path or discover_agent_gate_db()
+    path = Path(db_path or discover_agent_gate_db()).expanduser().absolute()
     sessions: dict[str, list[dict]] = {}
-    if not os.path.exists(path):
-        return []
-    uri = f"file:{path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=10)
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=10)
+    except sqlite3.OperationalError:
+        # SQLite reports both a missing file and access failures as CANTOPEN.
+        # Check after the open attempt in case the source disappeared.
+        try:
+            path.stat()
+        except FileNotFoundError:
+            if db_path:
+                raise
+            return []
+        raise
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -87,7 +95,15 @@ def read_agent_gate_json_sessions(dir_path: str = "", limit: int = 100000) -> li
     if not d:
         d = str(Path(os.path.expanduser("~/.local/share/agent_gate")) / "tool_calls")
     sessions: dict[str, list[dict]] = {}
-    files = glob.glob(os.path.join(d, "*.json"))
+    try:
+        files = [
+            p for p in Path(d).expanduser().iterdir()
+            if not p.name.startswith(".") and p.match("*.json")
+        ]
+    except OSError:
+        if dir_path:
+            raise
+        return []
     for fp in sorted(files)[-200:]:  # 防御海量文件
         sid = Path(fp).stem
         try:
@@ -110,11 +126,10 @@ def read_agent_gate_json_sessions(dir_path: str = "", limit: int = 100000) -> li
 
 
 def load_agent_gate_sessions(db_path: str = "") -> list[dict]:
-    """统一入口：优先 SQLite，找不到默认就试 JSON 目录。"""
-    if db_path and os.path.isdir(db_path):
-        return read_agent_gate_json_sessions(dir_path=db_path)
-    sessions = read_agent_gate_sessions(db_path=db_path)
-    if sessions:
-        return sessions
-    # 无显式路径/库里空 → 兜底 JSON 目录
-    return read_agent_gate_json_sessions()
+    """显式路径只读该来源；无参调用保留 SQLite、默认 JSON 的发现顺序。"""
+    if db_path:
+        path = Path(db_path).expanduser()
+        if stat.S_ISDIR(path.stat().st_mode):
+            return read_agent_gate_json_sessions(dir_path=str(path))
+        return read_agent_gate_sessions(db_path=str(path))
+    return read_agent_gate_sessions() or read_agent_gate_json_sessions()

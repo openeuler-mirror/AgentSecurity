@@ -55,7 +55,7 @@ def test_l1_counts_stable():
     # 净 +9 = 删 1 加 10。收窄不丢覆盖：语料里靠 -Command 兜底的 4 条 Deny 用例
     # （IWR 下载 .ps1 / Set-MpPreference / -w hidden / schtasks 套 powershell）
     # 分别由既有规则与新规则接住。
-    assert len(l1["dangerous_commands"]) == 225  # 历史+批次见 git；+10 = 编码混淆 2 + 内网探测 5（NEW-FN-K/L/N）+ python 内联 3（M07）
+    assert len(l1["dangerous_commands"]) == 226  # 历史+批次见 git；+11 = 编码混淆 2 + 内网探测 5（NEW-FN-K/L/N）+ python 内联 3（M07）+ rm 根目录选项顺序 1
     # 51 = 48 通用（`os: "all"`，三平台共用）+ 3 Windows 独有（`os: "windows"`）。
     # 2026-10 修双端分叉：那 3 条原先硬编码在 windows.py，而通用 48 条被标成
     # `os: linux` —— Windows 按 os 过滤后一条不剩、静默回退到那 3 条所在的 14 条
