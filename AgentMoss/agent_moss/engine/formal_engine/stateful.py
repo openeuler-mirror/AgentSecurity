@@ -22,16 +22,19 @@
 from __future__ import annotations
 
 import gzip
-import datetime
 import hashlib
 import json
 import logging
 import os
 import re
 import time
+from copy import copy, deepcopy
+from dataclasses import asdict, dataclass, field, replace
+from bisect import bisect_left
+from datetime import datetime, timezone
+from heapq import heappop, heappush
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +70,83 @@ def _canonical_called_at(called_at: str) -> str:
     if not value:
         return ""
     try:
-        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt, _ = _parse_history_datetime(value)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+            dt = dt.replace(tzinfo=timezone.utc)
         return str(int(dt.timestamp()))
-    except (ValueError, OverflowError):
+    except (OSError, ValueError, OverflowError):
         return value
+
+
+def _legacy_audit_fingerprint(session_id: str, action_type: str, action_detail: str, called_at: str) -> str:
+    """兼容旧 Gate 审计库的秒级时间、工具别名和截断正文。"""
+    return _fingerprint(session_id, _canonical_action_type(action_type),
+                        _canonical_detail(action_detail), _canonical_called_at(called_at))
+
+
+class StatefulAnalysisUnavailable(RuntimeError):
+    """A trusted Gate call could not be evaluated against the required state."""
+
+
+class UnconfirmedGateRetry(StatefulAnalysisUnavailable):
+    """A retry with uncertain delivery has no confirmed result to reuse."""
+
+
+class GateCallConflict(UnconfirmedGateRetry):
+    """The same Gate call id was reused with different content or timing."""
+
+
+def _gate_order(action: dict) -> tuple[int, str] | None:
+    call_id = action.get("_gate_call_id")
+    call_time = action.get("_gate_call_time_us")
+    if isinstance(call_id, str) and call_id and type(call_time) is int and call_time > 0:
+        return call_time, call_id
+    return None
+
+
+_FRACTIONAL_SECONDS = re.compile(r"(?<=\d\d:\d\d:\d\d)[.,]([0-9]+)")
+_DATETIME_FRACTION = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}.[0-9]{2}:[0-9]{2}:[0-9]{2})[.,]([0-9]+)")
+_MICROSECOND_TIMESTAMP_LENGTH = len("0000-00-00T00:00:00.000000")
+
+
+def _parse_history_datetime(value: str) -> tuple[datetime, str]:
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    remainder = ""
+    if match := _DATETIME_FRACTION.match(value):
+        clock, fraction = match.groups()
+        offset = value[match.end():]
+        if offset and offset[0] not in "+-":
+            raise ValueError("unexpected text after fractional seconds")
+        remainder = fraction[6:].rstrip("0")
+        value = f"{clock}.{fraction[:6].ljust(6, '0')}{offset}"
+    try:
+        return datetime.fromisoformat(value), remainder
+    except ValueError:
+        # Python 3.10 also limits fractional seconds in an explicit UTC offset.
+        normalized = _FRACTIONAL_SECONDS.sub(lambda m: "." + m[1][:6].ljust(6, "0"), value)
+        if normalized == value:
+            raise
+        return datetime.fromisoformat(normalized), remainder
+
+
+def _history_time(value: object, *, local_naive: bool = False) -> str | None:
+    """Normalize audit timestamps for chronological comparisons."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed, remainder = _parse_history_datetime(value)
+        if parsed.tzinfo is not None or local_naive:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        # Retain the existing microsecond prefix and compare any finer precision after it.
+        return parsed.isoformat(timespec="microseconds") + remainder
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _history_priority(value: object) -> tuple[bool, str]:
+    stamp = _history_time(value)
+    return stamp is None, stamp or ""
 
 
 def _fingerprint(session_id: str, action_type: str, action_detail: str, called_at: str) -> str:
@@ -80,17 +154,14 @@ def _fingerprint(session_id: str, action_type: str, action_detail: str, called_a
 
     只对**带 called_at 的动作**生成 —— 同一 session 里重复执行同一命令是
     合法行为，没有时间戳就无法区分，宁可不作为也不误去重。
-
-    实时与 review 的同一动作必须同键：时间统一到秒、工具名过别名归一化、
-    命令用全文 sha256（截断记录里保留了原摘要）。
     """
-    raw = "\x00".join((
-        str(session_id),
-        _canonical_action_type(action_type),
-        _canonical_detail(action_detail),
-        _canonical_called_at(called_at),
-    ))
+    raw = "\x00".join((str(session_id), str(action_type), str(action_detail), str(called_at)))
     return hashlib.blake2b(raw.encode("utf-8", "replace"), digest_size=8).hexdigest()
+
+
+def _is_sqlite_second(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 19 and value[10] == " "
+
 
 # 时间线上限（安全相关节点；平凡动作即便不单独建安全语义节点也会被 append，
 # 高频大项目下需上限保护防无限增长。超限忽略新节点，建议定期 /api/v1/review 重建。）
@@ -245,8 +316,29 @@ class StateNode:
     agent_id: str = ""
     #: 来源实例（哪个 agent 安装/实例上报的）。仅用于展示层脱敏，不参与链匹配。
     instance_id: str = ""
-    # 真实发生时间（ISO 字符串，来自 action.called_at；无则 None → 退化为 seq 序号）
+    # 保留 action.called_at 原文，缺省时记录 Moss 接收时间。
     timestamp: str | None = None
+    gate_call_id: str = ""
+    gate_call_time_us: int = 0
+    input_fingerprint: str = ""
+    # None 表示只有回顾审计，空命中同样保存为已确认结果。
+    confirmed: dict | None = None
+    # None 是未增加此字段的旧快照，空串表示新的无时间戳记录。
+    legacy_fingerprint: str | None = None
+
+    @property
+    def order_key(self) -> tuple[int, str] | None:
+        if self.gate_call_id:
+            return self.gate_call_time_us, self.gate_call_id
+        return None
+
+
+class _ReviewRecord(NamedTuple):
+    session_id: str
+    instance_id: str
+    action: dict
+    gate_order: tuple[int, str] | None
+    legacy_fingerprint: str
 
 
 @dataclass
@@ -410,9 +502,8 @@ class StatefulChainTracker:
 
     @staticmethod
     def _now() -> str:
-        """本地接收时刻（实时路径无 called_at 时的兜底时间戳，ISO）。"""
-        import datetime
-        return datetime.datetime.now().isoformat(timespec="seconds")
+        """实时请求无 called_at 时，记录带时区的 UTC 接收时间。"""
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def __init__(self, agent_id: str = "", properties=None):
         self.agent_id = agent_id
@@ -422,20 +513,26 @@ class StatefulChainTracker:
         self._stages_patterns: dict[str, list[re.Pattern]] = {}
         self.from_rules()
 
-        # 时间线（全局序）
-        self.nodes: list[StateNode] = []
         self._session_ends: set = set()  # session 已结束（预留）
-        #: 已入时间线的动作指纹（**只有带 called_at 的动作才登记**）。
-        #:
-        #: 为什么需要（2026-11 实测）：`seed()` 原先无条件追加历史 —— 同一批
-        #: session seed 5 次，节点从 2 条变成 10 条。AgentGate 每 100 次
-        #: analyze 就触发一次 review 并 seed 全量历史，跑一小时能把 10 万节点
-        #: 上限打满，之后 `_append` 静默丢弃新节点 → **组合链检测彻底失效**。
-        #:
-        #: 只用 `(_agent, _type, _detail, called_at)` 做键；`called_at` 为空时
-        #: 不登记也不去重（同一 session 重复执行同一命令是合法行为，无时间戳
-        #: 无法区分，宁可重复也不能漏）。
+        # 旧快照里仍有效、但无法从旧节点重建的去重键。
+        self._unmapped_legacy_keys: tuple[str, ...] = ()
+        self.archived_through: tuple[int, str] | None = None
+        self._legacy_archive_boundary: tuple[str, tuple[str, ...]] | None = None
+        self.generation = 0
+        self._reset_timeline()
+
+    def _reset_timeline(self) -> None:
+        """初始化保留窗口，以及从窗口节点派生的索引和规则状态。"""
+        self.nodes: list[StateNode] = []
+        self.seq_next = 0
+        # 无编号动作只按显式 called_at 去重，同一会话可以合法地重复执行命令。
         self._seeded_keys: set[str] = set()
+        self._legacy_positions: dict[str, int] = {}
+        self._legacy_audit_candidates: dict[str, StateNode | None] | None = None
+        self._gate_nodes: dict[tuple[str, str], StateNode] = {}
+        self._last_gate_order: tuple[int, str] | None = None
+        self._gate_window_sorted = True
+        self._latest_history_priority: tuple[bool, str] = (False, "")
         #: 已打过的容量预警档位（0.7 / 0.85 / 0.95），防每请求刷屏
         self._capacity_warned: set[float] = set()
 
@@ -454,9 +551,6 @@ class StatefulChainTracker:
         self._taint_origin: dict[str, int] = {}
         # 生命周期：资源路径 -> 最近活跃 seq（"alive" 判定）
         self._alive_resources: dict[str, int] = {}
-
-        # 自上次 seed 后的节点数（供外部保存游标）
-        self.seq_next: int = 0
 
     # ---------------- 规则加载 ----------------
 
@@ -579,25 +673,159 @@ class StatefulChainTracker:
 
     # ---------------- 种子 / 增量 ----------------
 
-    def seed(self, sessions: list[dict] | None = None) -> int:
-        """全量/定期灌入历史 session（多 session 各动作追加到时间线）。返回节点数。
-
-        历史节点也要推进链指针 / 生命周期 / taint，否则后续 advance() 无法在
-        历史基础上补全链。历史阶段推进时若某条链被补全，属于历史事实，不阻断
-        当前动作（实时只在"当前动作补全链"时拦截）。
-        """
-        added = 0
-        for s in sessions or []:
-            sid = str(s.get("session_id", "s"))
-            for a in s.get("action_history", []) or []:
-                node = self._append(a, sid, instance_id=str(s.get("instance_id") or ""))
-                if node is None:
+    def _review_records(self, sessions: list[dict] | None) -> list[_ReviewRecord]:
+        """先做批内去重，再决定哪些无号记录进入本轮回顾窗口。"""
+        records: list[_ReviewRecord] = []
+        batch_keys: set[tuple[str, str] | str] = set()
+        for session in sessions or []:
+            sid = str(session.get("session_id", "s"))
+            instance = str(session.get("instance_id") or "")
+            for action in session.get("action_history") or []:
+                if not action.get("action_detail"):
                     continue
-                added += 1
-                self._record_lifecycle(node)
-                self._advance_taint(node)
-                self._advance_chains(node)  # 历史阶段推进指针（补全匹配属于历史，忽略）
-        return added
+                order = _gate_order(action)
+                fingerprint = self._legacy_key(action, sid) if order is None else ""
+                key = (sid, order[1]) if order is not None else fingerprint
+                if key in batch_keys:
+                    continue
+                if key:
+                    batch_keys.add(key)
+                records.append(_ReviewRecord(sid, instance, action, order, fingerprint))
+
+        if len(records) <= _MAX_NODES or all(record.gate_order is not None for record in records):
+            return records
+        if all("_sqlite_review_rank" in record.action for record in records):
+            # SQLite 排名从新到旧，反向排序恢复审计顺序。
+            records.sort(key=lambda record: record.action["_sqlite_review_rank"], reverse=True)
+            cutoff = len(records) - _MAX_NODES
+            return [record for i, record in enumerate(records) if i >= cutoff or record.gate_order is not None]
+
+        # 其他来源按时间选取最近记录，并保持它们在输入中的相对位置。
+        by_time = sorted(range(len(records)), key=lambda i: _history_priority(records[i].action.get("called_at")))
+        recent = set(by_time[-_MAX_NODES:])
+        return [record for i, record in enumerate(records) if i in recent or record.gate_order is not None]
+
+    def seed(self, sessions: list[dict] | None = None, *, archive_dir: Path | None = None) -> int:
+        """按调用编号补录暂定节点，并按实际添加的数量准备容量。"""
+        if _MAX_NODES <= 0:
+            return 0
+        additions: list[StateNode] = []
+        history: dict[str, list[tuple[StateNode | str, int]]] = {}
+        unnumbered_prefixes: dict[str, list[StateNode]] = {}
+        outside_window: set[int] = set()
+        records = self._review_records(sessions)
+        legacy_matches = self._match_legacy_audit(records)
+        for sid, instance, action, order, fingerprint in records:
+            rank = action.get("_sqlite_review_rank", 0)
+            rank = rank if type(rank) is int and rank > 0 else 0
+            if order is not None:
+                key = sid, order[1]
+                prefix = unnumbered_prefixes.pop(sid, ())
+                if retained := self._gate_nodes.get(key):
+                    history.setdefault(sid, []).append((retained, rank))
+                    continue
+                if self._is_archived(order):
+                    outside_window.update(id(node) for node in prefix)
+                    continue
+            else:
+                if fingerprint in self._seeded_keys:
+                    history.setdefault(sid, []).append((fingerprint, rank))
+                    continue
+                if retained := legacy_matches.get(fingerprint):
+                    history.setdefault(sid, []).append((retained, rank))
+                    continue
+                if self._is_legacy_archived(action.get("called_at"), fingerprint):
+                    continue
+            node = self._make_node(action, sid, bool(action.get("is_error")) if order else False, "",
+                                   instance, order=order, legacy_fingerprint=fingerprint)
+            additions.append(node)
+            history.setdefault(sid, []).append((node, rank))
+            if order is None:
+                unnumbered_prefixes.setdefault(sid, []).append(node)
+
+        # 锚点已归档时，它的旧记录前驱也处于边界之外，不能改为从尾部补回。
+        if outside_window:
+            additions = [node for node in additions if id(node) not in outside_window]
+        if not additions:
+            return 0
+
+        existing = len(self.nodes)
+        if archive_dir is None and existing >= _MAX_NODES:
+            return 0
+        if existing + len(additions) <= _MAX_NODES and self._review_follows_window(additions, history):
+            for node in self._merge_review(additions, history, include_retained=False):
+                self._step(self._add_node(node), evaluate=False)
+            return len(additions)
+        merged = self._merge_review(additions, history)
+        added_ids = {id(node) for node in additions}
+        if archive_dir is not None and len(merged) > _MAX_NODES:
+            keep = min(_MAX_NODES, _retain_nodes() + len(additions))
+            # 先看容量边界是否真的移出了既有节点。只有旧补录被裁掉时，保留整个现有窗口。
+            if self.nodes and any(node is self.nodes[0] for node in merged[-_MAX_NODES:]):
+                keep = _MAX_NODES
+            added = sum(id(node) in added_ids for node in merged[-keep:])
+            if added:
+                self._rotate_nodes(merged, archive_dir, keep)
+            return added
+
+        if len(merged) > _MAX_NODES:
+            free = _MAX_NODES - existing
+            candidates = [node for node in merged if id(node) in added_ids]
+            allowed = {id(node) for node in candidates[-free:]}
+            merged = [node for node in merged if id(node) not in added_ids or id(node) in allowed]
+        if existing and merged[existing - 1] is not self.nodes[-1]:
+            updated, _ = self._replay(merged)
+            self.__dict__.update(updated.__dict__)
+        else:
+            for node in merged[existing:]:
+                self._step(self._add_node(node), evaluate=False)
+        return len(merged) - existing
+
+    def _match_legacy_audit(self, records: list[_ReviewRecord]) -> dict[str, StateNode]:
+        """Allow a unique old SQLite row to match a unique full-time legacy node."""
+        if not self._legacy_positions or not any(
+            record.gate_order is None and record.legacy_fingerprint not in self._seeded_keys
+            and _is_sqlite_second(record.action.get("called_at")) for record in records
+        ):
+            return {}
+        if self._legacy_audit_candidates is None:
+            self._legacy_audit_candidates = {}
+            for node in self.nodes:
+                self._index_legacy_audit(node)
+
+        matches = {}
+        seen = {}
+        for record in records:
+            action = record.action
+            called_at = action.get("called_at")
+            if record.gate_order is not None or not _is_sqlite_second(called_at):
+                continue
+            key = _legacy_audit_fingerprint(record.session_id, action.get("action_type") or "",
+                                            action.get("action_detail") or "", called_at)
+            retained = self._legacy_audit_candidates.get(key)
+            if retained is not None:
+                fingerprint = record.legacy_fingerprint
+                if key in seen:
+                    matches.pop(seen[key], None)
+                else:
+                    seen[key] = fingerprint
+                    matches[fingerprint] = retained
+        return matches
+
+    def will_rewrite(self, a_next: dict, session_id: str) -> bool:
+        """Determine whether this request may need a structural state write."""
+        order = _gate_order(a_next)
+        if order is not None and a_next.get("_gate_delivery_uncertain") is True:
+            # These retries either reuse a confirmation or stop before mutation.
+            return False
+        if len(self.nodes) >= _MAX_NODES:
+            return True
+        if order is None:
+            return False
+        existing = self._gate_nodes.get((session_id, order[1]))
+        if existing is not None:
+            return existing.confirmed is None
+        return self._last_gate_order is not None and order < self._last_gate_order
 
     def advance(
         self,
@@ -608,6 +836,8 @@ class StatefulChainTracker:
         external_resources: dict | None = None,
         agent_id: str = "",
         instance_id: str = "",
+        *,
+        archive_dir: Path | None = None,
     ) -> "AdvanceResult":
         """增量推进：把当前动作追加到时间线 → 链指针推进 → 判定。
 
@@ -616,36 +846,279 @@ class StatefulChainTracker:
             用于"跨会话渲染前序链路径"。缺省则只针对时间线已累积的节点。
         is_error: 工具结果失败标志（AgentGate 的 is_error / 退出码非 0）。
         """
-        # 1. 新节点
-        seq = self.seq_next
-        node = self._append(
-            a_next, session_id, is_error=is_error,
-            agent_id=agent_id, instance_id=instance_id,
-        )
-        if node is None:
+        order = _gate_order(a_next)
+        existing = None
+        input_fingerprint = ""
+        if order is not None:
+            existing = self._gate_nodes.get((session_id, order[1]))
+            input_fingerprint = self._input_fingerprint(a_next, is_error, agent_id, instance_id, order)
+            if existing is not None:
+                if existing.confirmed is not None:
+                    if (existing.input_fingerprint == input_fingerprint
+                            and existing.order_key == order):
+                        return self._confirmed_result(existing)
+                    raise GateCallConflict("同一 Gate call_id 的内容或时间不一致")
+                if a_next.get("_gate_delivery_uncertain") is True:
+                    raise UnconfirmedGateRetry("不确定送达的调用缺少已确认的状态化判定")
+                if existing.order_key != order:
+                    raise GateCallConflict("同一 Gate call_id 的时间不一致")
+                if existing.input_fingerprint:
+                    raise GateCallConflict("同一 Gate call_id 的重复调用缺少送达不确定标记")
+                # Review seed 建的是未确认节点（无 input_fingerprint）：允许本次真实调用纠正它。
+            if a_next.get("_gate_delivery_uncertain") is True:
+                raise UnconfirmedGateRetry("不确定送达的调用缺少已确认的状态化判定")
+            if self._is_archived(order):
+                raise StatefulAnalysisUnavailable("调用早于当前链状态保留窗口")
+
+        # 带编号的空动作也保存确认结果，供响应丢失后的重试关联。
+        if order is None and not a_next.get("action_detail"):
             return AdvanceResult(seq=self.seq_next)
-        seq = self.seq_next  # 追加后的下一个序号（节点 seq 索引为 seq_next-1）
+        legacy_fingerprint = self._legacy_key(a_next, session_id) if order is None else ""
+        if legacy_fingerprint in self._seeded_keys:
+            return AdvanceResult(seq=self.seq_next)
 
-        # 2. 生命周期登记（在链判定前，让"创建失败/销毁"正确失效前序）
+        node = self._make_node(a_next, session_id, is_error, agent_id, instance_id,
+                               order=order, input_fingerprint=input_fingerprint,
+                               legacy_fingerprint=legacy_fingerprint)
+        at_capacity = len(self.nodes) >= _MAX_NODES
+        out_of_order = order is not None and self._last_gate_order is not None and order < self._last_gate_order
+        if existing is not None:
+            merged = [node if old is existing else old for old in self.nodes]
+        elif out_of_order:
+            index = next(i for i, old in enumerate(self.nodes)
+                         if old.order_key is not None and old.order_key > order)
+            merged = [*self.nodes[:index], node, *self.nodes[index:]]
+        else:
+            merged = None
+
+        if merged is not None:
+            needs_rotation = at_capacity and existing is None
+            if needs_rotation and (archive_dir is None
+                                   or not any(kept is node for kept in merged[-_retain_nodes():])):
+                raise StatefulAnalysisUnavailable("迟到调用无法在轮转后的窗口保留")
+            updated, result = self._replay(merged, confirm=node)
+            if needs_rotation:
+                updated._rotate_for_gate(archive_dir)
+            assert result is not None
+            self.__dict__.update(updated.__dict__)
+            return result
+
+        if at_capacity:
+            if order is not None:
+                if archive_dir is None:
+                    raise StatefulAnalysisUnavailable("链状态窗口已满")
+                self._rotate_for_gate(archive_dir)
+            elif archive_dir is not None:
+                try:
+                    self.rotate(archive_dir)
+                except OSError as exc:
+                    logger.error("链状态轮转失败: %s", exc)
+            if len(self.nodes) >= _MAX_NODES:
+                logger.warning("stateful 时间线达到兜底上限 %d（agent=%s），忽略本次新节点",
+                               _MAX_NODES, self.agent_id)
+                return AdvanceResult(seq=self.seq_next, skipped_for_capacity=True)
+        node = self._add_node(node)
+        matched, exfil = self._step(node, evaluate=True)
+        return self._result(node, matched, exfil)
+
+    def _rotate_for_gate(self, archive_dir: Path) -> None:
+        try:
+            self.rotate(archive_dir)
+        except OSError as exc:
+            raise StatefulAnalysisUnavailable("链状态归档失败") from exc
+        if len(self.nodes) >= _MAX_NODES:
+            raise StatefulAnalysisUnavailable("链状态无法释放节点容量")
+
+    def _is_archived(self, order: tuple[int, str]) -> bool:
+        return self.archived_through is not None and order <= self.archived_through
+
+    def _is_legacy_archived(self, called_at: object, fingerprint: str) -> bool:
+        if self._legacy_archive_boundary is None or not fingerprint:
+            return False
+        boundary, keys = self._legacy_archive_boundary
+        stamp = _history_time(called_at)
+        if stamp is None:
+            return False
+        if stamp < boundary:
+            return True
+        # An old cutoff truncated to microseconds can still identify an exact archived call.
+        i = bisect_left(keys, fingerprint)
+        return i < len(keys) and keys[i] == fingerprint
+
+    def _merge_review(
+        self, additions: list[StateNode], history: dict[str, list[tuple[StateNode | str, int]]],
+        *, include_retained: bool = True,
+    ) -> list[StateNode]:
+        """保留既有顺序及共享键，尽量遵守回顾中的同会话相邻关系。"""
+        retained = self.nodes if include_retained else ()
+        nodes = [*retained, *additions]
+        existing = len(retained)
+        positions = {id(node): i for i, node in enumerate(nodes)}
+        legacy_positions = self._legacy_positions if include_retained else {}
+
+        # 拓扑排序的每种关系最多为每个节点增加一条出边。旧窗口顺序不能改变，正常窗口
+        # 已按共享键排列。若旧快照的带号子序列曾经逆序，保留该窗口并按键排序新增调用。
+        edges: list[list[tuple[int, bool]]] = [[] for _ in nodes]
+        hard_in = [0] * len(nodes)
+        session_in = [0] * len(nodes)
+
+        def link(left: int, right: int, *, shared: bool) -> None:
+            edges[left].append((right, shared))
+            incoming = hard_in if shared else session_in
+            incoming[right] += 1
+
+        for i in range(1, existing):
+            link(i - 1, i, shared=True)
+        numbered = [(order, i) for i, node in enumerate(nodes) if (order := node.order_key) is not None]
+        if not self._gate_window_sorted and include_retained:
+            numbered = [(order, i) for order, i in numbered if i >= existing]
+        numbered.sort()
+        for (_, left), (_, right) in zip(numbered, numbered[1:]):
+            link(left, right, shared=True)
+
+        ranks = {}
+        for rows in history.values():
+            previous = None
+            seen = set()
+            for ref, rank in rows:
+                index = legacy_positions.get(ref) if isinstance(ref, str) else positions.get(id(ref))
+                if index is None or index in seen:
+                    continue
+                seen.add(index)
+                if rank:
+                    ranks[index] = rank
+                if previous is not None:
+                    link(previous, index, shared=False)
+                previous = index
+
+        # 审计时间排在最前，SQLite 同时刻的排名由新到旧，需反向比较；无时间沿用输入顺序。
+        priority = []
+        ready = []
+        hard_ready = []
+        for i, node in enumerate(nodes):
+            time_priority = self._node_history_priority(node) if i < existing else self._new_review_priority(node)
+            key = (*time_priority, -ranks.get(i, 0), i)
+            priority.append(key)
+            if not hard_in[i]:
+                heappush(hard_ready, key)
+                if not session_in[i]:
+                    heappush(ready, key)
+
+        # 会话次序与硬约束有环时，选择审计顺序最早的可用节点，放弃它尚未满足的会话前驱。
+        # 没有冲突时全部约束同时满足。最坏 O((保留节点 + 新节点) log(保留节点 + 新节点))。
+        emitted = set()
+        merged = []
+        while len(merged) < len(nodes):
+            while ready and ready[0][-1] in emitted:
+                heappop(ready)
+            while hard_ready and hard_ready[0][-1] in emitted:
+                heappop(hard_ready)
+            index = heappop(ready or hard_ready)[-1]
+            emitted.add(index)
+            merged.append(nodes[index])
+            for child, shared in edges[index]:
+                if shared:
+                    hard_in[child] -= 1
+                    if not hard_in[child]:
+                        heappush(hard_ready, priority[child])
+                else:
+                    session_in[child] -= 1
+                if child not in emitted and not hard_in[child] and not session_in[child]:
+                    heappush(ready, priority[child])
+        return merged
+
+    def _new_review_priority(self, node: StateNode) -> tuple[bool, str]:
+        if not node.gate_call_id and node.legacy_fingerprint == "":
+            return True, ""
+        return self._node_history_priority(node)
+
+    def _review_follows_window(
+        self, additions: list[StateNode], history: dict[str, list[tuple[StateNode | str, int]]],
+    ) -> bool:
+        if not self.nodes:
+            return True
+        latest = self._last_gate_order
+        if latest is not None and any((order := node.order_key) is not None and order < latest for node in additions):
+            return False
+
+        # 已保留锚点必须原序出现，且位于本会话新增节点之前。每段新增必须经由尾部
+        # 锚点或共享键排在窗口之后，或按时间/排名优先级不可能先于尚未输出的旧节点。
+        # 按回顾记录查索引，开销与本批大小相关，不扫描保留窗口。
+        tail = len(self.nodes) - 1
+        gate_tail = self._gate_window_sorted and self.nodes[tail].gate_call_id
+        addition_ids = {id(node) for node in additions}
+        for rows in history.values():
+            last_anchor = -1
+            seen = set()
+            saw_addition = False
+            follows_tail = False
+            for ref, rank in rows:
+                if not isinstance(ref, str) and id(ref) in addition_ids:
+                    if not follows_tail and not (gate_tail and ref.gate_call_id):
+                        priority = self._new_review_priority(ref)
+                        if priority < self._latest_history_priority or (rank and priority == self._latest_history_priority):
+                            return False
+                    saw_addition = follows_tail = True
+                    continue
+                if isinstance(ref, str):
+                    index = self._legacy_positions.get(ref)
+                    if index is None:
+                        continue
+                else:
+                    index = ref.seq
+                    if index > tail or self.nodes[index] is not ref:
+                        continue
+                if index in seen:
+                    continue
+                if saw_addition or index < last_anchor:
+                    return False
+                seen.add(index)
+                last_anchor = index
+                follows_tail = index == tail
+        return True
+
+    def _step(self, node: StateNode, *, evaluate: bool) -> tuple[ChainMatch | None, list]:
+        if node.gate_call_id and not node.action_detail:
+            return None, []
         self._record_lifecycle(node)
-
-        # 3. 链推进（当前动作参与；dead 资源不续链）
         matched = self._advance_chains(node)
-
-        # 4. 敏感数据 taint 增量（P2）
         self._advance_taint(node)
+        return matched, self._check_exfil_after_taint(node) if evaluate else []
 
-        # 5. 判定
-        #    若当前动作正好补全一条链 → matched（阻断级）
-        #    否则记录 pending 前序（供外部持久化/预判）
-        exfil_violations = self._check_exfil_after_taint(node)
-        return AdvanceResult(
-            seq=seq,
-            node=node,
-            matched=matched,
-            pending_prefixes=self.pending_prefixes,
-            exfil=exfil_violations,
-        )
+    def _result(self, node: StateNode, matched: ChainMatch | None, exfil: list) -> AdvanceResult:
+        if node.input_fingerprint:
+            # 保存原始证据，轮转重编号后也不再根据 seq 反查历史节点。
+            node = replace(node, confirmed={"matched": asdict(matched) if matched else None,
+                                            "exfil": deepcopy(exfil)})
+            self.nodes[node.seq] = node
+            self._gate_nodes[node.session_id, node.gate_call_id] = node
+        return AdvanceResult(seq=node.seq + 1, node=node, matched=matched,
+                             pending_prefixes=self.pending_prefixes, exfil=exfil)
+
+    def _confirmed_result(self, node: StateNode) -> AdvanceResult:
+        result = deepcopy(node.confirmed)
+        match = result["matched"]
+        if match:
+            match["stages"] = tuple(match["stages"])
+            match["path"] = [tuple(item) for item in match["path"]]
+        return AdvanceResult(seq=node.seq + 1, node=node, matched=ChainMatch(**match) if match else None,
+                             pending_prefixes=self.pending_prefixes, exfil=result["exfil"])
+
+    def _replay(
+        self, nodes: list[StateNode], *, confirm: StateNode | None = None,
+    ) -> tuple[StatefulChainTracker, AdvanceResult | None]:
+        # 重放在独立状态上进行，完成前不修改可见的时间线。
+        updated = copy(self)
+        updated._reset_timeline()
+        updated._seeded_keys.update(updated._unmapped_legacy_keys)
+        updated.generation = self.generation + 1
+        result = None
+        for old in nodes:
+            node = updated._add_node(old, warn_capacity=False)
+            matched, exfil = updated._step(node, evaluate=old is confirm)
+            if old is confirm:
+                result = updated._result(node, matched, exfil)
+        return updated, result
 
     def _archive_nodes(self, nodes: list[StateNode], archive_dir: Path | None = None) -> Path:
         """把旧节点写 gzip JSONL；写成功后才允许调用方删除/重置。"""
@@ -665,11 +1138,10 @@ class StatefulChainTracker:
         path = archive_dir / f"chain-nodes-{self.agent_id or 'default'}-{stamp}-{int(time.time()*1000)%1000:03d}.jsonl.gz"
         payload = "\n".join(
             json.dumps(
-                {k: (list(v) if k == "resources" or k == "instances" else v)
-                 for k, v in n.__dict__.items()},
+                node.__dict__ | {"seq": seq, "resources": list(node.resources), "instances": list(node.instances)},
                 ensure_ascii=False,
             )
-            for n in nodes
+            for seq, node in enumerate(nodes)
         ) + "\n"
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
@@ -692,79 +1164,73 @@ class StatefulChainTracker:
         返回 ``(归档条数, 归档文件)``。归档失败抛异常，调用方不得丢状态。
         """
         keep = _retain_nodes() if retain is None else max(1, min(retain, _MAX_NODES - 1))
-        if len(self.nodes) <= keep:
-            return 0, ""
-        old = self.nodes[:-keep]
-        kept = self.nodes[-keep:]
-        path = self._archive_nodes(old, archive_dir)
+        return self._rotate_nodes(self.nodes, archive_dir, keep)
 
-        # 重建为一棵新的时间线：保留节点重新编号，链指针/taint 从头 replay。
-        self.nodes = []
-        self._ptr = {}
-        self._tainted = set()
-        self._tainted_resources = set()
-        self._taint_parent = {}
-        self._taint_edge_label = {}
-        self._taint_origin = {}
-        self._alive_resources = {}
-        self._seeded_keys = set()
-        self._capacity_warned = set()
-        self.seq_next = 0
-        for n in kept:
-            action = {
-                "action_type": n.action_type,
-                "action_detail": n.action_detail,
-                "called_at": n.timestamp or "",
-                "agent_id": n.agent_id,
-                "instance_id": n.instance_id,
-            }
-            node = self._append(
-                action, n.session_id, is_error=n.is_error,
-                agent_id=n.agent_id, instance_id=n.instance_id,
-            )
-            if node is not None:
-                self._record_lifecycle(node)
-                self._advance_taint(node)
-                self._advance_chains(node)
+    def _rotate_nodes(
+        self, nodes: list[StateNode], archive_dir: Path | None, keep: int,
+    ) -> tuple[int, str]:
+        if len(nodes) <= keep:
+            return 0, ""
+        old = nodes[:-keep]
+        updated, _ = self._replay(nodes[-keep:])
+        archived = max((node.order_key for node in old if node.order_key), default=None)
+        if archived is not None and (self.archived_through is None or archived > self.archived_through):
+            updated.archived_through = archived
+        updated._update_legacy_archive_boundary(old)
+        path = self._archive_nodes(old, archive_dir)
+        self.__dict__.update(updated.__dict__)
         return len(old), str(path)
 
-    def _append(
+    def _update_legacy_archive_boundary(self, archived: list[StateNode]) -> None:
+        previous_time, previous_keys = self._legacy_archive_boundary or ("", ())
+        dated = [(stamp, self._legacy_node_key(node)) for node in archived
+                 if (stamp := self._legacy_history_time(node)) is not None]
+        latest = max(previous_time, max((stamp for stamp, _ in dated), default=""))
+        if not latest:
+            return
+        earliest_retained = min(
+            (stamp for node in self.nodes if (stamp := self._node_history_time(node)) is not None),
+            default=latest,
+        )
+        # Never split the retained window by its timestamps, even if an archived action arrived late.
+        boundary = min(latest, earliest_retained)
+        keys = {key for stamp, key in dated if stamp == boundary}
+        if boundary.startswith(previous_time[:_MICROSECOND_TIMESTAMP_LENGTH]):
+            keys.update(previous_keys)
+        self._legacy_archive_boundary = boundary, tuple(sorted(keys))
+
+    @staticmethod
+    def _legacy_key(action: dict, session_id: str) -> str:
+        called_at = action.get("called_at")
+        if called_at:
+            return _fingerprint(session_id, action.get("action_type") or "",
+                                action.get("action_detail") or "", called_at)
+        return ""
+
+    @staticmethod
+    def _input_fingerprint(action: dict, is_error: bool, agent_id: str, instance_id: str,
+                           order: tuple[int, str]) -> str:
+        values = (action.get("action_type") or "", action.get("action_detail") or "",
+                  action.get("called_at") or "", action.get("agent_id") or agent_id,
+                  action.get("instance_id") or instance_id, is_error, order[0])
+        return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+
+    def _make_node(
         self,
         action: dict,
         session_id: str,
-        is_error: bool = False,
-        agent_id: str = "",
-        instance_id: str = "",
-    ) -> StateNode | None:
-        """构造并追加一个节点，返回节点；空 detail 跳过。
-
-        时间线上限保护：防无限增长（高频大项目下平凡动作会持续产生节点）。
-        超限后**忽略新节点**（warn 一次）并返回 None，由外部低频 /api/v1/review
-        重建来恢复（seq==index 不变式不被破坏，链指针/taint 索引安全）。
-
-        幂等（2026-11）：带 ``called_at`` 的动作按「session + 类型 + 详情 +
-        时间」去重。review 会周期性重复 seed 全量历史，不去重就会成倍膨胀。
-        """
+        is_error: bool,
+        agent_id: str,
+        instance_id: str,
+        *,
+        order: tuple[int, str] | None,
+        input_fingerprint: str = "",
+        legacy_fingerprint: str = "",
+    ) -> StateNode:
         ad = str(action.get("action_detail", "") or "")
         at = str(action.get("action_type", "") or "")
-        if not ad:
-            return None
-        _called_at = str(action.get("called_at", "") or "")
-        _dedupe_key = ""
-        if _called_at:
-            _dedupe_key = _fingerprint(session_id, at, ad, _called_at)
-            if _dedupe_key in self._seeded_keys:
-                return None  # 这条动作已经在时间线里了
-        # 触顶保护（硬上限）
-        if len(self.nodes) >= _MAX_NODES:
-            logger.warning(
-                "stateful 时间线达到兜底上限 %d（agent=%s），自动轮转未生效，忽略本次新节点；"
-                "请检查链状态归档目录权限/磁盘空间，不要用 state reset 清空历史",
-                _MAX_NODES, self.agent_id,
-            )
-            return None
-        stage = _mark_stage(ad, self._stages_patterns)
-        node = StateNode(
+        stage = _mark_stage(ad, self._stages_patterns) if ad else ""
+        return StateNode(
             seq=self.seq_next,
             session_id=session_id,
             action_type=at,
@@ -776,13 +1242,85 @@ class StatefulChainTracker:
             agent_id=str(action.get("agent_id") or agent_id or ""),
             instance_id=str(action.get("instance_id") or instance_id or ""),
             lifecycle=self._lifecycle_for(ad, stage, is_error),
-            # 调用方带 called_at → 用真实发生时间；否则用本地接收时刻（实时路径）
-            timestamp=(str(action.get("called_at", "")) or self._now()),
+            timestamp=str(action.get("called_at") or "") or self._now(),
+            gate_call_id=order[1] if order else "",
+            gate_call_time_us=order[0] if order else 0,
+            input_fingerprint=input_fingerprint,
+            legacy_fingerprint=legacy_fingerprint,
         )
+
+    @classmethod
+    def _node_history_time(cls, node: StateNode) -> str | None:
+        order = node.order_key
+        if order is None:
+            return _history_time(node.timestamp, local_naive=node.legacy_fingerprint == "")
+        # 旧 Moss 生成的接收时刻固定精度且无偏移；有编号时用原请求指纹区分空 called_at。
+        stamp = node.timestamp
+        local_naive = False
+        if isinstance(stamp, str) and len(stamp) == 19 and stamp[10] == "T" and node.input_fingerprint:
+            without_called_at = cls._input_fingerprint(
+                {"action_type": node.action_type, "action_detail": node.action_detail},
+                node.is_error, node.agent_id, node.instance_id, order,
+            )
+            local_naive = without_called_at == node.input_fingerprint
+        return _history_time(stamp, local_naive=local_naive)
+
+    @classmethod
+    def _node_history_priority(cls, node: StateNode) -> tuple[bool, str]:
+        stamp = cls._node_history_time(node)
+        return stamp is None, stamp or ""
+
+    def _index_node(self, node: StateNode) -> None:
+        priority = self._node_history_priority(node)
+        self._latest_history_priority = max(self._latest_history_priority, priority)
+        unknown, stamp = priority
+        if self._legacy_archive_boundary is not None and not unknown and stamp < self._legacy_archive_boundary[0]:
+            # A late numbered node can move the start of the retained interval backwards.
+            self._legacy_archive_boundary = stamp, ()
+        order = node.order_key
+        if order is not None:
+            self._gate_nodes[node.session_id, node.gate_call_id] = node
+            if self._last_gate_order is None or order > self._last_gate_order:
+                self._last_gate_order = order
+            elif order < self._last_gate_order:
+                self._gate_window_sorted = False
+            return
+        legacy = self._legacy_node_key(node)
+        if legacy:
+            self._seeded_keys.add(legacy)
+            self._legacy_positions.setdefault(legacy, node.seq)
+            if self._legacy_audit_candidates is not None:
+                self._index_legacy_audit(node)
+
+    def _index_legacy_audit(self, node: StateNode) -> None:
+        candidates = self._legacy_audit_candidates
+        if candidates is None or node.gate_call_id or not self._legacy_node_key(node):
+            return
+        if stamp := node.timestamp:
+            key = _legacy_audit_fingerprint(node.session_id, node.action_type, node.action_detail, stamp)
+            # Ambiguity includes already-retained SQLite rows as well as other live calls.
+            candidates[key] = None if key in candidates or _is_sqlite_second(stamp) else node
+
+    @staticmethod
+    def _legacy_node_key(node: StateNode) -> str:
+        if node.legacy_fingerprint is None and node.timestamp:
+            return _fingerprint(node.session_id, node.action_type, node.action_detail, node.timestamp)
+        return node.legacy_fingerprint or ""
+
+    @staticmethod
+    def _legacy_history_time(node: StateNode) -> str | None:
+        if not node.gate_call_id and node.legacy_fingerprint:
+            return _history_time(node.timestamp)
+        return None
+
+    def _add_node(self, node: StateNode, *, warn_capacity: bool = True) -> StateNode:
+        if node.seq != self.seq_next:
+            node = replace(node, seq=self.seq_next)
         self.nodes.append(node)
         self.seq_next += 1
-        if _dedupe_key:
-            self._seeded_keys.add(_dedupe_key)
+        self._index_node(node)
+        if not warn_capacity:
+            return node
         # 容量分级预警（2026-11）：在**触顶之前**提醒，给运维留处理时间。
         # 放在 append 之后，这样「第 70 条落库时正好打 70% 的提醒」。
         _n = len(self.nodes)
@@ -1043,124 +1581,166 @@ class StatefulChainTracker:
         现在：锁内只取引用（浅拷贝），真正的逐节点构建和 json.dumps 在锁外做
         （``finalize_snapshot``）。节点对象创建后不再被修改，浅拷贝安全。
         """
-        return {
+        parts = {
             "agent_id": self.agent_id,
             "nodes": list(self.nodes),
+            "generation": self.generation,
+            "archived_through": self.archived_through,
             "ptrs": dict(self._ptr),
             "tainted": sorted(self._tainted),
-            # taint 传播路径（前端攻击链图）；taint_edge_label 是 tuple key，
-            # 不入快照（重启后可从 parent + 资源交集重建，结构不受影响）。
             "taint_parent": {str(k): v for k, v in self._taint_parent.items()},
             "taint_origin": dict(self._taint_origin),
+            "taint_edge_labels": [[src, dst, label] for (src, dst), label in self._taint_edge_label.items()],
             "alive": {k: v for k, v in self._alive_resources.items()},
             "seq_next": self.seq_next,
-            # seed 去重指纹：不持久化的话，重启后 review 会再把全量历史追加一遍。
-            # 锁内只做 set 浅拷贝（10 万条约 2ms），排序在 finalize 里做。
-            "seeded_keys": set(self._seeded_keys),
         }
+        if self._unmapped_legacy_keys:
+            parts["unmapped_legacy_keys"] = self._unmapped_legacy_keys
+        if self._legacy_archive_boundary is not None:
+            parts["legacy_archive_boundary"] = self._legacy_archive_boundary
+        return parts
 
     @staticmethod
     def finalize_snapshot(parts: dict) -> dict:
         """**锁外调用**：把浅拷贝展开成可 JSON 化的完整快照。"""
         return {
-            "agent_id": parts["agent_id"],
+            **parts,
             "nodes": [
                 {k: (v if k != "resources" else list(v)) for k, v in n.__dict__.items()}
                 for n in parts["nodes"]
             ],
-            "ptrs": parts["ptrs"],
-            "tainted": parts["tainted"],
-            "taint_parent": parts["taint_parent"],
-            "taint_origin": parts["taint_origin"],
-            "alive": parts["alive"],
-            "seq_next": parts["seq_next"],
-            "seeded_keys": sorted(parts.get("seeded_keys") or ()),
         }
 
     def restore(self, snapshot: dict | None) -> None:
-        """从快照恢复（幂等，供服务重启后重建）。
-
-        ⚠️ 幂等要求先清空（2026-11）：原先直接 ``nodes.append`` —— 同一个
-        tracker 被 restore 两次，节点就翻倍。这与 ``seed`` 重复追加是同一类坑，
-        只是当前调用路径恰好每次 new 新对象才没暴露。防御性清空。
-        """
+        """从快照幂等恢复当前保留窗口。"""
         if not snapshot:
             return
-        self.nodes = []
-        self._ptr = {}
-        self._tainted = set()
-        self._taint_parent = {}
-        self._taint_origin = {}
-        self._taint_edge_label = {}
-        self._tainted_resources = set()
-        self._alive_resources = {}
-        self._seeded_keys = set()
-        self._capacity_warned = set()
-        self.seq_next = 0
-        self.agent_id = str(snapshot.get("agent_id", self.agent_id))
-        for raw in snapshot.get("nodes", []) or []:
-            n = StateNode(
-                seq=int(raw.get("seq", 0)),
-                session_id=str(raw.get("session_id", "")),
-                action_type=str(raw.get("action_type", "")),
-                action_detail=str(raw.get("action_detail", "")),
-                stage=str(raw.get("stage", "")),
-                resources=tuple(raw.get("resources") or ()),
-                instances=tuple(raw.get("instances") or ()),  # 旧快照无此字段 → 空
-                is_error=bool(raw.get("is_error", False)),
-                agent_id=str(raw.get("agent_id", "")),  # 旧快照无此字段 → 空
-                instance_id=str(raw.get("instance_id", "")),  # 旧快照无此字段 → 空
-                lifecycle=str(raw.get("lifecycle", "")),
-                timestamp=(raw.get("timestamp") or None),  # 旧快照无此字段 → None
-            )
-            self.nodes.append(n)
-        self.seq_next = int(snapshot.get("seq_next", len(self.nodes)))
-        self._ptr = {str(k): int(v) for k, v in (snapshot.get("ptrs") or {}).items()}
-        self._tainted = set(int(i) for i in (snapshot.get("tainted") or []))
-        self._taint_parent = {
+        updated = copy(self)
+        updated._unmapped_legacy_keys = ()
+        updated._reset_timeline()
+        updated.agent_id = str(snapshot.get("agent_id", self.agent_id))
+        updated.restore_incremental(snapshot, snapshot.get("nodes") or [])
+        self.__dict__.update(updated.__dict__)
+
+    @staticmethod
+    def _node_from_snapshot(raw: dict, legacy_keys: set[str] | None, migrated_keys: set[str]) -> StateNode:
+        session_id = str(raw.get("session_id", ""))
+        action_type = str(raw.get("action_type", ""))
+        action_detail = str(raw.get("action_detail", ""))
+        timestamp = raw.get("timestamp") or None
+        gate_call_id = str(raw.get("gate_call_id") or "")
+        legacy_fingerprint = raw.get("legacy_fingerprint")
+        if legacy_fingerprint is None and legacy_keys is not None:
+            # Old nodes stored receipt time too. Only the old key list can identify a real call time.
+            legacy_fingerprint = ""
+            if timestamp and not gate_call_id:
+                candidate = _fingerprint(session_id, action_type, action_detail, timestamp)
+                if candidate in legacy_keys:
+                    legacy_fingerprint = candidate
+                elif len(timestamp) != 19 or timestamp[10] != "T":
+                    # The old local receipt clock used a naive T-separated timestamp.
+                    audit_key = _legacy_audit_fingerprint(session_id, action_type, action_detail, timestamp)
+                    if audit_key in legacy_keys:
+                        legacy_fingerprint = candidate
+                        migrated_keys.add(audit_key)
+        return StateNode(
+            seq=int(raw.get("seq", 0)),
+            session_id=session_id,
+            action_type=action_type,
+            action_detail=action_detail,
+            stage=str(raw.get("stage", "")),
+            resources=tuple(raw.get("resources") or ()),
+            instances=tuple(raw.get("instances") or ()),
+            is_error=bool(raw.get("is_error", False)),
+            agent_id=str(raw.get("agent_id", "")),
+            instance_id=str(raw.get("instance_id", "")),
+            lifecycle=str(raw.get("lifecycle", "")),
+            timestamp=timestamp,
+            gate_call_id=gate_call_id,
+            gate_call_time_us=int(raw.get("gate_call_time_us") or 0),
+            input_fingerprint=str(raw.get("input_fingerprint") or ""),
+            confirmed=raw.get("confirmed"),
+            legacy_fingerprint=legacy_fingerprint,
+        )
+
+    def restore_incremental(self, snapshot: dict, rows: list[dict]) -> None:
+        """Apply a validated same-generation SQLite increment and its metadata."""
+        legacy_keys = None
+        if "seeded_keys" in snapshot:
+            legacy_keys = {str(key) for key in (snapshot["seeded_keys"] or ())}
+        migrated_keys: set[str] = set()
+        appended = [self._node_from_snapshot(raw, legacy_keys, migrated_keys) for raw in rows]
+        previous_size = len(self.nodes)
+        next_seq = previous_size + len(appended)
+        if any(node.seq != index for index, node in enumerate(appended, previous_size)):
+            raise ValueError("状态节点序号不连续")
+        if int(snapshot.get("seq_next", next_seq)) != next_seq:
+            raise ValueError("状态元数据与节点游标不一致")
+        keys = set()
+        for node in appended:
+            if node.gate_call_id:
+                key = node.session_id, node.gate_call_id
+                if key in keys or key in self._gate_nodes:
+                    raise ValueError("状态窗口存在重复的 Gate 调用编号")
+                keys.add(key)
+
+        def get_node(seq: int) -> StateNode:
+            if not 0 <= seq < next_seq:
+                raise ValueError("状态节点引用超出保留窗口")
+            if seq < previous_size:
+                return self.nodes[seq]
+            return appended[seq - previous_size]
+
+        generation = int(snapshot.get("generation", 0))
+        archived = snapshot.get("archived_through")
+        archived_through = (int(archived[0]), str(archived[1])) if archived else None
+        ptr = {str(k): int(v) for k, v in (snapshot.get("ptrs") or {}).items()}
+        tainted = set(int(i) for i in (snapshot.get("tainted") or []))
+        taint_parent = {
             int(k): (int(v) if v is not None else None)
             for k, v in (snapshot.get("taint_parent") or {}).items()
         }
-        self._taint_origin = {
+        taint_origin = {
             str(k): int(v) for k, v in (snapshot.get("taint_origin") or {}).items()
         }
-        self._taint_edge_label = {}  # 旧快照无此字段：边标签缺失，图结构不受影响
-        # seed 去重指纹（旧快照没有这个字段：从已有节点重建，保证升级后
-        # 第一次 review 不会把历史再追加一遍）。
-        # 无论是否有旧 keys，都用新指纹补一遍当前节点：指纹算法从 2026-11 起
-        # 对时间/别名/截断做归一，旧 keys 可能对不上当前节点的规范键。
-        _keys = snapshot.get("seeded_keys")
-        self._seeded_keys = {str(k) for k in _keys} if _keys else set()
-        for n in self.nodes:
-            if getattr(n, "timestamp", ""):
-                self._seeded_keys.add(
-                    _fingerprint(n.session_id, n.action_type, n.action_detail, n.timestamp)
-                )
-        # 重建 taint 资源反索引：由染毒节点的 resources 推导（并集 all）
-        self._tainted_resources = set()
-        for i in self._tainted:
-            if 0 <= i < len(self.nodes):
-                self._tainted_resources.update(self.nodes[i].resources)
-        if self._tainted and not self._taint_parent:
-            self._rebuild_taint_parent()
-        if not self._taint_origin:
-            for i in sorted(self._tainted):
-                for r in self.nodes[i].resources:
-                    self._taint_origin.setdefault(r, i)
-        self._alive_resources = {
+        edge_labels = {(int(src), int(dst)): str(label)
+                       for src, dst, label in (snapshot.get("taint_edge_labels") or ())}
+        alive_resources = {
             str(k): int(v) for k, v in (snapshot.get("alive") or {}).items()
         }
+        tainted_resources = {resource for seq in tainted for resource in get_node(seq).resources}
+        if tainted and (not taint_parent or not taint_origin):
+            latest: dict[str, int] = {}
+            for seq in sorted(tainted):
+                resources = get_node(seq).resources
+                taint_parent.setdefault(seq, max((latest[r] for r in resources if r in latest), default=None))
+                for resource in resources:
+                    taint_origin.setdefault(resource, seq)
+                    latest[resource] = seq
 
-    def _rebuild_taint_parent(self) -> None:
-        """旧快照无 parent 信息时，按 seq 顺序找最近的资源相交染毒前驱。"""
-        for i in sorted(self._tainted):
-            n = self.nodes[i]
-            parent = None
-            for j in range(i - 1, -1, -1):
-                if j in self._tainted and (self.nodes[j].resources & n.resources):
-                    parent = j
-                    break
-            self._taint_parent[i] = parent
+        self.nodes.extend(appended)
+        for node in appended:
+            self._index_node(node)
+        unmapped_keys = set(snapshot.get("unmapped_legacy_keys") or ())
+        if legacy_keys is not None:
+            unmapped_keys.update(legacy_keys.difference(self._seeded_keys, migrated_keys))
+            unmapped_keys.update(self._unmapped_legacy_keys)
+        if unmapped_keys:
+            self._unmapped_legacy_keys = tuple(sorted(unmapped_keys))
+            self._seeded_keys.update(self._unmapped_legacy_keys)
+        self.seq_next = next_seq
+        self.generation = generation
+        self.archived_through = archived_through
+        # The older archived_legacy_through value used retained timestamps and could hide valid history.
+        legacy_boundary = snapshot.get("legacy_archive_boundary")
+        self._legacy_archive_boundary = (legacy_boundary[0], tuple(legacy_boundary[1])) if legacy_boundary else None
+        self._ptr = ptr
+        self._tainted = tainted
+        self._taint_parent = taint_parent
+        self._taint_origin = taint_origin
+        self._taint_edge_label = edge_labels
+        self._alive_resources = alive_resources
+        self._tainted_resources = tainted_resources
 
 
 @dataclass
@@ -1172,6 +1752,7 @@ class AdvanceResult:
     matched: ChainMatch | None = None
     pending_prefixes: list = field(default_factory=list)
     exfil: list = field(default_factory=list)
+    skipped_for_capacity: bool = False
 
     @property
     def should_block(self) -> bool:

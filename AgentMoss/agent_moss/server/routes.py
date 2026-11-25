@@ -17,6 +17,7 @@ from ..infra.script_diagnostics import ScriptDiagnostics
 from .models import (
     AnalyzeRequest,
     AnalyzeResponse,
+    GateAnalyzeResponse,
     HealthResponse,
     ErrorResponse,
     ReviewRequest,
@@ -49,7 +50,9 @@ def _merge_stateful_denial(result: dict, finding: dict) -> tuple[dict, bool]:
     outcome = result.get("l3_outcome")
     stateful_wins = (
         result["decision"] != "Deny"
-        or result.get("source") in ("llm_failure_fallback", "llm_circuit_open", "llm_failure_with_violation")
+        or result.get("source") in (
+            "llm_failure_fallback", "llm_circuit_open", "llm_failure_with_violation", "llm_budget_skipped",
+        )
         or RISK_PRIORITY.get(level, 0) > RISK_PRIORITY.get(result.get("risk_level"), -1)
     )
     merged = dict(result)
@@ -74,6 +77,35 @@ def _merge_stateful_denial(result: dict, finding: dict) -> tuple[dict, bool]:
         finding.get("property_id", "?"), level, merged.get("risk_level"),
     )
     return merged, stateful_wins
+
+
+def _stateful_unconfirmed(result: dict, degraded: list[str]) -> dict:
+    """Gate 调用无法确认是否已入链：只在这种情况下拒绝，避免重复记账。"""
+    reason = "AgentMoss 无法确认本次 Gate 调用是否已入链"
+    degraded.append(f"【已降级】{reason}；本次按拒绝处理，避免重复入链。")
+    if result["decision"] == "Deny":
+        return result
+    result = {**result, "policy": ""}
+    result.update(
+        decision="Deny", reason=reason, risk_type="service_unavailable", risk_level="high",
+        ask_recommended=True,
+        ask_reason=(
+            "无法确认本次 Gate 调用是否已入链；"
+            "这是“没查完”而非“确认有风险”，建议向用户确认是否继续。"
+        ),
+    )
+    if result.get("l3_outcome") == "fail_open":
+        result["l3_outcome"] = "failed_but_blocked"
+    return result
+
+
+def _stateful_degraded(result: dict, degraded: list[str], detail: str) -> dict:
+    """状态层不可用是能力降级，不改变 L1/L2/L3 的判定。"""
+    degraded.append(
+        f"【已降级】有状态分析不可用（{detail}）："
+        "本次动作未参与 L2.2 组合链检测；L1/L2.1/L3 判定不受影响。"
+    )
+    return result
 
 
 def _public_formal_result(result: dict, finding: dict | None, instance_id: str, session_id: str,
@@ -161,10 +193,7 @@ class _AgentState:
             source_agent=source_agent,
             instance_id=instance_id,
         )
-        # 容量状态（2026-11）：调用方据此在响应里标注"这次判定缺了什么/快缺什么"。
-        # 分两档语义：
-        #   - usage_pct >= 90：**预警**（还没降级，只是提醒尽快处理）
-        #   - at_capacity：**已降级**（新动作不入链，L2.2 没覆盖本次动作）
+        # 容量使用率用于预警，本次是否因容量跳过由增量结果报告。
         _at_capacity = False
         _node_count = 0
         _usage_pct = 0.0
@@ -193,17 +222,12 @@ class _AgentState:
                 for p in r.pending_prefixes
             ],
             "should_block": r.should_block,
+            "skipped_for_capacity": r.skipped_for_capacity,
             "at_capacity": _at_capacity,
             "node_count": _node_count,
             "usage_pct": _usage_pct,
             "capacity": _max_nodes,
         }
-
-    def seed_full(self, sessions: list[dict]) -> int:
-        t = self.store.load_or_new(self.agent_id)
-        added = t.seed(sessions)
-        self.store.save(t)
-        return added
 
 
 # ==================== Brain API ====================
@@ -503,11 +527,19 @@ async def health(request: Request):
     )
 
 
-@router.post("/analyze", response_model=AnalyzeResponse)
+@router.post("/analyze", response_model=AnalyzeResponse | GateAnalyzeResponse)
 async def analyze(req: AnalyzeRequest, request: Request, response: Response):
     try:
         from ..engine.analyzer import analyze as run_analysis
         from ..profiles import get_profile
+
+        gate_call_id = getattr(request.state, "gate_call_id", None)
+        if gate_call_id is not None and (
+            req.gate_call_id != gate_call_id
+            or not sp.valid_gate_call_time(req.gate_call_time_us)
+            or type(req.gate_delivery_uncertain) is not bool
+        ):
+            raise HTTPException(status_code=422, detail="AgentGate 专用请求元数据无效")
 
         # Step 1: 取字段（原始可观测格式已在 **模型校验前** 适配成标准格式 —— 见
         # models.py::AnalyzeRequest._adapt_observable_format。这里不再分支：
@@ -756,8 +788,15 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 instance_id=instance_id,  # 来源实例（仅展示层脱敏）
                 _req_id=_req_id,   # 仅在 executor 线程里恢复 contextvars 用
                 script_diagnostics=diagnostics,
+                include_l3_diagnostics=True,
             ),
         )
+        # 后续归并可能替换 reason/source。此处只记录确实来自 L3 熔断的原因。
+        circuit_reason = ""
+        if result.get("source") == "llm_circuit_open":
+            circuit_reason = str(result.get("_l3_circuit_reason") or result.get("reason") or "")
+            if circuit_reason.startswith("LLM 分析失败"):
+                circuit_reason = circuit_reason.partition(": ")[2] or circuit_reason
         # ========== L2.2 stateful incremental（有状态实时判定，可选启用） ==========
         # 调用方在 metadata.stateful_incremental=true 时启用：把当前动作推入该 agent
         # 的持久化时间线，若当前动作补全某组合链（跨 session/长时距前序已就位）→ Deny。
@@ -765,20 +804,25 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
         metadata = req.metadata or {}
         finding = None
         if str(metadata.get("stateful_incremental", "") or "").lower() in ("1", "true", "yes", "on"):
+            from ..engine.formal_engine.stateful import StatefulAnalysisUnavailable, UnconfirmedGateRetry
+
+            state_action = a_next
+            if gate_call_id is not None:
+                state_action = {
+                    **a_next,
+                    "_gate_call_id": gate_call_id,
+                    "_gate_call_time_us": req.gate_call_time_us,
+                    "_gate_delivery_uncertain": req.gate_delivery_uncertain,
+                }
             try:
-                # ⚠️ 必须在 executor 里跑（2026-11 修）：apply_incremental 是
-                # 「SQLite 全量读 → json.loads → 重建所有节点 → 追加 → 全量
-                # json.dumps → 全量写回」，O(节点数)。跑在事件循环上时，时间线
-                # 一长就每次占住几十到几百毫秒，console / 其它 analyze 全排不上。
-                # 放线程池后事件循环不受影响（线程内串行由 ChainStateStore 的
-                # RLock + 单连接保证）。
+                # 链状态更新涉及同步 SQLite 操作，在线程池中执行。
                 _inc_state = _chain_state_for_agent(agent_id)
 
                 def _apply_incremental():
                     nonlocal queued_ms
                     queued_ms += (time.monotonic() - incremental_submitted) * 1000
                     return _inc_state.apply_incremental(
-                        a_next,
+                        state_action,
                         session_id=session_id,
                         is_error=bool(metadata.get("is_error", False)),
                         # 来源：真实 agent（不是桶 key），仅用于链路径取证/展示
@@ -788,11 +832,9 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
 
                 incremental_submitted = time.monotonic()
                 inc = await loop.run_in_executor(None, _apply_incremental)
-                # 能力状态两档（2026-11，用户要求「先预警、后降级」）：
-                #   >=90%  → 预警：还能完整判定，但很快会触顶，请尽快处理
-                #   >=100% → 降级：本次动作确实没参与 L2.2，如实告知
+                # 时间线接近容量上限时预警，只有本次动作被跳过才报告降级。
                 _pct = inc.get("usage_pct") or 0
-                if inc.get("at_capacity"):
+                if inc.get("skipped_for_capacity"):
                     _degraded.append(
                         f"【已降级】链状态时间线已满（{inc.get('node_count')}/"
                         f"{inc.get('capacity')} 节点）：**本次动作未参与 L2.2 组合链检测**"
@@ -806,9 +848,8 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 elif _pct >= 90:
                     _degraded.append(
                         f"【预警】链状态时间线已用 {_pct}%（{inc.get('node_count')}/"
-                        f"{inc.get('capacity')} 节点）：**本次判定完整**，但即将触顶。"
-                        f"触顶后 L2.2 组合链检测（跨会话组合攻击）将失效，"
-                        "L1/L2.1/L3 不受影响。"
+                        f"{inc.get('capacity')} 节点）：**本次判定完整**。"
+                        "后续写入可能触发归档。归档失败时，L2.2 组合链检测可能受影响。"
                         "处理（任选其一）：① 备份后重置：agent-moss state backup <备份目录> "
                         "→ 停服 → agent-moss state reset --yes → 起服；"
                         "② 临时扩容：调大 AGENT_MOSS_CHAIN_MAX_NODES 后重启。"
@@ -817,10 +858,18 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 if inc["should_block"]:
                     candidates = ([inc["matched"]] if inc["matched"] else []) + inc["exfil"]
                     finding = max(candidates, key=lambda v: RISK_PRIORITY.get(v.get("risk_level", "high"), 0))
+            except UnconfirmedGateRetry as e:
+                logger.warning("Gate 调用状态无法确认: %s", e)
+                result = _stateful_unconfirmed(result, _degraded)
+            except StatefulAnalysisUnavailable as e:
+                logger.warning("stateful incremental 状态不可用（降级，不阻断）: %s", e)
+                _stateful_degraded(result, _degraded, "链状态存储不可用或本次动作超出保留窗口")
             except Exception as e:
-                logger.warning("stateful incremental 异常（不阻断响应）: %s", e)
+                logger.warning("stateful incremental 异常（降级，不阻断）: %s", e)
+                _stateful_degraded(result, _degraded, "内部异常")
 
         result = _public_formal_result(result, finding, instance_id, session_id, session_history)
+        _degraded.extend(result.get("degraded") or [])
         duration_ms = (time.monotonic() - start) * 1000
 
         # ========== L3 结局 → 能力说明（2026-11）==========
@@ -846,15 +895,13 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
                 "拦截原因是「分析不可用」而非「确认有风险」。修复模型服务后重试可能放行。"
             )
         elif _l3_outcome == "circuit_open":
-            # 前序层或有状态规则确认风险时，reason 描述该风险，不是熔断原因。
-            circuit_detail = f"（{_l3_fail_msg}）" if result.get("source") == "llm_circuit_open" else ""
+            circuit_detail = f"（{circuit_reason[:160]}）" if circuit_reason else ""
             _degraded.append(
-                f"【已降级】LLM 熔断器打开，本次**未发起 L3 请求**{circuit_detail}："
-                "L1/L2 正常，语义层缺失。检查模型服务与网络，冷却后自动试探恢复。"
+                f"【已降级】LLM 熔断器打开，本次**未发起 L3 请求**{circuit_detail}。"
+                "检查模型服务与网络，冷却后自动试探恢复。"
             )
-        # 注意：``skipped``（L3 未启用）**不**写 degraded —— 那是部署方的既有
-        # 选择，每条响应都提示会变成噪音；需要时读 l3_outcome 字段即可。
-        # ``not_reached`` / ``ok`` / ``failed_but_blocked`` 同理，判定本身完整。
+        # 主动禁用 L3 的 skipped 没有降级说明。预算跳过的说明已从引擎合入。
+        # 状态不可用导致的 ``failed_but_blocked`` 提示已在合并判定时添加。
 
         # 追踪日志：最终判定 + 总耗时
         try:
@@ -882,7 +929,7 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
             _decision = str(result.get("decision", "") or "")
             _risk = str(result.get("risk_level", "") or "")
             # l3_outcome 标签（2026-11）：Grafana 可直接拉「降级放行占比」
-            # = rate(analyze_total{l3_outcome=~"fail_open|circuit_open"}) / rate(analyze_total)
+            # = rate(analyze_total{decision="Allow",l3_outcome=~"fail_open|circuit_open"}) / rate(analyze_total)
             _m.ANALYZE_TOTAL.inc(
                 decision=_decision,
                 risk_level=_risk,
@@ -955,7 +1002,8 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
         except Exception:
             pass
 
-        analysis_response = AnalyzeResponse(
+        response_model = GateAnalyzeResponse if gate_call_id is not None else AnalyzeResponse
+        analysis_response = response_model(
             decision=result["decision"],
             reason=result["reason"],
             risk_level=result.get("risk_level", "low"),
@@ -969,6 +1017,9 @@ async def analyze(req: AnalyzeRequest, request: Request, response: Response):
             violation_graph=result.get("violation_graph"),
             degraded=_degraded,
             l3_outcome=str(result.get("l3_outcome", "") or ""),
+            ask_recommended=bool(result.get("ask_recommended", False)),
+            ask_reason=str(result.get("ask_reason") or ""),
+            **({"gate_call_id": gate_call_id} if gate_call_id is not None else {}),
         )
         if diagnostics and await diagnostics.write_with_timeout(analysis_response.decision):
             response.headers["X-AgentMoss-Diagnostic-Id"] = diagnostics.request_id
@@ -1059,9 +1110,33 @@ def _trim_review_sessions(sessions: list[dict], limit: int) -> tuple[list[dict],
     return out, total - limit
 
 
-def _load_review_sessions(req: ReviewRequest) -> list[dict]:
+_REVIEW_HISTORY_KEYS = frozenset((
+    "_gate_call_id", "_gate_call_time_us", "_gate_delivery_uncertain", "_gate_protocol_rejected",
+    "_sqlite_review_rank",
+))
+
+
+def _inline_review_sessions(sessions: list[dict]) -> list[dict]:
+    """Remove server-owned review metadata from caller-supplied history."""
+    cleaned = []
+    for session in sessions:
+        history = session.get("action_history")
+        if isinstance(history, list):
+            session = {
+                **session,
+                "action_history": [
+                    {key: value for key, value in action.items() if key not in _REVIEW_HISTORY_KEYS}
+                    if isinstance(action, dict) else action
+                    for action in history
+                ],
+            }
+        cleaned.append(session)
+    return cleaned
+
+
+def _load_review_sessions(req: ReviewRequest, *, limit: int = 0) -> list[dict]:
     if not req.db_path:
-        return req.sessions
+        return _inline_review_sessions(req.sessions)
 
     from .agent_gate_reader import load_agent_gate_sessions
 
@@ -1075,7 +1150,7 @@ def _load_review_sessions(req: ReviewRequest) -> list[dict]:
             ),
         )
     try:
-        sessions = load_agent_gate_sessions(source_path)
+        sessions = load_agent_gate_sessions(source_path, limit=limit, include_review_rank=True)
     except FileNotFoundError:
         sessions = None
     if sessions:
@@ -1083,7 +1158,7 @@ def _load_review_sessions(req: ReviewRequest) -> list[dict]:
 
     # A missing or empty source can only use actions supplied in this request.
     backup = []
-    for session in req.sessions:
+    for session in _inline_review_sessions(req.sessions):
         history = session.get("action_history")
         if not isinstance(history, list):
             continue
@@ -1105,7 +1180,7 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
     """在线程池中选择历史来源、更新链状态并验证。"""
     try:
         from ..engine.formal_engine import FormalEngine
-        from ..engine.formal_engine.chain_state import get_chain_state_store
+        from ..engine.formal_engine import chain_state
 
         agent_id = req.agent_id or "default"
         _review_t0 = time.monotonic()
@@ -1121,10 +1196,12 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
             )
         except Exception:  # noqa: BLE001
             pass
-        sessions = _load_review_sessions(req)
-        store = get_chain_state_store()
+        # Limit the SQLite query before grouping. Read existing in-process
+        # capacity without creating a state store for invalid/missing sources.
+        _seed_limit = _review_seed_limit(chain_state._store)  # noqa: SLF001
+        sessions = _load_review_sessions(req, limit=_seed_limit)
+        store = chain_state.get_chain_state_store()
         # 限制单次 seed 的规模（可配置 + 按时间线水位自适应收紧）
-        _seed_limit = _review_seed_limit(store)
         sessions, _dropped = _trim_review_sessions(sessions, _seed_limit)
         if _dropped:
             logger.warning(
@@ -1136,7 +1213,15 @@ def _run_review(req: ReviewRequest) -> ReviewResponse:
         # 否则"谁触发 review 谁才有跨 agent 历史"的不一致会一直存在。
         # ⚠️ seed 必须持锁（seed_and_save）：它修改的是内存缓存里的同一个 tracker，
         # 并发的 apply_action 正在持锁推进同一条时间线，锁外 seed 会丢节点。
-        added, tracker = store.seed_and_save(sp.chain_bucket(agent_id), sessions)
+        state_sessions = []
+        for session in sessions:
+            history = [
+                action for action in session.get("action_history") or []
+                if not (isinstance(action, dict) and action.get("_gate_protocol_rejected") is True)
+            ]
+            if history:
+                state_sessions.append({**session, "action_history": history})
+        added, tracker = store.seed_and_save(sp.chain_bucket(agent_id), state_sessions)
         try:
             from ..infra.trace_log import trace_summary as _ts
 

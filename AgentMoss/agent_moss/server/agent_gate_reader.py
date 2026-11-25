@@ -21,9 +21,11 @@ import os
 import sqlite3
 import stat
 from pathlib import Path
-from typing import Any
+
+from ..infra import security_policy as sp
 
 DEFAULT_SQLITE = os.path.expanduser("~/.local/share/agent_gate/agent_gate_ts.db")
+SQLITE_HISTORY_LIMIT = 100000
 
 
 def discover_agent_gate_db() -> str:
@@ -42,14 +44,44 @@ def _normalize_action(row: dict) -> dict:
     return act
 
 
+def _gate_review_metadata(raw: object) -> dict:
+    if not isinstance(raw, str) or not (
+        '"_gate_call_id"' in raw or '"_gate_protocol_rejected"' in raw
+    ):
+        return {}
+    try:
+        audit = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(audit, dict):
+        return {}
+    if audit.get("_gate_protocol_rejected") is True:
+        return {"_gate_protocol_rejected": True}
+    call_id = audit.get("_gate_call_id")
+    call_time = audit.get("_gate_call_time_us")
+    if sp.valid_gate_call_id(call_id) and sp.valid_gate_call_time(call_time):
+        return {"_gate_call_id": call_id, "_gate_call_time_us": call_time}
+    return {}
+
+
 def read_agent_gate_sessions(
     db_path: str = "",
     agent_id: str = "",
-    limit: int = 100000,
+    limit: int = SQLITE_HISTORY_LIMIT,
+    *,
+    include_review_rank: bool = False,
 ) -> list[dict]:
-    """从 AgentGate SQLite 读全量 tool_calls → sessions 结构。"""
-    path = Path(db_path or discover_agent_gate_db()).expanduser().absolute()
-    sessions: dict[str, list[dict]] = {}
+    """Select the latest valid SQLite rows globally before grouping by session."""
+    # Explicit review paths were resolved and authorized by the route. Use the
+    # same path at open time instead of resolving it again after authorization.
+    path = (
+        Path(db_path).expanduser().absolute()
+        if db_path
+        else Path(os.path.realpath(os.path.expanduser(discover_agent_gate_db())))
+    )
+    configured = os.environ.get("AGENT_GATE_DB", "").strip()
+    trusted = bool(configured) and path == Path(os.path.realpath(os.path.expanduser(configured)))
+    limit = min(limit, SQLITE_HISTORY_LIMIT) if limit > 0 else SQLITE_HISTORY_LIMIT
     try:
         conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=10)
     except sqlite3.OperationalError:
@@ -64,15 +96,33 @@ def read_agent_gate_sessions(
         raise
     try:
         conn.row_factory = sqlite3.Row
+        with_metadata = trusted and any(
+            row["name"] == "moss_response"
+            for row in conn.execute("PRAGMA table_info(tool_calls)")
+        )
+        audit_column = ", call.moss_response" if with_metadata else ""
         rows = conn.execute(
-            """
-            SELECT session_id, action_type, tool_name, action_detail, command, called_at
-            FROM tool_calls
-            ORDER BY called_at, id
-            LIMIT ?
+            f"""
+            WITH recent AS (
+                SELECT rowid AS call_rowid, called_at, id
+                FROM tool_calls
+                WHERE COALESCE(session_id, '') <> ''
+                  AND (COALESCE(action_detail, '') <> '' OR COALESCE(command, '') <> '')
+                ORDER BY called_at DESC, id DESC, rowid DESC
+                LIMIT ?
+            ), ranked AS (
+                SELECT call_rowid,
+                       ROW_NUMBER() OVER (ORDER BY called_at DESC, id DESC, call_rowid DESC) AS review_rank
+                FROM recent
+            )
+            SELECT ranked.review_rank, call.session_id, call.action_type, call.tool_name,
+                   call.action_detail, call.command, call.called_at{audit_column}
+            FROM ranked
+            CROSS JOIN tool_calls AS call ON call.rowid = ranked.call_rowid
             """,
             (limit,),
-        ).fetchall()
+        )
+        actions_by_rank: list[tuple[int, str, dict]] = []
         for r in rows:
             sid = str(r["session_id"] or "")
             if not sid:
@@ -80,9 +130,19 @@ def read_agent_gate_sessions(
             act = _normalize_action(dict(r))
             if not act["action_detail"]:
                 continue
-            sessions.setdefault(sid, []).append(act)
+            if with_metadata:
+                act.update(_gate_review_metadata(r["moss_response"]))
+            rank = r["review_rank"]
+            if include_review_rank:
+                act["_sqlite_review_rank"] = rank
+            # Rank narrow row identifiers in SQLite, then order only normalized
+            # actions here so large response JSON never enters either sort.
+            actions_by_rank.append((rank, sid, act))
     finally:
         conn.close()
+    sessions: dict[str, list[dict]] = {}
+    for _, sid, act in sorted(actions_by_rank, reverse=True):
+        sessions.setdefault(sid, []).append(act)
     return [
         {"session_id": sid, "action_history": actions}
         for sid, actions in sessions.items()
@@ -125,11 +185,13 @@ def read_agent_gate_json_sessions(dir_path: str = "", limit: int = 100000) -> li
     ]
 
 
-def load_agent_gate_sessions(db_path: str = "") -> list[dict]:
+def load_agent_gate_sessions(
+    db_path: str = "", *, limit: int = SQLITE_HISTORY_LIMIT, include_review_rank: bool = False,
+) -> list[dict]:
     """显式路径只读该来源；无参调用保留 SQLite、默认 JSON 的发现顺序。"""
     if db_path:
         path = Path(db_path).expanduser()
         if stat.S_ISDIR(path.stat().st_mode):
             return read_agent_gate_json_sessions(dir_path=str(path))
-        return read_agent_gate_sessions(db_path=str(path))
-    return read_agent_gate_sessions() or read_agent_gate_json_sessions()
+        return read_agent_gate_sessions(db_path=str(path), limit=limit, include_review_rank=include_review_rank)
+    return read_agent_gate_sessions(limit=limit, include_review_rank=include_review_rank) or read_agent_gate_json_sessions()

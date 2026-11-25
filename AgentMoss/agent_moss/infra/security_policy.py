@@ -11,6 +11,7 @@
 | ``AGENT_MOSS_AUTH_TOKEN`` | 空 | 全局 Bearer token；**空 = 不鉴权（保持现状）** |
 | ``AGENT_MOSS_AUTH_TOKEN_FILE`` | 空 | 同上，从文件读（便于 0600 保存） |
 | ``AGENT_MOSS_AGENT_TOKENS`` | 空 | 每个 agent 一个 token，``agent=tok,agent2=tok2``；启用后 ``agent_id`` 必须与 token 匹配 |
+| ``AGENT_MOSS_GATE_AUTH_TOKEN`` | 空 | AgentGate 专用凭据，仅用于 analyze 和 review |
 | ``AGENT_MOSS_LOG_ROOTS`` | ``$HOME,/tmp,$TMPDIR`` | ``metadata.llm_log_path`` 允许落盘的根目录（root 下取真实用户家目录；多用户机器不猜，需显式配置） |
 | ``AGENT_MOSS_REVIEW_PATHS`` | AgentGate 标准目录 | ``/api/v1/review`` 的 ``db_path`` 允许读取的根目录 |
 | ``AGENT_MOSS_CHAIN_DETAIL`` | ``redacted`` | 组合链返回：``redacted`` 隐藏跨会话命令原文，``full`` 全量 |
@@ -30,6 +31,7 @@ import hmac
 import logging
 import ipaddress
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -41,6 +43,21 @@ logger = logging.getLogger("agent_moss.security")
 # ==================== 基础读取 ====================
 
 TRUTHY = ("1", "true", "yes", "on")
+GATE_PRINCIPAL = "gate"
+GATE_IDENTITY_HEADER = "X-AgentGate-Require-Identity"
+GATE_CALL_ID_HEADER = "X-AgentGate-Call-Id"
+GATE_RATE_LIMIT_HEADER = "X-AgentGate-Rate-Limited-Call-Id"
+GATE_BUSY_HEADER = "X-AgentGate-Busy-Call-Id"
+_GATE_AUTH_PATHS = frozenset(("/api/v1/analyze", "/api/v1/review"))
+
+
+def valid_gate_call_id(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def valid_gate_call_time(value: object) -> bool:
+    # UTC microseconds are represented as an unsigned integer on the wire.
+    return type(value) is int and 0 < value <= 2**63 - 1
 
 
 def _env(name: str, default: str = "") -> str:
@@ -269,6 +286,8 @@ def _resolve_auth() -> tuple[str, dict[str, str], str]:
     """
     global _TOKEN_CACHE
     raw_agents = _env("AGENT_MOSS_AGENT_TOKENS")
+    gate_token = _env("AGENT_MOSS_GATE_AUTH_TOKEN")
+    console_token = _env("AGENT_MOSS_CONSOLE_TOKEN")
     key = (
         auth_mode(),
         _env("AGENT_MOSS_AUTH_TOKEN"),
@@ -276,6 +295,8 @@ def _resolve_auth() -> tuple[str, dict[str, str], str]:
         _env("AGENT_MOSS_AUTH_TOKEN_FD"),
         raw_agents,
         _env("AGENT_MOSS_DATA_DIR"),
+        gate_token,
+        console_token,
     )
     if _TOKEN_CACHE is not None and _TOKEN_CACHE[0] == key:
         return _TOKEN_CACHE[1], _TOKEN_CACHE[2], _TOKEN_CACHE[3]
@@ -309,6 +330,11 @@ def _resolve_auth() -> tuple[str, dict[str, str], str]:
             logger.error("鉴权配置错误，拒绝启动: %s", error)
 
     agents = _parse_agent_tokens(raw_agents)
+    if not error and auth_mode() == AUTH_MODE_OFF and gate_token:
+        error = "AGENT_MOSS_GATE_AUTH_TOKEN 不能在 AGENT_MOSS_AUTH_MODE=off 时启用"
+    elif not error and gate_token:
+        if gate_token == token or gate_token == console_token or gate_token in agents.values():
+            error = "AGENT_MOSS_GATE_AUTH_TOKEN 必须与全局、Agent 和 Console 凭据不同"
     _TOKEN_CACHE = (key, token, agents, error)
     return token, agents, error
 
@@ -345,7 +371,7 @@ def auth_enabled() -> bool:
     tok, agents, err = _resolve_auth()
     # 配置错误也属于「鉴权开启」：启动会被 fail_fast 拒绝，运行期请求也会
     # fail-closed；不能因为 token 为空就误判成「无需鉴权」。
-    return bool(err) or bool(tok or agents)
+    return bool(err or tok or agents or _env("AGENT_MOSS_GATE_AUTH_TOKEN"))
 
 
 def _bearer(headers) -> str:
@@ -371,17 +397,21 @@ def check_request_auth(headers, path: str) -> tuple[bool, str]:
     """
     if auth_mode() == AUTH_MODE_OFF:
         return True, ""
-    is_health = path.rstrip("/") in HEALTH_PATHS
+    path = path.rstrip("/")
+    is_health = path in HEALTH_PATHS
     global_tok, agents, err = _resolve_auth()
+    gate_tok = _env("AGENT_MOSS_GATE_AUTH_TOKEN")
     if err:
         return (True, "") if is_health else (False, "")
-    if not global_tok and not agents:
+    if not global_tok and not agents and not gate_tok:
         return True, ""
     if is_health:
         return True, ""
     tok = _bearer(headers)
     if not tok:
         return False, ""
+    if gate_tok and path in _GATE_AUTH_PATHS and _const_eq(tok, gate_tok):
+        return True, GATE_PRINCIPAL
     # Console 自己的 token 继续有效（存量部署已经配了 AGENT_MOSS_CONSOLE_TOKEN 的不用改）
     if path.startswith("/console/api"):
         console_tok = _env("AGENT_MOSS_CONSOLE_TOKEN")
@@ -503,6 +533,17 @@ def path_within(path: str, roots: list[Path]) -> bool:
 
 # ==================== 私有文件 / 目录 ====================
 
+def _current_uid() -> int | None:
+    """当前进程 uid；Windows 没有 ``os.getuid()``，返回 None。
+
+    Windows 的文件权限是 ACL，``st_uid`` 与 POSIX 属主语义不对应；此时跳过
+    属主校验，只做 chmod（尽力而为），否则鉴权 token 初始化会直接 AttributeError
+    → 服务拒绝启动（2026-11 Windows 实测）。
+    """
+    getter = getattr(os, "getuid", None)
+    return getter() if getter is not None else None
+
+
 def ensure_private_dir(path: Path) -> bool:
     """确保目录存在且为 0700；失败返回 False（调用方决定是否回退）。"""
     try:
@@ -510,7 +551,8 @@ def ensure_private_dir(path: Path) -> bool:
         if path.is_symlink():
             return False
         st = path.stat()
-        if st.st_uid != os.getuid():
+        uid = _current_uid()
+        if uid is not None and st.st_uid != uid:
             return False
         os.chmod(path, stat.S_IRWXU)
         return True

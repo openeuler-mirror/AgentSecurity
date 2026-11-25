@@ -161,12 +161,31 @@ def check_mc_rules(graph: MultiSessionGraph) -> list[PropertyViolation]:
             continue  # 仅评估 LTL 型且未被 console 关闭的规则
             continue
         if _rule_violates(rule, trace, witness_mode):
+            path_nodes = [n for n in nodes if label_event(n.action_detail)][-3:]
+            path = [(n.session_id, n.seq, n.action_detail[:60]) for n in path_nodes]
+            graph_nodes = [{
+                "session_id": n.session_id,
+                "seq": n.seq,
+                "stage": n.stage,
+                "action_detail": n.action_detail,
+                "resources": sorted(n.resources),
+                "instance_id": n.instance_id,
+            } for n in path_nodes]
             violations.append(PropertyViolation(
                 property_id=rule.get("id", "mc-ltl"),
                 reason=rule.get("reason", "L2.2 模型检测规则命中"),
                 risk_level=rule.get("risk_level", "high"),
-                path=[(n.session_id, n.seq, n.action_detail[:60])
-                      for n in nodes if label_event(n.action_detail)][-3:],
+                path=path,
+                graph={
+                    "property_id": rule.get("id", "mc-ltl"),
+                    "property_short": "P6",
+                    "property_name": "LTL 模型检测",
+                    "nodes": graph_nodes,
+                    "edges": [
+                        {"from": i - 1, "to": i, "type": "next"}
+                        for i in range(1, len(graph_nodes))
+                    ],
+                },
             ))
             if witness_mode:
                 return violations  # 实时判定命中即停（与 L2 短路语义一致）

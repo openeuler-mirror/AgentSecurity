@@ -518,6 +518,16 @@ def get_llm_fail_mode() -> str:
     return "fail_closed" if val.lower() == "fail_closed" else "fail_open"
 
 
+def get_deploy_role() -> str:
+    """部署角色：standalone（默认）/ host（agent 本体）/ sandbox（沙箱）。
+
+    host 侧读不到沙箱脚本内容，脚本内容分析交给 sandbox；host 不因
+    “脚本读不到”做内容判断。
+    """
+    val = str(get_agent_moss_setting("AGENT_MOSS_DEPLOY_ROLE", "standalone")).strip().lower()
+    return val if val in ("host", "sandbox") else "standalone"
+
+
 def get_llm_timeout() -> int:
     """获取 LLM 超时时间（秒）"""
     timeout = get_agent_moss_setting("AGENT_MOSS_LLM_TIMEOUT", 300)
@@ -565,12 +575,47 @@ def get_llm_prompt_history_max_turns() -> int:
 
 
 def get_llm_max_prompt_tokens() -> int:
-    """L3 输入 prompt 的 token 总预算（0 = 不限，默认 0）。
+    """L3 输入 prompt 的估算 token 预算（0 = 不启用）。"""
+    return max(0, _get_int_setting("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", 0))
 
-    超限时按「历史条数减半 → 单条截断长度减半 → 截断当前动作详情」逐级压缩，
-    保证 prompt 不会因为超长 tool call 无限膨胀。
-    """
-    return _get_int_setting("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", 0)
+
+@dataclass(frozen=True)
+class LLMPromptBudgetConfig:
+    max_prompt_tokens: int
+    mode: str
+    history_max_items: int
+    action_detail_max_chars: int
+    prompt_history_max_turns: int
+    prompt_turn_max_chars: int
+    prompt_turn_min_chars: int
+    prompt_recent_turns_full: int
+    prompt_session_max_chars: int
+    prompt_session_min_chars: int
+    script_analysis_max_chars: int
+
+
+def get_llm_prompt_budget_config() -> LLMPromptBudgetConfig:
+    """读取本次 L3 渲染使用的字段上限和预算配置。"""
+    def positive(suffix: str, default: int) -> int:
+        value = _get_int_setting(f"AGENT_MOSS_LLM_{suffix}", default)
+        return value if value > 0 else default
+
+    mode = get_agent_moss_setting("AGENT_MOSS_LLM_BUDGET_MODE", "hard").strip().lower()
+    max_turn_chars = positive("PROMPT_TURN_MAX_CHARS", 500)
+    max_session_chars = positive("PROMPT_SESSION_MAX_CHARS", 8000)
+    return LLMPromptBudgetConfig(
+        max_prompt_tokens=get_llm_max_prompt_tokens(),
+        mode="soft" if mode == "soft" else "hard",
+        history_max_items=max(0, get_llm_history_max_items()),
+        action_detail_max_chars=max(0, get_llm_action_detail_max_chars()),
+        prompt_history_max_turns=get_llm_prompt_history_max_turns(),
+        prompt_turn_max_chars=max_turn_chars,
+        prompt_turn_min_chars=min(max_turn_chars, positive("PROMPT_TURN_MIN_CHARS", 100)),
+        prompt_recent_turns_full=max(0, _get_int_setting("AGENT_MOSS_LLM_PROMPT_RECENT_TURNS_FULL", 3)),
+        prompt_session_max_chars=max_session_chars,
+        prompt_session_min_chars=min(max_session_chars, positive("PROMPT_SESSION_MIN_CHARS", 200)),
+        script_analysis_max_chars=positive("SCRIPT_ANALYSIS_MAX_CHARS", 4000),
+    )
 
 
 def get_log_path() -> str:

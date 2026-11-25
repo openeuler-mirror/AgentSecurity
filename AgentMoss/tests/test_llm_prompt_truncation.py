@@ -62,10 +62,13 @@ def test_format_prompt_history_keeps_latest_turns(turn_count, first_turn):
 
     result = LLMAnalyzer._format_prompt_history(history)
 
-    assert result.splitlines() == [
+    expected = [
         f"  第{turn}轮用户意图: 意图 {turn}"
         for turn in range(first_turn, turn_count + 1)
     ]
+    if first_turn > 1:
+        expected.insert(0, f"（因历史窗口上限省略 {turn_count - 20} 轮更早历史意图）")
+    assert result.splitlines() == expected
 
 
 def test_format_prompt_history_skips_empty_turns_within_window():
@@ -74,7 +77,10 @@ def test_format_prompt_history_skips_empty_turns_within_window():
 
     result = LLMAnalyzer._format_prompt_history(history)
 
-    assert result.splitlines() == [f"  第{turn}轮用户意图: 近期意图" for turn in range(3, 22)]
+    assert result.splitlines() == [
+        "（因历史窗口上限省略 1 轮更早历史意图）",
+        *[f"  第{turn}轮用户意图: 近期意图" for turn in range(3, 22)],
+    ]
 
 
 @pytest.mark.parametrize(("input_chars", "kept_chars"), [(499, 499), (500, 500), (501, 500)])
@@ -86,7 +92,8 @@ def test_format_prompt_history_limits_text_and_only_shows_action_types(input_cha
 
     result = LLMAnalyzer._format_prompt_history(history)
 
-    assert result == f"  第1轮用户意图: {'甲' * kept_chars}  → 动作: file_read"
+    marker = "（本段因长度上限已截断）" if input_chars > kept_chars else ""
+    assert result == f"  第1轮用户意图: {'甲' * kept_chars}{marker}  → 动作: file_read"
 
 
 @pytest.mark.parametrize("history", [None, [], [{"text": " \t "}]])
@@ -101,6 +108,7 @@ def test_format_prompt_history_respects_configured_turns(monkeypatch):
     result = LLMAnalyzer._format_prompt_history(history)
 
     assert result.splitlines() == [
+        "（因历史窗口上限省略 1 轮更早历史意图）",
         "  第2轮用户意图: 意图 2",
         "  第3轮用户意图: 意图 3",
     ]

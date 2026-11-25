@@ -21,7 +21,7 @@ from ..types import ScriptChainAnalysisResult, ScriptNode
 from .backends.base import LanguageBackend
 from .backends.python_backend import PythonBackend
 from .backends.shell_backend import ShellBackend
-from .ir import scan_fingerprint
+from .ir import WorkingDirectory, scan_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +71,11 @@ DIAGNOSTIC_NODE_LIMIT = 8
 DIAGNOSTIC_CHILD_LIMIT = 4
 
 
-def _resolve_path(p: str, base_dir: str) -> str:
+def _resolve_path(p: str, base_dir: Path) -> str:
     """解析脚本路径：~展开 + 相对按 base_dir。"""
     path = Path(p).expanduser()
     if not path.is_absolute():
-        path = Path(base_dir) / path
+        path = base_dir / path
     return str(path.resolve())
 
 
@@ -125,18 +125,10 @@ class RecursiveTracker:
 
     def track(self, entry_path: str, entry_args: list[str] | None, cwd: str = "") -> ScriptChainAnalysisResult:
         """从入口脚本开始追踪调用链。"""
-        base_dir = cwd or str(Path.cwd())
-        resolved = _resolve_path(entry_path, base_dir)
+        process_cwd = Path(cwd or ".").absolute()
+        resolved = _resolve_path(entry_path, process_cwd)
         self._result.entry_path = resolved
-
-        # ⚠️ Path.exists() 在父目录不可读时会抛 PermissionError（Python 3.12），
-        # 不设防就会一路上抛 → 外层 fail-closed → 判定随文件系统状态变化。
-        # 这里只是在选 base_dir，探测失败退回传入的 base_dir 即可。
-        try:
-            _entry_exists = Path(resolved).exists()
-        except OSError:
-            _entry_exists = False
-        self._visit_script(resolved, depth=0, base_dir=str(Path(resolved).parent if _entry_exists else base_dir), args=entry_args)
+        self._visit_script(resolved, depth=0, process_cwd=process_cwd, args=entry_args)
 
         # 汇总
         result = self._result
@@ -180,7 +172,7 @@ class RecursiveTracker:
         self,
         path_str: str,
         depth: int,
-        base_dir: str,
+        process_cwd: Path | None,
         args: list[str] | None,
     ) -> None:
         """递归处理单个脚本节点及其子脚本。"""
@@ -274,6 +266,8 @@ class RecursiveTracker:
         self._result.total_nodes = len(self._result.nodes)
 
         if details is not None:
+            from ...infra.script_diagnostics import capture_reachable_content
+
             scan_bytes, scan_sha256 = scan_fingerprint(ir.reachable_content)
             details.update(
                 language=ir.language,
@@ -285,6 +279,7 @@ class RecursiveTracker:
                 child_arg_counts=[len(call.args) for call in ir.calls[:DIAGNOSTIC_CHILD_LIMIT]],
                 inline_l1_scan=False,
             )
+            capture_reachable_content(details, content, ir.reachable_content)
 
         # Inline L1（内联扫描 reachable_content）
         if self._scanner is not None and ir.reachable_content:
@@ -312,12 +307,27 @@ class RecursiveTracker:
         # 子脚本调用（IR.calls，含参数）→ 递归
         child_paths: list[str] = []
         for call in ir.calls:
-            child = _resolve_path(call.path, str(Path(path_str).parent))
+            child_cwd = process_cwd
+            path_base = Path(path_str).parent
+            if call.launch_cwd is WorkingDirectory.UNKNOWN:
+                child_cwd = None
+            elif call.launch_cwd is not None:
+                directory = Path(call.launch_cwd)
+                if directory.is_absolute():
+                    child_cwd = directory
+                elif process_cwd is not None:
+                    child_cwd = process_cwd / directory
+            if call.launch_cwd is not None:
+                if child_cwd is not None:
+                    path_base = child_cwd
+                elif not Path(call.path).expanduser().is_absolute():
+                    continue
+            child = _resolve_path(call.path, path_base)
             child_paths.append(child)
             self._visit_script(
                 path_str=child,
                 depth=depth + 1,
-                base_dir=str(Path(child).parent),
+                process_cwd=child_cwd,
                 args=call.args,  # 关键：子脚本用自己的调用参数
             )
             if self._stop_on_critical and self._result.has_critical:

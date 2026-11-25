@@ -11,6 +11,7 @@
 累积节点、violations 带 path），引擎语义一致性由 `formal-stateful.test.ts` 覆盖。
 """
 
+import hashlib
 import sys
 from threading import Event
 from types import SimpleNamespace
@@ -127,6 +128,8 @@ def test_analyze_stateful_incremental_denies_when_chain_completes():
         ("Allow", "low", "fail_open", False, "chain", "high", "failed_but_blocked"),
         ("Allow", "low", "circuit_open", False, "chain", "high", "circuit_open"),
         ("Deny", "high", "failed_but_blocked", False, "chain", "high", "failed_but_blocked"),
+        ("Allow", "low", "skipped", False, "chain", "high", "skipped"),
+        ("Deny", "high", "skipped", False, "chain", "high", "skipped"),
     ],
 )
 def test_stateful_response_and_audit_follow_highest_denial(
@@ -137,13 +140,17 @@ def test_stateful_response_and_audit_follow_highest_denial(
     from agent_moss.server import routes
 
     observed = outcome == "failed_but_blocked"
-    prior_layers = ["L2.2"] if observed else (["L1.1"] if decision == "Deny" else [])
+    budget_skipped = outcome == "skipped"
+    prior_layers = ["L2.2"] if observed else (["L1.1"] if decision == "Deny" and not budget_skipped else [])
+    sources = {"failed_but_blocked": "llm_failure_with_violation", "skipped": "llm_budget_skipped"}
+    degraded = ["l3_budget_floor_exceeds"] if budget_skipped else []
     monkeypatch.setattr(analyzer, "analyze", Mock(return_value={
-        "source": "llm_failure_with_violation" if observed else "engine",
+        "source": sources.get(outcome, "engine"),
         "decision": decision, "risk_level": risk, "risk_type": "" if observed else "engine",
         "reason": "model failed" if observed else "engine",
         "violated_policy": "engine", "violated_layers": prior_layers, "confidence": 76,
         "policy": "allow policy" if decision == "Allow" else "", "l3_outcome": outcome,
+        "degraded": degraded,
     }))
     chain = {"risk_level": "high", "reason": "chain", "graph": {"property_id": "chain"}}
     flow = {"risk_level": "critical", "reason": "flow", "graph": {"property_id": "flow"}}
@@ -172,6 +179,8 @@ def test_stateful_response_and_audit_follow_highest_denial(
     assert body["risk_level"] == expected_risk
     assert body["reason"] == expected_reason
     assert body["l3_outcome"] == expected_outcome
+    if budget_skipped:
+        assert body["degraded"] == degraded
     assert body["violated_layers"] == prior_layers + ["L2.2-stateful"]
     assert body["risk_type"] == ("engine" if expected_reason == "engine" else "formal_verification")
     assert body["confidence"] == (76 if expected_reason == "engine" else 90)
@@ -477,26 +486,27 @@ def test_chain_state_auto_rotate_keeps_recent_and_archives_old(tmp_path, monkeyp
 
 
 def test_fingerprint_normalizes_time_alias_and_truncation():
-    """实时微秒/DB 秒、工具别名、落库截断必须生成同一 seed 指纹。"""
-    from agent_moss.engine.formal_engine.stateful import _fingerprint
+    """旧审计兼容键归一实时小数秒、工具别名和落库截断。"""
+    from agent_moss.engine.formal_engine.stateful import _legacy_audit_fingerprint
 
     full = "echo " + "x" * 100
-    truncated = full[:20] + "…[truncated 84B sha256:" + __import__("hashlib").sha256(
+    truncated = full[:20] + "…[truncated 84B sha256:" + hashlib.sha256(
         full.encode()
     ).hexdigest()[:16] + "]"
 
-    realtime = _fingerprint(
-        "s", "executeBash", full, "2026-11-23T12:00:00.123456+00:00",
+    realtime = _legacy_audit_fingerprint(
+        "s", "executeBash", full, "2026-11-23T12:00:00.123456789Z",
     )
-    review = _fingerprint(
+    review = _legacy_audit_fingerprint(
         "s", "terminal-executeBash", truncated, "2026-11-23 12:00:00",
     )
     assert realtime == review
 
 
-def test_seed_skips_same_action_across_time_precision_and_alias():
-    """同一动作第二次 seed（秒级/别名形态）不再新增节点。"""
-    from agent_moss.engine.formal_engine.stateful import StatefulChainTracker
+@pytest.mark.parametrize("restore_format", [None, "exact", "normalized"])
+def test_seed_skips_same_action_across_time_precision_and_alias(restore_format):
+    """旧 Gate 的同一次调用在回顾时能找到原始节点。"""
+    from agent_moss.engine.formal_engine.stateful import StatefulChainTracker, _legacy_audit_fingerprint
 
     tracker = StatefulChainTracker(agent_id="dedupe")
     first = {"session_id": "s", "action_history": [{
@@ -508,5 +518,31 @@ def test_seed_skips_same_action_across_time_precision_and_alias():
         "called_at": "2026-11-23 12:00:00",
     }]}
     assert tracker.seed([first]) == 1
+    if restore_format is not None:
+        snapshot = tracker.to_snapshot()
+        if restore_format == "normalized":
+            node = snapshot["nodes"][0]
+            node.pop("legacy_fingerprint")
+            snapshot["seeded_keys"] = [_legacy_audit_fingerprint(
+                "s", node["action_type"], node["action_detail"], node["timestamp"],
+            )]
+        tracker = StatefulChainTracker(agent_id="dedupe")
+        tracker.restore(snapshot)
+        assert "unmapped_legacy_keys" not in tracker.to_snapshot()
     assert tracker.seed([second]) == 0
     assert len(tracker.nodes) == 1
+
+
+def test_legacy_audit_does_not_merge_multiple_calls_in_the_same_second():
+    from agent_moss.engine.formal_engine.stateful import StatefulChainTracker
+
+    tracker = StatefulChainTracker(agent_id="dedupe")
+    action = {"action_type": "executeBash", "action_detail": "echo hi"}
+    for fraction in ("1", "2"):
+        tracker.advance({**action, "called_at": f"2026-11-23T12:00:00.{fraction}Z"}, session_id="s")
+    review = {**action, "action_type": "terminal-executeBash", "called_at": "2026-11-23 12:00:00"}
+    sessions = [{"session_id": "s", "action_history": [review]}]
+
+    assert tracker.seed(sessions) == 1
+    assert tracker.seed(sessions) == 0
+    assert len(tracker.nodes) == 3

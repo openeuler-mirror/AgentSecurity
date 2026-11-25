@@ -1,6 +1,6 @@
 """Pydantic models for AgentMoss API requests and responses."""
 
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..__version__ import __version__
@@ -73,6 +73,11 @@ class AnalyzeRequest(BaseModel):
     agent_id: str = Field(default="", description="Caller agent identifier, e.g. 'xiaoo' / 'opencode' / 'opendesk'. Empty = generic mode (no agent-specific rules).")
     instance_id: str = Field(default="", description="Agent installation/instance identifier. Used only for display-layer redaction: nodes from the same instance are returned unredacted. Does not affect detection.")
     metadata: Optional[dict] = Field(default=None, description="Extended metadata (sandbox_id, trace_id, etc.)")
+    # Only a gate-authenticated request validates these fields. Direct clients
+    # continue to ignore them, even when they are not the expected types.
+    gate_call_id: Any = None
+    gate_call_time_us: Any = None
+    gate_delivery_uncertain: Any = None
 
     @model_validator(mode="before")
     @classmethod
@@ -188,6 +193,19 @@ class AnalyzeResponse(BaseModel):
         description="L3 outcome: ok|reasoning_fallback|not_reached|skipped|"
                     "fail_open|fail_closed|failed_but_blocked|circuit_open",
     )
+    #: Deny 但建议向用户确认（2026-11）。旧 agent 忽略仍是 Deny。
+    ask_recommended: bool = Field(
+        default=False, description="Deny but user confirmation is recommended"
+    )
+    ask_reason: str = Field(
+        default="", description="Why user confirmation is recommended"
+    )
+
+
+class GateAnalyzeResponse(AnalyzeResponse):
+    """Response correlation for an authenticated AgentGate call."""
+
+    gate_call_id: str
 
 
 class HealthResponse(BaseModel):

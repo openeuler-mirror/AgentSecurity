@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from ..profiles.base import OSProfile
     from ..agents.base import AgentExtensions
 
-from ..infra.config import Config, is_brain_enabled, is_llm_enabled
+from ..infra.config import Config, get_deploy_role, get_llm_fail_mode, is_brain_enabled, is_llm_enabled
 from ..profiles import get_profile
 from .heuristic import (
     HeuristicDetector, is_safe_bash_command,
@@ -41,7 +41,7 @@ from .heuristic import (
 from .inline_analyzer import (
     analyze_inline_script, confirms_inline_read, has_inline_danger_evidence, is_literal_text_command,
 )
-from .llm_analyzer import LLMAnalyzer
+from .llm_analyzer import LLMAnalyzer, LLMPromptBudgetExceeded
 from .logic_rules import LogicRulesChecker, _SHELL_FULL_READ_CMDS, _split_shell_segments
 from .script_content_analyzer import (
     analyze_script_content,
@@ -174,6 +174,7 @@ class AgentMossBot:
         llm_analysis_enabled = is_layer_enabled("L3_llm_analysis")
 
         violated_layers: list[str] = []
+        degraded_notes: list[str] = []
 
         # ========== Brain 维护（节流，仅启用时） ==========
         # 定期执行 curator：draft 规则自动激活 + 规则/skill 生命周期（stale/archived）。
@@ -288,7 +289,13 @@ class AgentMossBot:
         # （实测 `bash Deploy.sh` 且 Deploy.sh 内含 `rm -rf /`：Python 放行、TS 拦截）。
         # Deploy.sh / Setup.sh / Install.sh 这类带大写的脚本名极常见，等于 L1.2 整层失效。
         _l15_action_detail = a_next.get("action_detail", "")
-        if _l15_action_type == "bash":
+        if _l15_action_type == "bash" and get_deploy_role() == "host":
+            # agent 本体侧读不到沙箱脚本内容：脚本内容分析由 sandbox 侧负责，
+            # 本体只做命令行级检查，不因“读不到脚本”误判。
+            degraded_notes.append(
+                "script_content_deferred_to_sandbox: AGENT_MOSS_DEPLOY_ROLE=host"
+            )
+        elif _l15_action_type == "bash":
             # 复用 HeuristicDetector 的 CommandPatternScanner（OS Profile 驱动）
             _scanner = self._heuristic_detector._command_scanner
             script_chain_result = analyze_script_content(
@@ -303,6 +310,14 @@ class AgentMossBot:
             # `bash huge2mb.sh`（末尾 rm -rf /）→ Deny 变 Allow）。这与「脚本不存在」
             # 本质不同：后者跑也跑不起来。客户可用 AGENT_MOSS_SCRIPT_MAX_FILE_SIZE 放宽。
             # 关闭 L1 时仅关闭本层拒绝，脚本内容与风险线索仍供 L2/L3 使用。
+            if script_chain_result and script_chain_result.nodes:
+                for node in script_chain_result.nodes:
+                    if node.error and not getattr(node, "unanalyzable", False):
+                        # 脚本不存在/权限读不到：不是“确认危险”，不阻断；
+                        # 明确告诉调用方本次脚本内容未被扫描。
+                        degraded_notes.append(
+                            f"script_content_unavailable: {node.script_path} ({node.error})"
+                        )
             if heuristic_enabled and script_chain_result and script_chain_result.nodes:
                 for node in script_chain_result.nodes:
                     if getattr(node, "unanalyzable", False):
@@ -721,6 +736,7 @@ class AgentMossBot:
                 source="heuristic_and_logic_only",
                 action_desc=action_detail,
                 violated_layers=violated_layers,
+                degraded=list(degraded_notes),
             )
 
         llm_analysis_enabled = llm_analysis_enabled and is_llm_enabled()
@@ -774,8 +790,26 @@ class AgentMossBot:
                     prompt_history=prompt_history,
                     path_context=path_context,
                 )
+            except LLMPromptBudgetExceeded as e:
+                # 前置层已确认的拒绝已返回。此时的 L2.2 标记仅来自 observe 模式。
+                fail_mode = get_llm_fail_mode()
+                allowed = fail_mode == "fail_open"
+                decision = "放行" if allowed else "拒绝"
+                return SecurityJudgment(
+                    allowed=allowed,
+                    reason=f"L3 prompt 超出硬预算，已跳过语义分析，按 {fail_mode} {decision}",
+                    risk_level="low" if allowed else "medium",
+                    source="llm_budget_skipped",
+                    action_desc=a_next.get("action_detail", ""),
+                    violated_layers=violated_layers,
+                    degraded=list(dict.fromkeys([*degraded_notes, e.code])),
+                )
             except Exception as e:
                 logger.warning("LLM 分析异常: %s", e)
+                budget_degradation = getattr(e, "l3_budget_degraded", "")
+                degraded = list(dict.fromkeys(
+                    [*degraded_notes, *([budget_degradation] if budget_degradation else [])]
+                ))
                 # 熔断打开 ≠ 调用失败：前者连请求都没发（上游早就判定不可用），
                 # 后者是真去调了但失败。两者对运维的含义不同，source 分开。
                 from ..infra.llm_client import LLMCircuitOpenError
@@ -793,11 +827,11 @@ class AgentMossBot:
                         source="llm_failure_with_violation",
                         action_desc=a_next.get("action_detail", ""),
                         violated_layers=violated_layers,
+                        degraded=degraded,
                     )
                 # 纯靠 L3 时 LLM 挂了：按 fail_mode 决策
                 # - fail_open（默认）：Allow + 警告，可用性优先
                 # - fail_closed：Deny，安全优先
-                from ..infra.config import get_llm_fail_mode
                 if get_llm_fail_mode() == "fail_open":
                     logger.warning(
                         "LLM 分析失败，fail_open 模式：允许执行（前两层未拦截）: %s", e
@@ -809,6 +843,7 @@ class AgentMossBot:
                         source=_l3_fail_source,
                         action_desc=a_next.get("action_detail", ""),
                         violated_layers=violated_layers,
+                        degraded=degraded,
                     )
                 return SecurityJudgment(
                     allowed=False,
@@ -816,6 +851,12 @@ class AgentMossBot:
                     risk_level="medium",
                     source=_l3_fail_source,
                     action_desc=a_next.get("action_detail", ""),
+                    degraded=degraded,
+                    ask_recommended=True,
+                    ask_reason=(
+                        "L3 语义分析不可用，按 fail_closed 拒绝；"
+                        "这是“没查完”而非“确认有风险”，建议向用户确认是否继续。"
+                    ),
                 )
             if not llm_judgment.allowed:
                 violated_layers.append("L3.1")
@@ -844,6 +885,10 @@ class AgentMossBot:
                 llm_judgment.violated_layers = list(dict.fromkeys(
                     ["L2.2", *llm_judgment.violated_layers]
                 ))
+            if degraded_notes:
+                llm_judgment.degraded = list(dict.fromkeys([
+                    *llm_judgment.degraded, *degraded_notes,
+                ]))
             return llm_judgment
         else:
             return SecurityJudgment(
@@ -853,6 +898,7 @@ class AgentMossBot:
                 source="heuristic_and_logic_only",
                 action_desc=a_next.get("action_detail", ""),
                 violated_layers=violated_layers,
+                degraded=list(degraded_notes),
             )
 
     def _maybe_run_brain_maintenance(self) -> None:

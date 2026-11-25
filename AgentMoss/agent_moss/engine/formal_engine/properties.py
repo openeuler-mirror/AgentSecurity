@@ -868,11 +868,21 @@ def check_low_integrity_command_exec(graph: MultiSessionGraph) -> list[PropertyV
     for i in candidates:
         n = nodes[i]
         if i in low_at and _is_compute_node(n):
+            path = [(n.session_id, n.seq, n.action_detail[:60])]
             violations.append(PropertyViolation(
                 property_id="low-integrity-command-exec",
                 reason=f"低完整性数据控制命令执行：{low_at[i]} → {n.session_id}#{n.seq} 执行不可信内容",
                 risk_level="critical",
-                path=[(n.session_id, n.seq, n.action_detail[:60])],
+                path=path,
+                graph=_graph_from_path(
+                    graph, path, edge_type="next",
+                    property_meta={
+                        "property_id": "low-integrity-command-exec",
+                        "property_short": "P7",
+                        "property_name": "低完整性命令执行",
+                    },
+                    roles=["sink"],
+                ),
             ))
             if witness is not None:
                 return violations  # 实时判定命中即停
@@ -1037,11 +1047,22 @@ def check_cross_session_reachability(graph: MultiSessionGraph) -> list[PropertyV
         if i in reached:
             src_idx = min(sources)
             src_desc = nodes[src_idx].action_detail[:40]
+            path = [(m.session_id, m.seq, m.action_detail[:60]) for m in nodes][-3:]
             violations.append(PropertyViolation(
                 property_id="low-integrity-reachability",
                 reason=f"低完整性源经跨 session 数据链多跳到达当前执行（源: {src_desc} → {n.session_id}#{n.seq}）",
                 risk_level="high",
-                path=[(m.session_id, m.seq, m.action_detail[:60]) for m in nodes][-3:],
+                path=path,
+                # dashboard/响应需要 property 元信息才能显示“违反哪条性质”；
+                # 之前 P3 没带 graph，154 条只能看到 risk_type=formal_verification。
+                graph=_graph_from_path(
+                    graph, path, edge_type="data",
+                    property_meta={
+                        "property_id": "low-integrity-reachability",
+                        "property_short": "P3",
+                        "property_name": "低完整性数据流可达",
+                    },
+                ),
             ))
             if witness is not None:
                 return violations  # 实时判定命中即停

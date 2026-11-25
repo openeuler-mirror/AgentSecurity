@@ -24,6 +24,11 @@ class SecurityJudgment:
     violation_graph: dict | None = None
     # 兼容旧调用方：反例路径数组 [[session_id, seq, detail, timestamp?, agent?], ...]
     violation_chain: list = field(default_factory=list)
+    #: 本次判定的能力降级说明（空 = 全层完整跑过）；由 analyze()/HTTP 层透传。
+    degraded: list[str] = field(default_factory=list)
+    #: Deny 但建议向用户确认（如 L3 fail_closed：拒绝原因是“分析不可用”，不是确认有风险）。
+    ask_recommended: bool = False
+    ask_reason: str = ""
 
 
 #: L3（LLM 语义分析）本次的实际结局。对客户暴露的稳定枚举 ——
@@ -32,10 +37,10 @@ L3_OUTCOMES = (
     "ok",                   # L3 正常返回并被采纳
     "reasoning_fallback",   # content 为空、判定取自 reasoning 类字段（判定仍有效）
     "not_reached",          # L1/L2 已给出结论（拦截或白名单放行），未调用 L3
-    "skipped",              # L3 未启用（无 key / 层级开关关闭）
+    "skipped",              # L3 未启用或主动跳过（如 prompt 硬预算不够）
     "fail_open",            # L3 调用失败，按 fail_open 放行（**能力降级**）
     "fail_closed",          # L3 调用失败，按 fail_closed 拒绝（**能力降级**）
-    "failed_but_blocked",   # L3 调用失败，但前序层已拦截（结论不受影响）
+    "failed_but_blocked",   # L3 调用失败，最终由其他分析层拒绝
     "circuit_open",         # LLM 熔断器打开，未发起请求（**能力降级**）
 )
 
@@ -57,7 +62,7 @@ def derive_l3_outcome(judgment: "SecurityJudgment") -> str:
         return "circuit_open"
     if src == "llm_failure_with_violation":
         return "failed_but_blocked"
-    if src in ("heuristic_and_logic_only", "disabled"):
+    if src in ("heuristic_and_logic_only", "disabled", "llm_budget_skipped"):
         return "skipped"
     # whitelist_bypass / heuristic* / logic_rule* / formal_engine / brain_rule …
     # 都是「前两层已给出结论，没轮到 L3」。
@@ -90,6 +95,8 @@ class LogicRuleResult:
     reason: str = ""
     risk_type: str = ""
     is_credential: bool = False  # 是否命中凭据文件（凭据文件无论读写都拦截，不进 inline 跳过）
+    #: L2 不确定但值得 L3 关注的结构化提示（不拦截，只注入 L3）。
+    l3_hint: str = ""
 
 
 @dataclass

@@ -38,6 +38,10 @@ _MAX_MS = int(_CFG.get("max_scan_ms") or 100)
 _WRITE_TOOL_EXACT = {
     "write", "file_write", "writefile", "edit", "file_edit", "editfile",
     "searchreplace", "search_replace",
+    # 通用 workspace 工具名（ClawPartner/QwenPaw 等宿主常用），语义明确：
+    # workspace_write_file 写单个文件，workspace_edit_file 编辑单个文件。
+    "workspace_write_file", "workspace_edit_file",
+    "workspace_writefile", "workspace_editfile",
 }
 _WRITE_TOOL_SUFFIXES = ("-writefile", "-editfile", "-searchreplace")
 _APPLY_PATCH_SUFFIX = ("applypatch", "apply_patch", "-applypatch")
@@ -116,6 +120,45 @@ def extract_write_payload(action_type: str, action_detail_raw: str) -> tuple[str
         except Exception:  # noqa: BLE001 — 非法 JSON 按原文处理
             pass
     return None
+
+
+#: 指令/提示词/记忆/技能类写入目标。写入这些位置的正文会被下游 agent 当指令读，
+#: 注入关键词检测必须保留；普通报告/数据文档则只按数据内容处理。
+_INSTRUCTION_TARGET_RE = re.compile(
+    r"(?:^|[/\\])(?:prompts?|instructions?|skills?|memories|memory|"
+    r"config|policies|policy|\.claude|\.cursor)(?:[/\\]|$)"
+    r"|(?:^|[/\\])(?:AGENTS?|CLAUDE|SYSTEM|PROMPT|INSTRUCTIONS?)"
+    r"(?:\.[^/\\]+)?$"
+    r"|(?:^|[/\\])\.cursorrules$",
+    re.IGNORECASE,
+)
+
+
+def is_instruction_target(path: str) -> bool:
+    """写目标是否属于“会被下游当指令读取”的文件/目录。"""
+    p = (path or "").replace("\\", "/").lower()
+    if not p:
+        return False
+    base = p.rsplit("/", 1)[-1]
+    if base in ("agents.md", "claude.md", "system.md", "prompt.md",
+                "instructions.md", ".cursorrules"):
+        return True
+    # `agentmoss-prompt.txt` / `system_prompt.md` 这类名字也按指令源处理。
+    if re.search(r"(?:^|[-_.])(?:prompt|instruction|system)(?:[-_.]|$)", base):
+        return True
+    return bool(_INSTRUCTION_TARGET_RE.search(p))
+
+
+def is_data_document(action_type: str, action_detail_raw: str) -> bool:
+    """是否为“普通数据文档”写入（可跳过正文注入关键词检测）。
+
+    只认能解析出明确 path/content、语言判定为 data、且目标不是指令源的文件。
+    """
+    payload = extract_write_payload(action_type, action_detail_raw)
+    if payload is None:
+        return False
+    path, content = payload
+    return detect_language(path, content) == "data" and not is_instruction_target(path)
 
 
 def handles_written_content(action_type: str, action_detail_raw: str) -> bool:

@@ -269,6 +269,24 @@ def test_private_dir_rejects_symlink(tmp_path):
     assert sp.ensure_private_dir(link) is False
 
 
+def test_private_dir_and_auto_token_without_getuid(monkeypatch, tmp_path):
+    """Windows 没有 os.getuid()：跳过 POSIX 属主校验，token 仍要能生成。
+
+    2026-11 实测：auto 鉴权在 Windows 上调用 os.getuid() → AttributeError
+    → fail_fast 拒绝启动。这里模拟 Windows（删除 getuid）守住回归。
+    """
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setenv("AGENT_MOSS_AUTH_MODE", "auto")
+    monkeypatch.setenv("AGENT_MOSS_DATA_DIR", str(tmp_path))
+    sp.reset_auth_cache()
+
+    assert sp.ensure_private_dir(tmp_path / "private") is True
+    token = sp._auth_token()
+    assert token
+    assert sp.auto_token_path().is_file()
+    assert sp.auth_config_error() == ""
+
+
 # ==================== 限额 ====================
 
 def test_body_size_limit(monkeypatch):
