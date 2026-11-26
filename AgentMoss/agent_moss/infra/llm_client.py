@@ -291,13 +291,40 @@ def _describe_response(response) -> str:
         return f"<无法解析响应结构: {e}>"
 
 
-#: LLM 客户端缓存：key = (base_url, api_key, headers, timeout) → OpenAI。
+#: 同步 LLM 客户端缓存：key = (base_url, api_key, headers, timeout) → OpenAI。
 #:
 #: 为什么缓存（2026-11，客户 TPS < 1）：原先每次 call_llm 都 `OpenAI(...)` 新建
 #: 客户端 —— 每次都新建 httpx 连接池，**TCP + TLS 握手开销**在高并发下非常可观
 #: （几十毫秒 × 每秒数百次）。复用后连接池保持存活，二次请求直接走已有连接。
+#:
+#: ⚠️ 只缓存**同步**客户端。``AsyncOpenAI`` 的 httpx 连接池绑定在创建它的事件
+#: 循环上，而 ``call_llm`` 每次都在独立线程里用 ``asyncio.run`` 建一个短生命
+#: 周期循环；若把异步客户端也缓存，下一次调用会复用一个事件循环已关闭的连接池，
+#: 立即报 ``APIConnectionError: Connection error.`` / ``Event loop is closed``
+#: （2026-11 招行现场，0.17.35 起的回归）。异步客户端必须每次新建。
 _CLIENT_CACHE: dict[tuple, object] = {}
 _CLIENT_LOCK = threading.Lock()
+
+
+def _build_client(
+    base_url: str,
+    api_key: str,
+    extra_headers: dict,
+    timeout: float,
+    *,
+    asynchronous: bool,
+):
+    """新建 OpenAI / AsyncOpenAI 客户端（不缓存）。"""
+    OpenAI = _get_openai_client_class(asynchronous=asynchronous)
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        # 调用方（llm_analyzer）自己管理重试与总超时预算；SDK 再重试会叠加
+        # 等待时间，让「总超时」失效（实测 1 次调用变 3 次请求）。
+        max_retries=0,
+        default_headers=extra_headers if extra_headers else None,
+    )
 
 
 def _get_shared_client(
@@ -308,30 +335,23 @@ def _get_shared_client(
     *,
     asynchronous: bool = False,
 ):
-    """按 (base_url, api_key, headers, timeout, 同步/异步) 复用 OpenAI 客户端。
+    """同步客户端按配置复用；异步客户端每次新建（不能跨事件循环复用）。"""
+    if asynchronous:
+        return _build_client(
+            base_url, api_key, extra_headers, timeout, asynchronous=True
+        )
 
-    注意：超时时间不同的调用（prompt1 40s / prompt2 20s）会各自缓存一份，
-    避免用错超时。缓存无上限但 key 组合极少（通常 1-2 个）。
-    """
     key = (
         base_url,
         api_key,
         tuple(sorted((extra_headers or {}).items())),
         float(timeout),
-        bool(asynchronous),
     )
     with _CLIENT_LOCK:
         client = _CLIENT_CACHE.get(key)
         if client is None:
-            OpenAI = _get_openai_client_class(asynchronous=asynchronous)
-            client = OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                timeout=timeout,
-                # 调用方（llm_analyzer）自己管理重试与总超时预算；SDK 再重试会叠加
-                # 等待时间，让「总超时」失效（实测 1 次调用变 3 次请求）。
-                max_retries=0,
-                default_headers=extra_headers if extra_headers else None,
+            client = _build_client(
+                base_url, api_key, extra_headers, timeout, asynchronous=False
             )
             _CLIENT_CACHE[key] = client
         return client
@@ -545,7 +565,26 @@ async def _call_llm_async(
     api_key = _resolve_api_key(config)
 
     client = _get_shared_client(base_url, api_key, extra_headers, timeout, asynchronous=True)
+    try:
+        return await _call_llm_with_client(client, prompt, timeout, config)
+    finally:
+        # AsyncOpenAI 的连接池绑定当前事件循环。call_llm 每次用 asyncio.run
+        # 建短生命周期循环，必须在循环关闭前显式关闭客户端；否则其 __del__
+        # 会在已关闭的循环上调度 aclose，打出
+        # "Task exception was never retrieved / Event loop is closed"。
+        try:
+            await client.close()
+        except Exception:  # noqa: BLE001 - 清理失败不能覆盖原始结果
+            pass
 
+
+async def _call_llm_with_client(
+    client,
+    prompt: str,
+    timeout: float,
+    config: LLMConfig,
+) -> LLMResult:
+    """使用给定客户端执行一次 L3 调用（客户端生命周期由调用方管理）。"""
     # 熔断（2026-11）：模型服务挂掉时，不让每个请求都等满超时把池占死。
     from .circuit_breaker import get_breaker
 
