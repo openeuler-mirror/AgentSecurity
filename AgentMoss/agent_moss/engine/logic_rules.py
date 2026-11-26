@@ -198,15 +198,139 @@ _DELETE_ACTION_WORDS: tuple[str, ...] = tuple(_INTENT_MATRIX.get("delete_action_
 _ALL_INTENT_KEYWORDS: tuple[str, ...] = tuple(
     kw for kws in _INTENT_CATEGORIES.values() for kw in kws
 )
+#: 意图词前的否定词（窗口内命中即视为该次出现被否定）。
+_NEGATION_WORDS: tuple[str, ...] = tuple(
+    str(w).lower() for w in (_INTENT_MATRIX.get("negation_words") or ())
+)
+_NEGATION_WINDOW = 8
+
+
+def _intent_keyword_negated(text: str, index: int) -> bool:
+    """关键词出现位置前面是否紧跟否定词。
+
+    只看关键词前 8 个字符，避免把整句前面的「不要」误当成对后面所有词的否定；
+    “不只分析，还要修改”里的“修改”不会被前面的“不”误伤。
+    """
+    if not _NEGATION_WORDS or index <= 0:
+        return False
+    prefix = text[max(0, index - _NEGATION_WINDOW):index]
+    return any(neg in prefix for neg in _NEGATION_WORDS)
+
+
+#: 明确的“只读”约束。只有出现这类表达时，L2 才把“读意图 + 覆盖动作”判为
+#: 确定冲突；仅出现“分析/查看”等普通读词时，可能是在读后生成/更新文件，交 L3。
+_EXPLICIT_READONLY_RE = re.compile(
+    r"(?:只读|仅读|只看|仅看|只查看|仅查看|只分析|仅分析|只做分析|"
+    r"只查询|仅查询|"
+    r"不要(?:修改|写入|写|改动|动)|禁止(?:修改|写入|写|改动)|"
+    r"不得(?:修改|写入|写|改动)|别(?:修改|写入|写|动)|"
+    r"read[- ]only|do not (?:modify|write|change)|don't (?:modify|write|change))",
+    re.IGNORECASE,
+)
+
+
+#: “更新/修改/替换”类写意图：可能包含先删旧再写新的实现，不能仅凭
+#: “写意图 + 删除动作”就判死；由 L3 结合动作序列判断。明确“不要删除”除外。
+_UPDATE_INTENT_RE = re.compile(
+    r"(?:更新|修改|编辑|替换|覆盖|改成|改到|rename|replace|update|modify|edit)",
+    re.IGNORECASE,
+)
+_EXPLICIT_NO_DELETE_RE = re.compile(
+    r"(?:不要|禁止|不得|别|切勿)\s*(?:删除|删掉|删|移除|remove|delete|rm)",
+    re.IGNORECASE,
+)
+#: 可能改变关键词含义的上下文。命中这些表达时，即使出现读/写/删意图词，
+#: 也不能由 L2 直接判死；保留 hint 交 L3。
+_INTENT_AMBIGUITY_RE = re.compile(
+    r"(?:处理|整理|优化|调整|清掉|如果|假如|若|或者|还是|看情况|根据|"
+    r"按.{0,6}要求|继续|之前|上次|刚才|顺便|示例|例如|比如|按钮|接口|"
+    r"函数|字段|变量|代码里|可能|建议|评估|考虑)",
+    re.IGNORECASE,
+)
+
+
+#: 任务构建产物清理白名单：只允许相对目标，避免把 /opt/prod/build 这类
+#: 业务绝对路径误当构建目录。绝对路径仍由 /tmp 临时目录豁免或 L1 危险规则处理。
+_BUILD_ARTIFACT_NAMES = frozenset({
+    "build", "dist", "target", "out", "tmp", "temp", "cache", ".cache",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".tox", "node_modules",
+    "coverage", ".coverage", "htmlcov",
+})
+_BUILD_ARTIFACT_GLOB_RE = re.compile(
+    r"^\*\.(?:pyc|pyo|class|o|obj|d|egg-info)$", re.IGNORECASE
+)
+
+
+def is_build_artifact_cleanup(action_detail: str) -> bool:
+    """是否为“任务目录内清理构建产物”的 rm 命令。
+
+    只接受相对目标 + 构建产物名/后缀。`rm -rf /`、`/logs/*`、`rm -rf *`、
+    含 `..` 的目标一律拒绝，避免把窄豁免扩大成任意删除。
+    """
+    text = (action_detail or "").strip()
+    if not text:
+        return False
+    found_rm = False
+    targets: list[str] = []
+    for seg in _split_shell_segments(text):
+        s = seg.strip()
+        if not s:
+            continue
+        parts = s.split()
+        if not parts:
+            continue
+        if parts[0].lower() in ("sudo", "command"):
+            parts = parts[1:]
+        if not parts or parts[0].lower() != "rm":
+            continue
+        found_rm = True
+        for tok in parts[1:]:
+            tok = tok.strip().strip("'\"")
+            if not tok or tok.startswith("-"):
+                continue
+            targets.append(tok)
+    if not found_rm or not targets:
+        return False
+    for target in targets:
+        t = target.replace("\\", "/")
+        if t.startswith("/") or ".." in t.split("/"):
+            return False
+        while t.startswith("./"):
+            t = t[2:]
+        if not t or t in (".", "*", "?"):
+            return False
+        if "*" in t or "?" in t:
+            if not _BUILD_ARTIFACT_GLOB_RE.match(t):
+                return False
+            continue
+        first = t.split("/", 1)[0].lower()
+        if first not in _BUILD_ARTIFACT_NAMES:
+            return False
+    return True
 
 
 def _intent_categories(text: str) -> set[str]:
-    """从 prompt 文本提取意图类别（read/write/delete，可多选）。"""
+    """从 prompt 文本提取意图类别（read/write/delete，可多选）。
+
+    同一个词只要有一次**非否定**出现就计入；全部被否定则不计。
+    例：\"不要修改，只分析\" → 只有 read；\"不只分析，还要修改\" → read+write。
+    """
     t = (text or "").lower()
     out: set[str] = set()
     for cat, kws in _INTENT_CATEGORIES.items():
-        if any(kw.lower() in t for kw in kws):
-            out.add(cat)
+        for kw in kws:
+            needle = kw.lower()
+            start = 0
+            while True:
+                idx = t.find(needle, start)
+                if idx < 0:
+                    break
+                if not _intent_keyword_negated(t, idx):
+                    out.add(cat)
+                    break
+                start = idx + len(needle)
+            if cat in out:
+                break
     return out
 
 
@@ -1964,6 +2088,71 @@ class LogicRulesChecker:
             action_type, a_next.get("action_detail", ""), self._profile, extra_write_tools
         )
         reason_key = _intent_matrix_violation(intents, action_cat)
+        _is_reference_prompt = bool(
+            _REFERENCE_PRIOR_RE.search((prompt_session or "").strip().lower())
+        )
+        if (
+            reason_key == "read->overwrite"
+            and not _EXPLICIT_READONLY_RE.search(intent_text)
+            and not _is_reference_prompt
+        ):
+            # 只有普通读意图、没有“只读/不要修改”等明确约束时，读后覆盖可能是
+            # “分析后生成/更新报告”。L2 不猜，保留 prompt/动作给 L3 判断。
+            logger.info(
+                "[intent] 读意图 + 覆盖动作，缺少明确只读约束，放行交 L3：prompt=%r 目标=%r",
+                (prompt_session or "")[:80],
+                action_detail[:80],
+            )
+            return LogicRuleResult(
+                hit=False,
+                l3_hint=(
+                    "L2 意图观察（不确定，交 L3）：出现读意图词，但当前动作是覆盖写，"
+                    f"prompt 没有明确“只读/不要修改”约束。prompt={(prompt_session or '')[:160]!r}，"
+                    f"动作={action_cat}，目标={a_next.get('action_detail','')[:160]!r}"
+                ),
+            )
+        if (
+            reason_key in ("read->delete", "write->delete")
+            and _UPDATE_INTENT_RE.search(intent_text)
+            and not _EXPLICIT_NO_DELETE_RE.search(intent_text)
+        ):
+            # “先分析/更新，然后清理旧文件”这类更新流程可能用 rm 实现替换。
+            # 只有“更新/修改/替换”意图且没有明确“不要删除”时，L2 不判死，交 L3。
+            logger.info(
+                "[intent] 更新类意图 + 删除动作，可能包含替换流程，放行交 L3：prompt=%r 动作=%r",
+                (prompt_session or "")[:80],
+                action_detail[:80],
+            )
+            return LogicRuleResult(
+                hit=False,
+                l3_hint=(
+                    "L2 意图观察（不确定，交 L3）：出现更新/修改类意图，但当前动作是删除，"
+                    "可能是先删旧再写新的替换流程。"
+                    f"prompt={(prompt_session or '')[:160]!r}，动作={action_cat}，"
+                    f"目标={a_next.get('action_detail','')[:160]!r}"
+                ),
+            )
+        if (
+            reason_key in ("read->delete", "write->delete")
+            and not _is_reference_prompt
+            and _INTENT_AMBIGUITY_RE.search(intent_text)
+        ):
+            # 关键词可能只是上下文里的一部分（“处理/按钮/如果/示例”等），
+            # 或动作与关键词的组合有歧义：L2 不猜，交 L3。
+            logger.info(
+                "[intent] 意图词存在歧义上下文，放行交 L3：prompt=%r 动作=%r",
+                (prompt_session or "")[:80],
+                action_detail[:80],
+            )
+            return LogicRuleResult(
+                hit=False,
+                l3_hint=(
+                    "L2 意图观察（不确定，交 L3）：意图词出现在可能改变含义的上下文"
+                    "（处理/条件/示例/按钮/指代等）中，不能仅凭关键词判偏离。"
+                    f"prompt={(prompt_session or '')[:160]!r}，动作={action_cat}，"
+                    f"目标={a_next.get('action_detail','')[:160]!r}"
+                ),
+            )
         if reason_key is not None:
             return LogicRuleResult(
                 hit=True,
@@ -2388,8 +2577,15 @@ class LogicRulesChecker:
         # 通配符 + 删除/修改 — 排除 /tmp 等临时目录的清理操作
         is_temp_path = any(td in action_detail for td in _TEMP_DIRS)
 
-        if not is_temp_path and ("*" in action_detail or "?" in action_detail) and any(
-            kw in action_detail for kw in ["rm ", "rm\t", "del ", "del\t", "delete", "remove ", "remove\t", "删除", "移除"]
+        if (
+            not is_temp_path
+            and not is_build_artifact_cleanup(action_detail)
+            and ("*" in action_detail or "?" in action_detail)
+            and any(
+                kw in action_detail
+                for kw in ["rm ", "rm\t", "del ", "del\t", "delete",
+                           "remove ", "remove\t", "删除", "移除"]
+            )
         ):
             return LogicRuleResult(
                 hit=True,

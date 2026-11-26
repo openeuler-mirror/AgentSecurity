@@ -98,6 +98,7 @@ def get_security_judge_prompt(
     skip_l3_hints: str = "",
     prompt_history_text: str = "（未提供历史意图）",
     path_context: str = "",
+    history_authorization: str = "",
 ) -> str:
     """
     生成安全判断 prompt 的完整内容。
@@ -127,6 +128,7 @@ def get_security_judge_prompt(
         prompt_session=prompt_session,
         action_history=action_history,
         prompt_history_text=prompt_history_text,
+        history_authorization=f"\n\n{history_authorization}" if history_authorization else "",
         action_type=a_next.get("action_type", "unknown"),
         action_detail=a_next.get("action_detail", ""),
         reason=reason,

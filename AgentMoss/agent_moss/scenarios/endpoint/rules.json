@@ -1,0 +1,11 @@
+{
+  "scenario_id": "endpoint",
+  "description": "端侧场景占位规则。当前无定制规则，接口与 Console 展示先就绪；后续按客户端侧策略补充。",
+  "extra_command_patterns": [],
+  "extra_injection_keywords": [],
+  "extra_sensitive_paths": [],
+  "builtin_safe_action_types": [],
+  "builtin_safe_skills": [],
+  "extra_single_file_write_tools": [],
+  "extra_skills": []
+}

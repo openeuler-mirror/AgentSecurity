@@ -1,0 +1,14 @@
+{
+  "agent_id": "clawpartner",
+  "description": "ClawPartner（基于 QwenPaw）宿主 agent 专属规则。当前先登记工具名，具体规则待客户场景补充；workspace_* 写工具按单文件写处理。",
+  "extra_command_patterns": [],
+  "extra_injection_keywords": [],
+  "extra_sensitive_paths": [],
+  "builtin_safe_skills": [],
+  "extra_single_file_write_tools": [
+    "workspace_write_file",
+    "workspace_edit_file"
+  ],
+  "builtin_safe_action_types": [],
+  "extra_skills": []
+}

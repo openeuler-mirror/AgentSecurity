@@ -38,6 +38,20 @@ def test_status_reports_nodes(tmp_path, monkeypatch, capsys):
     assert "__system__: 3 节点" in out
 
 
+def test_status_excludes_deleted_bucket(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_MOSS_STATE_DIR", str(tmp_path))
+    _seed(tmp_path)
+    store = ChainStateStore(str(tmp_path / "stateful_chains.db"))
+    try:
+        store.delete("__system__")
+    finally:
+        store.close()
+    assert cmd_state_status(_Args()) == 0
+    out = capsys.readouterr().out
+    assert "agent 分桶: 0" in out
+    assert "__system__" not in out
+
+
 def test_status_missing_db_is_ok(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AGENT_MOSS_STATE_DIR", str(tmp_path / "empty"))
     (tmp_path / "empty").mkdir()

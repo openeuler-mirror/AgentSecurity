@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -66,16 +67,19 @@ def cmd_state_status(args) -> int:
         }
         print(f"表: {', '.join(sorted(tables)) or '(无)'}")
         if "chain_meta" in tables:
-            rows = conn.execute(
-                "SELECT agent_id, updated_at FROM chain_meta ORDER BY updated_at DESC"
-            ).fetchall()
-            print(f"agent 分桶: {len(rows)}")
-            for r in rows[:10]:
+            agents = [
+                (row["updated_at"], row["agent_id"])
+                for row in conn.execute("SELECT agent_id, updated_at, meta_json FROM chain_meta")
+                if not json.loads(row["meta_json"]).get("deleted")
+            ]
+            agents.sort(key=lambda item: item[0], reverse=True)
+            print(f"agent 分桶: {len(agents)}")
+            for _, agent_id in agents[:10]:
                 n = conn.execute(
                     "SELECT COUNT(*) AS c FROM chain_nodes WHERE agent_id=?",
-                    (r["agent_id"],),
+                    (agent_id,),
                 ).fetchone()["c"]
-                print(f"  - {r['agent_id']}: {n} 节点")
+                print(f"  - {agent_id}: {n} 节点")
         elif "chain_state" in tables:
             rows = conn.execute("SELECT agent_id, updated_at FROM chain_state").fetchall()
             print(f"agent 分桶: {len(rows)}（旧结构，升级后会自动迁移）")

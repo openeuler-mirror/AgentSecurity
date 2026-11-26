@@ -570,6 +570,8 @@ class TestLayer1And2:
             ("deny-130-gitconfig-pager-revshell.json", dict(decision="Deny", risk_level="critical")),
             ("deny-131-gitconfig-printf-write.json", dict(decision="Deny", risk_level="medium")),
             ("deny-132-rm-log-wildcard.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：构建产物清理豁免不得扩大到裸通配
+            ("deny-rm-wildcard-all.json", dict(decision="Deny", risk_level="high")),
             ("deny-133-rm-home-tilde.json", dict(decision="Deny", risk_level="high")),
             ("deny-134-rm-home-var-indirect.json", dict(decision="Deny", risk_level="high")),
             ("deny-136-rm-home-cmdsubst.json", dict(decision="Deny", risk_level="high")),
@@ -641,12 +643,22 @@ class TestLayer1And2:
             # 2026-11 意图矩阵：写意图→删除（补漏报）、删意图→覆盖
             ("logic-58-intent-write-to-delete-deny.json", dict(decision="Deny", risk_level="high")),
             ("logic-63-intent-delete-to-overwrite-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11 意图词表：否定写意图 / 「看看」读意图的反向看护
+            ("logic-70-intent-negated-write-deny.json", dict(decision="Deny", risk_level="high")),
+            ("logic-71-intent-look-read-deny.json", dict(decision="Deny", risk_level="high")),
+            # 2026-11：更新流程允许删除交 L3，但明确“不要删除”仍拦
+            ("logic-74-intent-update-no-delete-deny.json", dict(decision="Deny", risk_level="high")),
             # 2026-11：写文件内容按语言分析 —— 脚本里的真实危险调用仍拦
             ("deny-write-sh-command-subst.json", dict(decision="Deny", risk_level="critical")),
             ("deny-write-py-os-system.json", dict(decision="Deny", risk_level="critical")),
             ("deny-write-sh-curl-bash.json", dict(decision="Deny", risk_level="high")),
             ("deny-write-py-fstring.json", dict(decision="Deny", risk_level="critical")),
             ("deny-write-sh-space-path.json", dict(decision="Deny", risk_level="critical")),
+            # 2026-11：指令源（prompt.txt / AGENTS.md）里的注入关键词仍拦
+            ("deny-write-prompt-injection-target.json", dict(decision="Deny", risk_level="critical")),
+            ("deny-write-agents-md-injection.json", dict(decision="Deny", risk_level="critical")),
+            # 2026-11：写入脚本里的真实外传调用仍拦
+            ("deny-write-sh-curl-exfil.json", dict(decision="Deny", risk_level="high")),
             ("deny-bash-pipe-bash.json", dict(decision="Deny", risk_level="critical")),
             ("deny-bash-unquoted-heredoc.json", dict(decision="Deny", risk_level="critical")),
             # 脚本分支感知命中：bash deploy.sh clean 走危险分支（需 script_branch_cwd fixture 的 deploy.sh）
@@ -868,6 +880,8 @@ class TestLayer1And2:
             # 其对照改为 force-with-lease（allow-232）。
             ("allow-06-sudo-apt-install.json", dict(decision="Allow", risk_level="low")),
             ("allow-07-rmrf-tmp.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：任务目录内清理构建产物（build/dist/*.pyc）放行
+            ("allow-build-artifact-cleanup.json", dict(decision="Allow", risk_level="low")),
             ("allow-08-ssh-pubkey.json", dict(decision="Allow", risk_level="low")),
             ("allow-09-cd-diagnostic.json", dict(decision="Allow", risk_level="low")),
             ("inline-16-python-ge-compare.json", dict(decision="Allow", risk_level="low")),
@@ -936,6 +950,16 @@ class TestLayer1And2:
             # 2026-11 意图矩阵：写意图/删意图/追加/意图不明各组
             ("logic-59-intent-write-to-create-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-60-intent-write-to-overwrite-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11 意图词表：「写到」/「修改」覆盖已有文件
+            ("logic-68-intent-write-to-overwrite-phrase-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-69-intent-modify-overwrite-allow.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：「先分析，然后更新」/ 更新流程里的删除不误判
+            ("logic-72-intent-analyze-then-update-allow.json", dict(decision="Allow", risk_level="low")),
+            ("logic-73-intent-update-delete-ambiguous-allow.json", dict(decision="Allow", risk_level="low")),
+            # 意图词处于歧义上下文：L2 不判死，保留 hint 交 L3
+            ("logic-75-intent-ambiguous-delete-hint-allow.json", dict(decision="Allow", risk_level="low")),
+            # 查询后保存到新文件：没有“只读/不要写入”约束，L2 不判死
+            ("allow-intent-query-save-result.json", dict(decision="Allow", risk_level="low")),
             ("logic-61-intent-delete-to-delete-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-62-intent-delete-to-create-allow.json", dict(decision="Allow", risk_level="low")),
             ("logic-64-intent-read-to-append-allow.json", dict(decision="Allow", risk_level="low")),
@@ -948,6 +972,13 @@ class TestLayer1And2:
             ("allow-write-sh-comment.json", dict(decision="Allow", risk_level="low")),
             ("allow-write-py-string.json", dict(decision="Allow", risk_level="low")),
             ("allow-write-md-space-path.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：普通文档正文里的注入关键词是数据，不按注入指令拦
+            ("allow-write-md-injection-doc.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：写入脚本正文的循环/占位不是当前命令
+            ("allow-write-py-loop-placeholder.json", dict(decision="Allow", risk_level="low")),
+            ("allow-write-sh-loop-placeholder.json", dict(decision="Allow", risk_level="low")),
+            # 2026-11：workspace_write_file 按单文件写处理
+            ("allow-workspace-write-md-example.json", dict(decision="Allow", risk_level="low")),
             ("allow-bash-single-quote.json", dict(decision="Allow", risk_level="low")),
             ("allow-bash-quoted-heredoc.json", dict(decision="Allow", risk_level="low")),
             # L1 缺口补齐放行用例（每条规则配一个不命中的放行变体）

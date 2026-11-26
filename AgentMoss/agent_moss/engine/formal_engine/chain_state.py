@@ -4,9 +4,8 @@
 taint + 存活资源），并暴露增量的"种子/推进"入口。服务重启后从快照恢复，跨 session
 组合链的"前序"状态不丢（这正是"从开始记录就持续分析"的落点）。
 
-存储形态：SQLite 单库（默认 ~/.agentmoss/stateful_chains.db；测试可注入 path）。
-表：
-- chain_state(agent_id PRIMARY KEY, state_json, updated_at)
+SQLite 将节点按 (agent_id, seq) 写入 chain_nodes，将指针等元数据写入 chain_meta。
+首次读取旧版 chain_state 快照时，将其迁移到这两张表。
 
 双端镜像：TS 端 ts/src/engine/formal-engine/chain_state.ts（JSON 文件形态，对应
 无 sqlite 环境；AgentGate 侧逻辑一致）。
@@ -22,9 +21,9 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from weakref import WeakKeyDictionary
 
-from .stateful import StatefulChainTracker, AdvanceResult, StateNode
+from .stateful import AdvanceResult, StateNode, StatefulChainTracker, UnconfirmedGateRetry
 
 logger = logging.getLogger(__name__)
 
@@ -60,24 +59,9 @@ def default_state_db_path() -> str:
 class ChainStateStore:
     """SQLite 持久化的链状态仓储（线程安全）。
 
-    性能演进（2026-11，招行现场）：
-
-    旧实现每次 ``apply_action`` 都是「SQLite 全量读 → json.loads → 重建所有
-    节点 → 追加 → 全量 json.dumps → 全量写回」，O(节点数)。长时间运行后
-    时间线到几万节点，单次几十到几百毫秒 —— 招行表现为「跑一段时间就变慢、
-    最后 503」。WAL/NORMAL 只砍掉了 fsync，全量读写的本质没变。
-
-    新实现：
-      - **进程内缓存** tracker（``_trackers``）：``apply_action`` 是纯内存
-        O(1) 追加，不再每次读库/反序列化。
-      - **防抖写盘**：变更标记 dirty，后台 daemon 线程每 ``_flush_interval``
-        秒批量落盘一次。崩溃最坏丢最近一个间隔的增量（与 WAL+NORMAL 的
-        「掉电丢最近一帧」同一量级）。
-      - ``apply_action`` 全程持 ``RLock``：调用方已把它放进线程池，必须保证
-        load→advance→标记 的原子性，否则并发请求会丢节点。
-
-    已知限制：多 worker 部署时各进程缓存互相不可见（与并发池计数同样的
-    限制，见文档）。单进程部署（默认）不受影响。
+    单进程模式下，请求线程持锁推进缓存中的 tracker。普通追加由后台线程每
+    ``_FLUSH_INTERVAL`` 秒批量落盘，重放或轮转产生的新代次在请求内提交。
+    多 worker 模式在同一个 SQLite 写事务中同步已提交状态、判定并写回。
     """
 
     #: 后台落盘间隔（秒）。太短会让写盘重新变成热路径，太长会丢更多。
@@ -85,24 +69,25 @@ class ChainStateStore:
 
     def __init__(self, db_path: str = ""):
         self.db_path = db_path or default_state_db_path()
+        # Serialize snapshot capture through commit, including the final flush.
+        self._flush_lock = threading.Lock()
         self._lock = threading.RLock()
         #: 保护 SQLite 连接（后台 flush 线程与请求线程共用）。锁顺序固定为
-        #: _lock → _db_lock，不允许反向获取。
+        #: _flush_lock（仅 flush/close）→ _lock → _db_lock，不允许反向获取。
         self._db_lock = threading.Lock()
         #: agent_id -> 内存中的 tracker（唯一事实源；SQLite 是它的持久化副本）
         self._trackers: dict[str, StatefulChainTracker] = {}
+        # A retained tracker can outlive its cache entry or advance its in-memory generation.
+        self._tracker_origins: WeakKeyDictionary[StatefulChainTracker, tuple[str, int, int]] = WeakKeyDictionary()
         #: 自上次落盘以来变过的 agent_id
         self._dirty: set[str] = set()
-        #: agent_id -> 已经写进 chain_nodes 表的节点数（增量落盘的游标）。
-        #: 节点本身创建后不可变（_append 之后没有任何字段修改），所以只需按
-        #: 长度差追加新节点，不必每次重写整条时间线。
-        self._persisted_nodes: dict[str, int] = {}
+        #: 每个桶上次同步的持久化版本。seq 从零连续编号，已提交节点数为最后的 seq + 1。
+        self._persisted_generation: dict[str, int] = {}
+        self._synced_seq: dict[str, int] = {}
         #: 多进程模式（2026-11，`AGENT_MOSS_MULTI_PROCESS=1` 或 --workers>1）：
         #: 每次 apply_action 前从 SQLite 拉增量节点 + 元数据，避免各进程缓存
         #: 互相看不见导致组合链漏判。代价是每请求多一次增量查询 + 立即落盘。
         self._multi_process = False
-        #: agent_id -> 已同步到的最大 seq（多进程模式用）
-        self._synced_seq: dict[str, int] = {}
         self._closed = False
         self._stop = threading.Event()
         _parent = Path(self.db_path).parent
@@ -175,264 +160,151 @@ class ChainStateStore:
                 continue
 
     def flush(self) -> int:
-        """把 dirty 的 tracker 落盘，返回写入条数。
+        """Serialize outside the timeline lock, then commit only the captured version."""
+        with self._flush_lock:
+            return self._flush_pending()
 
-        锁粒度（关键，2026-11 长稳实测）：``to_snapshot_parts`` 必须在
-        ``_lock`` 内（tracker 会被并发 advance），但它只做浅拷贝（4 万节点
-        0.42ms）；**逐节点构建、``json.dumps``、SQLite 写全部在锁外** ——
-        这部分 4 万节点要 100ms+，放锁内会让每秒一次的 flush 变成全局卡顿，
-        实测长稳 QPS 47→32、p95 225→529ms。
-        """
+    def _flush_pending(self) -> int:
         with self._lock:
             if self._closed:
                 return 0
-            dirty = list(self._dirty)
-            self._dirty.clear()
-            parts: list[tuple[str, dict]] = []
-            for agent_id in dirty:
+            snapshots = []
+            for agent_id in list(self._dirty):
                 tracker = self._trackers.get(agent_id)
                 if tracker is None:
+                    self._dirty.discard(agent_id)
+                    continue
+                version = self._persisted_version(agent_id)
+                origin = (agent_id, *version)
+                if self._tracker_origins.get(tracker) != origin or tracker.generation < version[0]:
+                    self._invalidate_cache(agent_id)
                     continue
                 try:
-                    # 锁内只做浅拷贝（2 万节点约 0.2ms）；逐节点构建在锁外
-                    parts.append((agent_id, tracker.to_snapshot_parts()))
-                except Exception:  # noqa: BLE001
-                    self._dirty.add(agent_id)
+                    parts = tracker.to_snapshot_parts()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("链状态快照读取失败（会重试）: agent=%s err=%s", agent_id, exc)
+                    continue
+                snapshots.append((agent_id, tracker, tracker.generation, version, parts))
+                self._dirty.discard(agent_id)
+
         written = 0
-        for agent_id, part in parts:
+        for agent_id, tracker, generation, version, parts in snapshots:
+            persisted_generation, last_seq = version
+            replace = generation > persisted_generation
             try:
-                nodes = part["nodes"]  # list[StateNode]（浅拷贝）
-                start = self._persisted_nodes.get(agent_id, 0)
-                new_nodes = nodes[start:]
-                # 锁外：只序列化**新增**的节点（通常 1~几个/秒），不再重写整条时间线
-                rows = [
-                    (
-                        agent_id,
-                        int(n.seq),
-                        json.dumps(
-                            {k: (v if k != "resources" else list(v)) for k, v in n.__dict__.items()},
-                            ensure_ascii=False,
-                        ),
-                    )
-                    for n in new_nodes
-                ]
-                # 元数据（链指针 / taint / alive 资源 / seed 指纹）体积很小，每次全量写。
-                # 注意 seeded_keys 是 set，json 不能直接序列化（2026-11 踩到：
-                # dumps 抛 TypeError 被外层吞掉 → chain_meta 永远写不进去 →
-                # 重启后 load 返回 None，状态全丢）。
-                meta = {k: v for k, v in part.items() if k != "nodes"}
-                if isinstance(meta.get("seeded_keys"), set):
-                    meta["seeded_keys"] = sorted(meta["seeded_keys"])
-                meta_json = json.dumps(meta, ensure_ascii=False)
-                with self._db_lock:
-                    self._conn.execute("BEGIN")
-                    try:
-                        if rows:
-                            self._conn.executemany(
-                                "INSERT OR REPLACE INTO chain_nodes "
-                                "(agent_id, seq, node_json) VALUES (?, ?, ?)",
-                                rows,
-                            )
-                        self._conn.execute(
-                            """
-                            INSERT INTO chain_meta (agent_id, meta_json, updated_at)
-                            VALUES (?, ?, ?)
-                            ON CONFLICT(agent_id) DO UPDATE SET
-                                meta_json=excluded.meta_json,
-                                updated_at=excluded.updated_at
-                            """,
-                            (agent_id, meta_json, time.time()),
-                        )
-                        self._conn.execute("COMMIT")
-                    except Exception:
-                        try:
-                            self._conn.execute("ROLLBACK")
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise
+                rows, metadata = self._serialize_snapshot(agent_id, parts, 0 if replace else last_seq + 1)
                 with self._lock:
-                    self._persisted_nodes[agent_id] = len(nodes)
+                    if self._closed:
+                        break
+                    if (
+                        self._trackers.get(agent_id) is not tracker
+                        or self._persisted_version(agent_id) != version
+                    ):
+                        continue
+                    if tracker.generation != generation:
+                        self._dirty.add(agent_id)
+                        continue
+                    with self._transaction():
+                        if self._durable_version(agent_id) != version or (
+                            version == (0, -1) and self._has_legacy_snapshot(agent_id)
+                        ):
+                            self._invalidate_cache(agent_id)
+                            continue
+                        self._write_snapshot(agent_id, rows, metadata, delete_from=0 if replace else None)
+                    self._publish_cursor(agent_id, len(parts["nodes"]), generation, tracker=tracker)
                 written += 1
             except Exception as exc:  # noqa: BLE001
-                # 写失败 → 重新标记，下个周期再试（不能丢数据）。
-                # 锁定类错误是瞬态的（另一个进程/线程正在写），记 warning 便于排查
-                _msg = str(exc).lower()
-                if "locked" in _msg or "busy" in _msg:
-                    logger.warning(
-                        "链状态写入遇到锁竞争（会重试）: agent=%s err=%s", agent_id, exc
-                    )
                 with self._lock:
-                    self._dirty.add(agent_id)
+                    if self._trackers.get(agent_id) is tracker and tracker.generation == generation:
+                        self._dirty.add(agent_id)
+                logger.warning("链状态写入失败（会重试）: agent=%s err=%s", agent_id, exc)
         return written
 
     def close(self) -> None:
         self._stop.set()
-        try:
-            self.flush()
-        except Exception:  # noqa: BLE001
-            pass
-        with self._lock:
-            self._closed = True
-            with self._db_lock:
-                try:
+        with self._flush_lock, self._lock:
+            if self._closed:
+                return
+            try:
+                self._flush_pending()
+            finally:
+                self._closed = True
+                with self._db_lock:
                     self._conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
 
     # ---------------- 多进程模式 ----------------
 
     def enable_multi_process(self) -> None:
-        """启用多进程模式（每请求增量同步 + 立即落盘 + 跨进程文件锁）。
-
-        为什么需要（2026-11 实测）：4 个 worker 各跑 200 个带状态请求，
-        SQLite 里只有 59 个节点（期望 200）—— 每个进程的内存缓存互相看不见，
-        各自基于过时状态推进，后写的覆盖先写的。L1/L2 无状态可以并行，
-        但链状态必须跨进程一致。
-        """
+        """让各 worker 在 SQLite 写事务中同步并提交，避免基于过时的进度推进链状态。"""
         self._multi_process = True
 
-    def _apply_multi_process(
-        self, agent_id, a_next, session_id, is_error, source_agent, instance_id
-    ):
-        """多进程模式：**一个 BEGIN IMMEDIATE 事务内**完成 读增量 → advance → 写。
-
-        为什么必须同事务（2026-11，社区标准做法）：
-        - 分开做时，两个进程都读到相同的 seq_next，各自 advance 出相同的 seq，
-          后者 INSERT OR REPLACE 覆盖前者 → 丢节点（实测 200 请求只剩 58）。
-        - `BEGIN IMMEDIATE` 在事务开始就抢写锁，其它进程排队（busy_timeout=30s），
-          保证「读到的状态」到「写入」之间没有其它人插入。
-        - 不能用 `BEGIN`（DEFERRED）：WAL 下先读后写会触发 SQLITE_BUSY_SNAPSHOT，
-          busy_timeout 对它无效（SQLite 官方论坛 + 多个生产 PR 确认）。
-        """
-        with self._lock:
-            t = self._trackers.get(agent_id)
-            if t is None:
-                t = self._load_full_uncached(agent_id)
-                if t is None:
-                    t = StatefulChainTracker(agent_id=agent_id)
-                self._trackers[agent_id] = t
-                self._synced_seq[agent_id] = t.nodes[-1].seq if t.nodes else -1
-                self._persisted_nodes[agent_id] = len(t.nodes)
-
-            with self._db_lock:
-                for attempt in range(5):
-                    try:
-                        self._conn.execute("BEGIN IMMEDIATE")
-                        self._sync_in_tx(agent_id, t)
-                        self._rotate_if_needed(agent_id, t, in_tx=True)
-                        r = t.advance(
-                            a_next=a_next,
-                            session_id=session_id,
-                            is_error=is_error,
-                            agent_id=source_agent,
-                            instance_id=instance_id,
-                        )
-                        self._write_in_tx(agent_id, t)
-                        self._conn.execute("COMMIT")
-                        return r
-                    except Exception as exc:  # noqa: BLE001
-                        try:
-                            self._conn.execute("ROLLBACK")
-                        except Exception:  # noqa: BLE001
-                            pass
-                        if attempt >= 4:
-                            raise
-                        _msg = str(exc).lower()
-                        if "locked" not in _msg and "busy" not in _msg:
-                            raise
-                        time.sleep(0.05 * (attempt + 1))
-
-    def _load_full_uncached(self, agent_id: str) -> "StatefulChainTracker | None":
-        """事务外全量加载（仅首次，用于建立本进程的内存基础）。"""
+    @contextlib.contextmanager
+    def _transaction(self, *, write: bool = True):
+        """Call while holding the timeline lock, before acquiring the database lock."""
         with self._db_lock:
-            meta_row = self._conn.execute(
-                "SELECT meta_json FROM chain_meta WHERE agent_id=?", (agent_id,)
-            ).fetchone()
-            if meta_row is None:
-                return None
-            node_rows = self._conn.execute(
-                "SELECT node_json FROM chain_nodes WHERE agent_id=? ORDER BY seq",
-                (agent_id,),
-            ).fetchall()
-        try:
-            meta = json.loads(meta_row["meta_json"])
-            nodes = [json.loads(r["node_json"]) for r in node_rows]
-        except Exception:  # noqa: BLE001
-            return None
-        snap = dict(meta)
-        snap["agent_id"] = agent_id
-        snap["nodes"] = nodes
-        t = StatefulChainTracker(agent_id=agent_id)
-        t.restore(snap)
-        return t
+            self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
-    def _sync_in_tx(self, agent_id: str, tracker: StatefulChainTracker) -> None:
-        """事务内：拉本进程尚未见过的节点 + 最新元数据。"""
+    def _read_meta(self, agent_id: str) -> dict:
         row = self._conn.execute(
             "SELECT meta_json FROM chain_meta WHERE agent_id=?", (agent_id,)
         ).fetchone()
-        last = self._synced_seq.get(agent_id, -1)
-        rows = self._conn.execute(
-            "SELECT node_json FROM chain_nodes WHERE agent_id=? AND seq > ? ORDER BY seq",
-            (agent_id, last),
-        ).fetchall()
-        if row is not None:
-            try:
-                meta = json.loads(row["meta_json"])
-                tracker._ptr = {str(k): int(v) for k, v in (meta.get("ptrs") or {}).items()}
-                tracker._tainted = set(int(i) for i in (meta.get("tainted") or []))
-                tracker._taint_parent = {
-                    int(k): (int(v) if v is not None else None)
-                    for k, v in (meta.get("taint_parent") or {}).items()
-                }
-                tracker._taint_origin = {
-                    str(k): int(v) for k, v in (meta.get("taint_origin") or {}).items()
-                }
-                tracker._alive_resources = dict(meta.get("alive") or {})
-            except Exception:  # noqa: BLE001
-                pass
-        for r in rows:
-            try:
-                d = json.loads(r["node_json"])
-                tracker.nodes.append(StateNode(
-                    seq=int(d.get("seq", 0)),
-                    session_id=str(d.get("session_id", "")),
-                    action_type=str(d.get("action_type", "")),
-                    action_detail=str(d.get("action_detail", "")),
-                    stage=str(d.get("stage", "")),
-                    resources=tuple(d.get("resources") or ()),
-                    instances=tuple(d.get("instances") or ()),
-                    is_error=bool(d.get("is_error", False)),
-                    agent_id=str(d.get("agent_id", "")),
-                    instance_id=str(d.get("instance_id", "")),
-                    lifecycle=str(d.get("lifecycle", "")),
-                    timestamp=d.get("timestamp") or None,
-                ))
-                tracker.seq_next = max(tracker.seq_next, int(d.get("seq", 0)) + 1)
-                self._synced_seq[agent_id] = int(d.get("seq", 0))
-            except Exception:  # noqa: BLE001
-                continue
-        self._persisted_nodes[agent_id] = len(tracker.nodes)
+        return json.loads(row["meta_json"]) if row is not None else {}
 
-    def _write_in_tx(self, agent_id: str, tracker: StatefulChainTracker) -> None:
-        """事务内：把新增节点 + 元数据写进 SQLite（不自己 BEGIN/COMMIT）。"""
-        start = self._persisted_nodes.get(agent_id, 0)
-        nodes = tracker.nodes[start:]
+    def _read_persisted_seq(self, agent_id: str, meta: dict) -> int:
+        if "persisted_seq" in meta:
+            return int(meta["persisted_seq"])
+        # Snapshots from older builds have no persisted cursor in metadata.
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), -1) FROM chain_nodes WHERE agent_id=?", (agent_id,)
+        ).fetchone()
+        return int(row[0])
+
+    def _durable_version(self, agent_id: str) -> tuple[int, int]:
+        meta = self._read_meta(agent_id)
+        return int(meta.get("generation", 0)), self._read_persisted_seq(agent_id, meta)
+
+    def _persisted_version(self, agent_id: str) -> tuple[int, int]:
+        return self._persisted_generation.get(agent_id, 0), self._synced_seq.get(agent_id, -1)
+
+    def _publish_cursor(
+        self, agent_id: str, count: int, generation: int, *, tracker: StatefulChainTracker | None = None,
+    ) -> None:
+        cursor = count - 1
+        self._persisted_generation[agent_id] = generation
+        self._synced_seq[agent_id] = cursor
+        if tracker is not None:
+            self._tracker_origins[tracker] = (agent_id, generation, cursor)
+
+    def _invalidate_cache(self, agent_id: str) -> None:
+        self._trackers.pop(agent_id, None)
+        self._synced_seq.pop(agent_id, None)
+        self._persisted_generation.pop(agent_id, None)
+        self._dirty.discard(agent_id)
+
+    @staticmethod
+    def _serialize_snapshot(agent_id: str, parts: dict, start: int) -> tuple[list, str]:
+        nodes = parts["nodes"]
         rows = [
-            (
-                agent_id,
-                int(n.seq),
-                json.dumps(
-                    {k: (v if k != "resources" else list(v)) for k, v in n.__dict__.items()},
-                    ensure_ascii=False,
-                ),
-            )
-            for n in nodes
+            (agent_id, node.seq, json.dumps(node.__dict__, ensure_ascii=False))
+            for node in nodes[start:]
         ]
-        parts = tracker.to_snapshot_parts()
-        meta = {k: v for k, v in parts.items() if k != "nodes"}
-        if isinstance(meta.get("seeded_keys"), set):
-            meta["seeded_keys"] = sorted(meta["seeded_keys"])
+        meta = {key: value for key, value in parts.items() if key != "nodes"}
+        meta["persisted_seq"] = nodes[-1].seq if nodes else -1
+        return rows, json.dumps(meta, ensure_ascii=False)
+
+    def _write_snapshot(
+        self, agent_id: str, rows: list, metadata: str, *, delete_from: int | None = None,
+    ) -> None:
+        if delete_from is not None:
+            self._conn.execute(
+                "DELETE FROM chain_nodes WHERE agent_id=? AND seq >= ?", (agent_id, delete_from),
+            )
         if rows:
             self._conn.executemany(
                 "INSERT OR REPLACE INTO chain_nodes (agent_id, seq, node_json) VALUES (?, ?, ?)",
@@ -442,214 +314,236 @@ class ChainStateStore:
             "INSERT INTO chain_meta (agent_id, meta_json, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(agent_id) DO UPDATE SET "
             "meta_json=excluded.meta_json, updated_at=excluded.updated_at",
-            (agent_id, json.dumps(meta, ensure_ascii=False), time.time()),
+            (agent_id, metadata, time.time()),
         )
-        self._persisted_nodes[agent_id] = len(tracker.nodes)
-        if tracker.nodes:
-            self._synced_seq[agent_id] = max(
-                self._synced_seq.get(agent_id, -1), tracker.nodes[-1].seq
-            )
 
-    @contextlib.contextmanager
-    def _cross_process_lock(self):
-        """跨进程互斥（fcntl.flock on <db>.lock）。
-
-        只包住「读增量 → advance → 立即落盘」这一小段（O(1) 内存 + 几条 INSERT），
-        不覆盖 L1/L2/L3 —— 那些仍然并行。
-        """
-        import fcntl
-
-        lock_path = str(self.db_path) + ".lock"
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            yield
+    def _sync_in_tx(self, agent_id: str, tracker: StatefulChainTracker) -> None:
+        """Bring both the timeline and its derived state up to the committed version."""
+        meta = self._read_meta(agent_id)
+        durable_seq = self._read_persisted_seq(agent_id, meta)
+        _, generation, last = self._tracker_origins[tracker]
+        durable_generation = int(meta.get("generation", 0))
+        working_count = len(tracker.nodes)
+        if (generation, last) == (durable_generation, durable_seq) and (
+            tracker.generation > generation or (tracker.generation == generation and working_count > last)
+        ):
+            # Include pending edits in the next commit while their durable base is current.
             return
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+        reload = (
+            generation != durable_generation
+            or tracker.generation != durable_generation
+            or working_count != last + 1
+            or durable_seq < last
+        )
+        if reload:
+            last = -1
 
-    def _sync_incremental(self, agent_id: str, tracker: StatefulChainTracker) -> None:
-        """从 SQLite 拉本进程尚未见过的节点 + 最新元数据（链指针 / taint）。
+        rows = self._conn.execute(
+            "SELECT seq, node_json FROM chain_nodes WHERE agent_id=? AND seq > ? ORDER BY seq",
+            (agent_id, last),
+        ).fetchall()
+        nodes = []
+        for expected, row in enumerate(rows, start=last + 1):
+            node = json.loads(row["node_json"])
+            if row["seq"] != expected or node["seq"] != expected:
+                raise ValueError("chain state has a discontinuous sequence")
+            nodes.append(node)
+        if last + len(nodes) != durable_seq:
+            raise ValueError("chain state cursor does not match its stored nodes")
 
-        节点按 seq 增量读（通常几条），元数据全量覆盖（体积小）。
-        """
-        with self._db_lock:
-            row = self._conn.execute(
-                "SELECT meta_json FROM chain_meta WHERE agent_id=?", (agent_id,)
-            ).fetchone()
-            last = self._synced_seq.get(agent_id)
-            if last is None:
-                last = tracker.nodes[-1].seq if tracker.nodes else -1
-            rows = self._conn.execute(
-                "SELECT node_json FROM chain_nodes "
-                "WHERE agent_id=? AND seq > ? ORDER BY seq",
-                (agent_id, last),
-            ).fetchall()
-        if row is not None:
-            try:
-                meta = json.loads(row["meta_json"])
-                tracker._ptr = {str(k): int(v) for k, v in (meta.get("ptrs") or {}).items()}
-                tracker._tainted = set(int(i) for i in (meta.get("tainted") or []))
-                tracker._taint_parent = {
-                    int(k): (int(v) if v is not None else None)
-                    for k, v in (meta.get("taint_parent") or {}).items()
-                }
-                tracker._taint_origin = {
-                    str(k): int(v) for k, v in (meta.get("taint_origin") or {}).items()
-                }
-                tracker._alive_resources = dict(meta.get("alive") or {})
-            except Exception:  # noqa: BLE001 —— 元数据坏了不影响主流程
-                pass
-        for r in rows:
-            try:
-                d = json.loads(r["node_json"])
-            except Exception:  # noqa: BLE001
-                continue
-            try:
-                tracker.nodes.append(StateNode(
-                    seq=int(d.get("seq", 0)),
-                    session_id=str(d.get("session_id", "")),
-                    action_type=str(d.get("action_type", "")),
-                    action_detail=str(d.get("action_detail", "")),
-                    stage=str(d.get("stage", "")),
-                    resources=tuple(d.get("resources") or ()),
-                    instances=tuple(d.get("instances") or ()),
-                    is_error=bool(d.get("is_error", False)),
-                    agent_id=str(d.get("agent_id", "")),
-                    instance_id=str(d.get("instance_id", "")),
-                    lifecycle=str(d.get("lifecycle", "")),
-                    timestamp=d.get("timestamp") or None,
-                ))
-                tracker.seq_next = max(tracker.seq_next, int(d.get("seq", 0)) + 1)
-                # 已同步进来的节点也计入"已落盘"，否则 flush 会把它们再写一遍
-                self._persisted_nodes[agent_id] = len(tracker.nodes)
-            except Exception:  # noqa: BLE001
-                continue
-            self._synced_seq[agent_id] = int(d.get("seq", 0))
+        if reload:
+            tracker.restore({**meta, "agent_id": agent_id, "nodes": nodes})
+        else:
+            tracker.restore_incremental(meta, nodes)
+        self._publish_cursor(agent_id, len(tracker.nodes), tracker.generation, tracker=tracker)
 
-    def _write_immediate(self, agent_id: str, tracker: StatefulChainTracker) -> None:
-        """立即把新节点 + 元数据写进 SQLite（多进程下其它进程要马上看到）。"""
-        self._dirty.discard(agent_id)
-        self.flush()
+    def _change_multi_process(self, agent_id, operation, *, preserve_readonly_denial: bool = False):
+        with self._lock:
+            for attempt in range(5):
+                try:
+                    tracker = self.load(agent_id) or self._new_tracker(agent_id)
+                    with self._transaction():
+                        self._sync_in_tx(agent_id, tracker)
+                        _, generation, last = self._tracker_origins[tracker]
+                        count = last + 1
+                        before = None
+                        if tracker.generation == generation and len(tracker.nodes) >= count:
+                            # Replays allocate a new list. Appends leave the committed prefix intact.
+                            before = tracker.nodes
+                        result = operation(tracker)
+                        if tracker.generation != generation:
+                            self._replace_in_tx(agent_id, tracker, before)
+                        elif len(tracker.nodes) != count:
+                            rows, metadata = self._serialize_snapshot(
+                                agent_id, tracker.to_snapshot_parts(), count,
+                            )
+                            self._write_snapshot(agent_id, rows, metadata)
+                    self._trackers[agent_id] = tracker
+                    self._publish_cursor(agent_id, len(tracker.nodes), tracker.generation, tracker=tracker)
+                    self._dirty.discard(agent_id)
+                    return result, tracker
+                except UnconfirmedGateRetry:
+                    # A plain advance rejected before mutation. Its sync only read committed state.
+                    if preserve_readonly_denial:
+                        self._trackers[agent_id] = tracker
+                    else:
+                        self._invalidate_cache(agent_id)
+                    raise
+                except Exception as exc:
+                    self._invalidate_cache(agent_id)
+                    if attempt == 4 or not isinstance(exc, sqlite3.OperationalError):
+                        raise
+                    message = str(exc).lower()
+                    if "locked" not in message and "busy" not in message:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
 
     # ---------------- 读写 ----------------
 
-    def load(self, agent_id: str) -> StatefulChainTracker | None:
-        """读取某 agent 的 tracker（优先内存缓存）；不存在返回 None。
+    def _read_snapshot(self, agent_id: str, meta: dict) -> dict | None:
+        if not meta:
+            return None
+        if meta.get("deleted"):
+            return meta
+        rows = self._conn.execute(
+            "SELECT node_json FROM chain_nodes WHERE agent_id=? ORDER BY seq", (agent_id,),
+        )
+        return {**meta, "agent_id": agent_id, "nodes": [json.loads(row[0]) for row in rows]}
 
-        新结构（0.17.23 起）：节点按行存在 ``chain_nodes``，元数据在
-        ``chain_meta``。首次遇到旧结构（``chain_state`` 整份 JSON）时做一次
-        迁移，迁移完删掉旧行。
-        """
+    def _read_legacy_snapshot(self, agent_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT state_json FROM chain_state WHERE agent_id=?", (agent_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row is not None else None
+
+    def _has_legacy_snapshot(self, agent_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM chain_state WHERE agent_id=?", (agent_id,)
+        ).fetchone() is not None
+
+    def load(self, agent_id: str) -> StatefulChainTracker | None:
+        """Read metadata and nodes from one durable snapshot before caching."""
         with self._lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("chain state store is closed")
             cached = self._trackers.get(agent_id)
             if cached is not None:
                 return cached
-            with self._db_lock:
-                meta_row = self._conn.execute(
-                    "SELECT meta_json FROM chain_meta WHERE agent_id=?", (agent_id,)
-                ).fetchone()
-                if meta_row is None:
-                    old_row = self._conn.execute(
-                        "SELECT state_json FROM chain_state WHERE agent_id=?", (agent_id,)
-                    ).fetchone()
-                    if old_row is None:
-                        return None
-                    try:
-                        snap = json.loads(old_row["state_json"])
-                    except (ValueError, TypeError):
-                        return None
-                    self._migrate_from_old(agent_id, snap)
-                else:
-                    node_rows = self._conn.execute(
-                        "SELECT node_json FROM chain_nodes WHERE agent_id=? ORDER BY seq",
-                        (agent_id,),
-                    ).fetchall()
-                    try:
-                        meta = json.loads(meta_row["meta_json"])
-                    except (ValueError, TypeError):
-                        return None
-                    snap = dict(meta)
-                    snap["agent_id"] = agent_id
-                    try:
-                        snap["nodes"] = [json.loads(r["node_json"]) for r in node_rows]
-                    except (ValueError, TypeError):
-                        return None
-            t = StatefulChainTracker(agent_id=agent_id)
-            t.restore(snap)
-            self._trackers[agent_id] = t
-            self._persisted_nodes[agent_id] = len(t.nodes)
-            return t
 
-    def _migrate_from_old(self, agent_id: str, snap: dict) -> None:
-        """把旧结构（``chain_state`` 整份 JSON 一行）迁移到新表，成功后删旧行。
+            with self._transaction(write=False):
+                meta = self._read_meta(agent_id)
+                needs_normalization = "seeded_keys" in meta
+                snapshot = None if needs_normalization else self._read_snapshot(agent_id, meta)
+                legacy = self._read_legacy_snapshot(agent_id) if not meta else None
 
-        幂等：迁移失败（异常）会保留旧行，下次 load 再试；不会丢数据。
-        """
-        nodes = snap.get("nodes") or []
-        meta = {k: v for k, v in snap.items() if k not in ("nodes", "agent_id")}
-        self._conn.execute("BEGIN")
-        try:
-            if nodes:
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO chain_nodes (agent_id, seq, node_json) "
-                    "VALUES (?, ?, ?)",
-                    [
-                        (agent_id, int(n.get("seq", i)), json.dumps(n, ensure_ascii=False))
-                        for i, n in enumerate(nodes)
-                    ],
-                )
-            self._conn.execute(
-                "INSERT OR REPLACE INTO chain_meta (agent_id, meta_json, updated_at) "
-                "VALUES (?, ?, ?)",
-                (agent_id, json.dumps(meta, ensure_ascii=False), time.time()),
-            )
-            self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
-            self._conn.execute("COMMIT")
-        except Exception:  # noqa: BLE001
-            try:
-                self._conn.execute("ROLLBACK")
-            except Exception:  # noqa: BLE001
-                pass
-            raise
+            tracker = None
+            if legacy is not None or needs_normalization:
+                with self._transaction():
+                    # Recheck under the write lock before normalizing legacy fingerprints.
+                    snapshot = self._read_snapshot(agent_id, self._read_meta(agent_id))
+                    if snapshot is None:
+                        legacy = self._read_legacy_snapshot(agent_id)
+                        if legacy is not None:
+                            tracker = self._migrate_from_old(agent_id, legacy)
+                    elif "seeded_keys" in snapshot:
+                        tracker = self._normalize_legacy_snapshot_in_tx(agent_id, snapshot)
+
+            if tracker is None:
+                if snapshot is None:
+                    return None
+                if snapshot.get("deleted"):
+                    self._publish_cursor(agent_id, 0, int(snapshot["generation"]))
+                    return None
+                tracker = StatefulChainTracker(agent_id=agent_id)
+                tracker.restore(snapshot)
+            self._trackers[agent_id] = tracker
+            self._publish_cursor(agent_id, len(tracker.nodes), tracker.generation, tracker=tracker)
+            return tracker
+
+    def _migrate_from_old(self, agent_id: str, snapshot: dict) -> StatefulChainTracker:
+        """Migrate a legacy snapshot under the same transaction as its lookup."""
+        tracker = self._normalize_legacy_snapshot_in_tx(agent_id, snapshot)
+        self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
+        return tracker
+
+    def _normalize_legacy_snapshot_in_tx(self, agent_id: str, snapshot: dict) -> StatefulChainTracker:
+        tracker = StatefulChainTracker(agent_id=agent_id)
+        tracker.restore({**snapshot, "agent_id": agent_id})
+        rows, metadata = self._serialize_snapshot(agent_id, tracker.to_snapshot_parts(), 0)
+        self._write_snapshot(agent_id, rows, metadata)
+        return tracker
 
     def load_or_new(self, agent_id: str) -> StatefulChainTracker:
         """读取某 agent 的 tracker；不存在则新建（幂等）。"""
         with self._lock:
             t = self.load(agent_id)
             if t is None:
-                t = StatefulChainTracker(agent_id=agent_id)
+                t = self._new_tracker(agent_id)
                 self._trackers[agent_id] = t
                 self._dirty.add(agent_id)
             return t
 
-    def save(self, tracker: StatefulChainTracker) -> None:
-        """标记 tracker 需要落盘（内存先更新，后台线程批量写）。
+    def _new_tracker(self, agent_id: str) -> StatefulChainTracker:
+        tracker = StatefulChainTracker(agent_id=agent_id)
+        generation, cursor = self._persisted_version(agent_id)
+        tracker.generation = generation
+        self._tracker_origins[tracker] = (agent_id, generation, cursor)
+        return tracker
 
-        立即写盘请调用 ``flush()`` —— review 这类「写完马上要被另外的进程
-        读到」的场景用它。
+    def save(self, tracker: StatefulChainTracker) -> None:
+        """多 worker 模式下立即提交，单进程模式下由后台线程批量写。
+
+        tracker 必须基于当前已提交的代次和游标。外部创建的 tracker 只能初始化新状态桶，
+        旧表中的快照须先通过 ``load()`` 迁移。单进程模式下可调用 ``flush()`` 立即落盘。
         """
         with self._lock:
-            self._trackers[tracker.agent_id] = tracker
-            self._dirty.add(tracker.agent_id)
+            if self._closed:
+                raise sqlite3.ProgrammingError("chain state store is closed")
+            agent_id = tracker.agent_id
+            origin = self._tracker_origins.get(tracker, (agent_id, 0, -1))
+            write_now = self._multi_process
+            try:
+                with self._transaction(write=write_now):
+                    generation, cursor = self._durable_version(agent_id)
+                    count = cursor + 1
+                    if origin != (agent_id, generation, cursor) or tracker.generation < generation:
+                        raise ValueError("chain state tracker predates the persisted generation or cursor")
+                    if (generation, cursor) == (0, -1) and self._has_legacy_snapshot(agent_id):
+                        raise ValueError("chain state has an unmigrated legacy snapshot; load it before saving")
+                    if write_now:
+                        replace = tracker.generation > generation
+                        parts = tracker.to_snapshot_parts()
+                        rows, metadata = self._serialize_snapshot(agent_id, parts, 0 if replace else count)
+                        self._write_snapshot(agent_id, rows, metadata, delete_from=0 if replace else None)
+                        count, generation = len(parts["nodes"]), parts["generation"]
+            except Exception as exc:
+                if (write_now or isinstance(exc, ValueError)) and self._trackers.get(agent_id) is tracker:
+                    self._invalidate_cache(agent_id)
+                raise
+            self._trackers[agent_id] = tracker
+            self._publish_cursor(agent_id, count, generation, tracker=tracker)
+            if write_now:
+                self._dirty.discard(agent_id)
+            else:
+                self._dirty.add(agent_id)
 
     def delete(self, agent_id: str) -> None:
         with self._lock:
-            self._trackers.pop(agent_id, None)
-            self._dirty.discard(agent_id)
-            self._persisted_nodes.pop(agent_id, None)
-            with self._db_lock:
-                self._conn.execute("DELETE FROM chain_nodes WHERE agent_id=?", (agent_id,))
-                self._conn.execute("DELETE FROM chain_meta WHERE agent_id=?", (agent_id,))
+            with self._transaction():
+                previous = self._read_meta(agent_id) or self._read_legacy_snapshot(agent_id) or {}
+                generation = int(previous.get("generation", 0)) + 1
+                # Retain the generation fence even when all action data is removed.
+                metadata = json.dumps({
+                    "deleted": True,
+                    "generation": generation,
+                    "persisted_seq": -1,
+                })
+                self._write_snapshot(agent_id, [], metadata, delete_from=0)
                 self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
+            self._invalidate_cache(agent_id)
+            self._publish_cursor(agent_id, 0, generation)
 
-    # ---------------- 自动轮转（派生缓存，不是原始历史存储） ----------------
+    # ---------------- 自动轮转与状态重放 ----------------
 
     def _archive_dir(self) -> Path:
         raw = os.getenv("AGENT_MOSS_CHAIN_ARCHIVE_DIR", "")
@@ -657,75 +551,56 @@ class ChainStateStore:
             return Path(raw)
         return Path(self.db_path).parent / "chain-archive"
 
-    def _replace_in_tx(self, agent_id: str, tracker: StatefulChainTracker) -> None:
-        """事务内用轮转后的 tracker 整体替换该 agent 的持久化状态。"""
-        self._conn.execute("DELETE FROM chain_nodes WHERE agent_id=?", (agent_id,))
-        self._conn.execute("DELETE FROM chain_meta WHERE agent_id=?", (agent_id,))
-        self._conn.execute("DELETE FROM chain_state WHERE agent_id=?", (agent_id,))
+    def _replace_in_tx(
+        self, agent_id: str, tracker: StatefulChainTracker, before: list[StateNode] | None,
+    ) -> None:
+        """Commit the changed suffix when the previous durable nodes are known."""
+        persisted_generation, last_seq = self._persisted_version(agent_id)
+        if tracker.generation < persisted_generation:
+            raise ValueError("chain state tracker predates the persisted generation")
         parts = tracker.to_snapshot_parts()
         nodes = parts["nodes"]
-        rows = [
-            (
-                agent_id,
-                int(n.seq),
-                json.dumps(
-                    {k: (list(v) if k in ("resources", "instances") else v)
-                     for k, v in n.__dict__.items()},
-                    ensure_ascii=False,
-                ),
-            )
-            for n in nodes
-        ]
-        if rows:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO chain_nodes "
-                "(agent_id, seq, node_json) VALUES (?, ?, ?)",
-                rows,
-            )
-        meta = {k: v for k, v in parts.items() if k != "nodes"}
-        if isinstance(meta.get("seeded_keys"), set):
-            meta["seeded_keys"] = sorted(meta["seeded_keys"])
-        self._conn.execute(
-            "INSERT OR REPLACE INTO chain_meta (agent_id, meta_json, updated_at) "
-            "VALUES (?, ?, ?)",
-            (agent_id, json.dumps(meta, ensure_ascii=False), time.time()),
-        )
-        self._persisted_nodes[agent_id] = len(nodes)
-        self._synced_seq[agent_id] = nodes[-1].seq if nodes else -1
+        persisted_count = last_seq + 1
+        start = 0
+        if before is not None:
+            for index in range(min(persisted_count, len(before), len(nodes))):
+                if before[index] is not nodes[index]:
+                    break
+                start += 1
+        rows, metadata = self._serialize_snapshot(agent_id, parts, start)
+        delete_from = None
+        if start == 0:
+            delete_from = 0
+        elif len(nodes) < persisted_count:
+            delete_from = len(nodes)
+        self._write_snapshot(agent_id, rows, metadata, delete_from=delete_from)
 
-    def _rotate_if_needed(self, agent_id: str, tracker: StatefulChainTracker, *, in_tx: bool = False) -> bool:
-        """到达节点上限时自动归档旧节点并保留最近窗口。"""
-        from .stateful import _MAX_NODES
-        if len(tracker.nodes) < _MAX_NODES:
-            return False
-        try:
-            archived, path = tracker.rotate(self._archive_dir())
-        except Exception as exc:  # noqa: BLE001
-            logger.error("链状态轮转失败（保留现有数据，不丢新节点）: agent=%s err=%s", agent_id, exc)
-            return False
-        if archived <= 0:
-            return False
-        if in_tx:
-            self._replace_in_tx(agent_id, tracker)
-        else:
-            with self._db_lock:
-                self._conn.execute("BEGIN")
-                try:
-                    self._replace_in_tx(agent_id, tracker)
-                    self._conn.execute("COMMIT")
-                except Exception:
-                    try:
-                        self._conn.execute("ROLLBACK")
-                    except Exception:
-                        pass
-                    raise
-        logger.warning(
-            "链状态自动轮转: agent=%s 归档 %d 条 → %s，保留 %d 条",
-            agent_id, archived, path, len(tracker.nodes),
-        )
-        return True
-
-    # ---------------- 应用层入口（供 server 用） ----------------
+    def _change_single_process(self, agent_id, operation, may_rewrite):
+        with self._lock:
+            tracker = self.load_or_new(agent_id)
+            generation, count = tracker.generation, len(tracker.nodes)
+            before = tracker.to_snapshot_parts() if may_rewrite(tracker) else None
+            try:
+                result = operation(tracker)
+                if tracker.generation != generation:
+                    version = self._persisted_version(agent_id)
+                    durable_generation, durable_last = version
+                    durable_nodes = None
+                    if before is not None and generation == durable_generation and count > durable_last:
+                        durable_nodes = before["nodes"]
+                    with self._transaction():
+                        if self._durable_version(agent_id) != version:
+                            raise RuntimeError("chain state changed before replay could commit")
+                        self._replace_in_tx(agent_id, tracker, durable_nodes)
+                    self._publish_cursor(agent_id, len(tracker.nodes), tracker.generation, tracker=tracker)
+                    self._dirty.discard(agent_id)
+                elif len(tracker.nodes) != count:
+                    self._dirty.add(agent_id)
+                return result, tracker
+            except Exception:
+                if before is not None:
+                    tracker.restore(tracker.finalize_snapshot(before))
+                raise
 
     def apply_action(
         self,
@@ -736,73 +611,29 @@ class ChainStateStore:
         source_agent: str = "",
         instance_id: str = "",
     ) -> AdvanceResult:
-        """有状态的实时增量：对某 agent 的 tracker 推送一条当前动作并判定。
+        def advance(tracker):
+            return tracker.advance(
+                a_next=a_next, session_id=session_id, is_error=is_error,
+                agent_id=source_agent, instance_id=instance_id, archive_dir=self._archive_dir(),
+            )
 
-        - 首次（无 tracker）→ 从空状态 advance（等价只分析当前动作）。
-        - 之后 → 增量推进时间线 + 链指针。
-        - 返回 AdvanceResult（matched/exfil = 应阻断；pending_prefixes = 前序）。
-
-        并发：调用方已把本方法放进线程池，这里**全程持锁**保证
-        load→advance→标记 的原子性 —— 否则两个并发请求会各自 based on
-        同一份快照推进，后写的覆盖先写的（丢节点 = 组合链漏拦）。
-        锁内只做内存操作，O(1)；写盘由后台线程完成。
-        """
         if self._multi_process:
-            # 多进程：一个 BEGIN IMMEDIATE 事务内完成 读增量 → advance → 写。
-            return self._apply_multi_process(
-                agent_id, a_next, session_id, is_error, source_agent, instance_id
+            result, _ = self._change_multi_process(agent_id, advance, preserve_readonly_denial=True)
+        else:
+            result, _ = self._change_single_process(
+                agent_id, advance, lambda tracker: tracker.will_rewrite(a_next, session_id),
             )
-
-        if False:  # 旧的多进程分支（保留结构占位，已被上方取代）
-            with self._lock:
-                if True:
-                    t = self.load(agent_id) or StatefulChainTracker(agent_id=agent_id)
-                    self._sync_incremental(agent_id, t)
-                    r = t.advance(
-                        a_next=a_next,
-                        session_id=session_id,
-                        is_error=is_error,
-                        agent_id=source_agent,
-                        instance_id=instance_id,
-                    )
-                    self.save(t)
-                    # 自己写的节点也要推进同步游标，否则下次会把它们当"新增"
-                    # 重复处理（实测：不更新时 200 请求只落 60 个节点）
-                    if t.nodes:
-                        self._synced_seq[agent_id] = max(
-                            self._synced_seq.get(agent_id, -1), t.nodes[-1].seq
-                        )
-                self.flush()  # 文件锁内立即落盘，让其它进程马上看到
-                return r
-
-        with self._lock:
-            t = self.load(agent_id) or StatefulChainTracker(agent_id=agent_id)
-            self._rotate_if_needed(agent_id, t)
-            r = t.advance(
-                a_next=a_next,
-                session_id=session_id,
-                is_error=is_error,
-                agent_id=source_agent,
-                instance_id=instance_id,
-            )
-            self.save(t)
-            return r
+        return result
 
     def seed_and_save(
-        self, agent_id: str, sessions: list[dict]
-    ) -> tuple[int, "StatefulChainTracker"]:
-        """review 专用：**持锁**完成 load → seed → 标记落盘，返回 (新增数, tracker)。
+        self, agent_id: str, sessions: list[dict],
+    ) -> tuple[int, StatefulChainTracker]:
+        def seed(tracker):
+            return tracker.seed(sessions, archive_dir=self._archive_dir())
 
-        为什么单独一个方法（2026-11）：``/review`` 原先在锁外调
-        ``tracker.seed(...)`` —— 它修改的是内存缓存里的**同一个 tracker 对象**，
-        而此时并发的 ``apply_action`` 正在持锁推进同一条时间线。两边同时改
-        ``nodes`` / 链指针，结果就是丢节点或指针错位。锁必须覆盖整个 seed。
-        """
-        with self._lock:
-            tracker = self.load_or_new(agent_id)
-            added = tracker.seed(sessions)
-            self.save(tracker)
-            return added, tracker
+        if self._multi_process:
+            return self._change_multi_process(agent_id, seed)
+        return self._change_single_process(agent_id, seed, lambda _: True)
 
     def seed_and_apply(
         self,
@@ -816,16 +647,21 @@ class ChainStateStore:
 
         语义等价 FormalEngine 全量验证（先建立历史时间线，再推进当前动作）。
         """
-        with self._lock:
-            t = self.load(agent_id) or StatefulChainTracker(agent_id=agent_id)
-            t.seed(sessions)
-            r = t.advance(
+        def seed_then_advance(tracker):
+            archive_dir = self._archive_dir()
+            tracker.seed(sessions, archive_dir=archive_dir)
+            return tracker.advance(
                 a_next=a_next,
                 session_id=session_id,
                 is_error=is_error,
+                archive_dir=archive_dir,
             )
-            self.save(t)
-            return r
+
+        if self._multi_process:
+            result, _ = self._change_multi_process(agent_id, seed_then_advance)
+        else:
+            result, _ = self._change_single_process(agent_id, seed_then_advance, lambda _: True)
+        return result
 
 
 # 全局单例（FastAPI 进程内共享；测试可注入独立实例）

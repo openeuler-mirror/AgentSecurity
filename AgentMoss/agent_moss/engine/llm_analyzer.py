@@ -16,14 +16,19 @@ from datetime import datetime
 
 from ..infra.config import (
     Config,
-    get_llm_action_detail_max_chars,
-    get_llm_history_max_items,
-    get_llm_max_prompt_tokens,
-    get_llm_prompt_history_max_turns,
+    get_llm_prompt_budget_config,
     get_llm_timeout,
     get_log_path,
 )
-from ..infra.llm_client import LLMCircuitOpenError, LLMResponseError, call_llm
+from ..infra.llm_client import LLMCircuitOpenError, LLMResponseError, LLMResult, call_llm
+from ..infra.metrics import L3_BUDGET_EVENTS_TOTAL
+from .llm_prompt_budget import (
+    estimate_tokens,
+    format_action_history,
+    format_prompt_history,
+    prepare_l3_prompt,
+    truncate_detail,
+)
 from .script_analyzer import (
     ScriptAnalysisResult,
     analyze_script_content,
@@ -41,6 +46,41 @@ logger = logging.getLogger(__name__)
 
 class LLMAnalysisFailure(Exception):
     """LLM 分析失败的异常"""
+
+
+class LLMPromptBudgetExceeded(LLMAnalysisFailure):
+    """The L3 request was skipped before contacting the model."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _record_l3_usage(result: LLMResult, budget: int, attempt: int, *, count_empty: bool = False) -> None:
+    prompt_tokens = result.prompt_tokens or 0
+    completion_tokens = result.completion_tokens or 0
+    total_tokens = result.total_tokens or 0
+    if prompt_tokens > 0:
+        logger.debug("l3_prompt_tokens_actual=%d model=%s attempt=%d", prompt_tokens, result.model, attempt)
+        if budget > 0 and prompt_tokens > budget:
+            logger.warning(
+                "l3_budget_exceeded_actual: actual=%d budget=%d model=%s attempt=%d",
+                prompt_tokens, budget, result.model, attempt,
+            )
+            L3_BUDGET_EVENTS_TOTAL.inc(event="l3_budget_exceeded_actual")
+
+    # Count a returned response even when its provider did not report usage.
+    if not (count_empty or prompt_tokens or completion_tokens or total_tokens):
+        return
+    try:
+        from ..infra.token_stats import record_token_usage
+
+        record_token_usage(
+            session_id="audit", step="L3_security_judge", model=result.model,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens,
+        )
+    except Exception:
+        pass  # 统计故障不影响判定或原始模型错误。
 
 
 def _masked_base_url(url: str) -> str:
@@ -137,29 +177,24 @@ class LLMAnalyzer:
         Returns:
             SecurityJudgment: 安全判断结果
         """
-        from ..infra.prompt_templates import get_security_judge_prompt
+        budget = get_llm_prompt_budget_config()
 
         # 0. LLM 结果缓存查找
         action_type = a_next.get("action_type", "")
         action_detail = a_next.get("action_detail", "")
-        # cache_key 用动作详情的 sha256：超长 tool call（如写文件，detail 里带整个
-        # 文件内容）若直接用全文当 key，200 条缓存会占几十 MB 内存。
-        detail_digest = hashlib.sha256(
-            action_detail.encode("utf-8", "ignore")
-        ).hexdigest()
-        cache_key = f"{action_type}:{detail_digest}"
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            logger.debug("LLM cache hit: %s", cache_key)
-            return cached
+        cache_key = None
+        if budget.max_prompt_tokens == 0:
+            # 动作详情可能含完整文件内容，缓存键只保留其摘要。
+            detail_digest = hashlib.sha256(action_detail.encode("utf-8", "ignore")).hexdigest()
+            cache_key = f"{action_type}:{detail_digest}"
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.debug("LLM cache hit: %s", cache_key)
+                return cached
 
         # 1. 匹配相关 Skill
         matched_skills = self._skill_engine.match_skills(a_next, reason)
         skills_text = self._skill_engine.format_skills_for_prompt(matched_skills)
-
-        # 2.5 格式化交错历史 prompt（供 LLM 判断意图一致性，避免"继续"覆盖初始意图）
-        # 只喂 prompt 文本 + 各轮动作类型/详情（截断），与 action_history 互补但不重复。
-        prompt_history_text = self._format_prompt_history(prompt_history)
 
         # 3. 格式化特征匹配/逻辑规则提示
         hints_text = self._format_hints(heuristic_result, logic_result)
@@ -173,82 +208,58 @@ class LLMAnalyzer:
             script_analysis = analyze_script_content(action_type, action_detail)
             script_analysis_text = format_script_analysis_for_prompt(script_analysis)
 
-        # 4. 生成安全判断 prompt。
-        #
-        # 背景（2026-11）：客户的写文件类 tool call 会把整个文件内容放进
-        # action_detail，历史累积几十条后 prompt 能到几十万字符。这里分两级兜底：
-        #   ① 历史按配置截断（条数 + 单条长度）—— 默认就生效；
-        #   ② 若设了 AGENT_MOSS_LLM_MAX_PROMPT_TOKENS 且仍超预算，先把历史压到
-        #      最小，最后才截断当前动作详情（保头保尾，判定仍以命令/路径为主）。
-        max_items = get_llm_history_max_items()
-        max_chars = get_llm_action_detail_max_chars()
-        max_prompt_tokens = get_llm_max_prompt_tokens()
-        prompt_a_next = a_next
-
-        for _attempt in range(4):
-            history_text = self._format_action_history(
-                action_history, max_items, max_chars
+        prepared = prepare_l3_prompt(
+            budget,
+            prompt_session=prompt_session,
+            action_history=action_history,
+            prompt_history=prompt_history,
+            a_next=a_next,
+            reason=reason,
+            skills_text=skills_text,
+            hints_text=hints_text,
+            script_analysis_text=script_analysis_text,
+            skip_l3_hints=skip_l3_hints,
+            path_context=path_context,
+        )
+        estimated = estimate_tokens(prepared.text)
+        logger.debug(
+            "L3 prompt_size actions_in=%d prompt_chars=%d estimated_tokens=%d token_budget=%d stage=%s",
+            len(action_history or ()), len(prepared.text), estimated, budget.max_prompt_tokens, prepared.stage,
+        )
+        if prepared.code:
+            logger.warning(
+                "%s: mode=%s estimated=%d floor_estimate=%d budget=%d",
+                prepared.code, budget.mode, estimated, prepared.floor_estimate, budget.max_prompt_tokens,
             )
-            judge_prompt = get_security_judge_prompt(
-                prompt_session=prompt_session,
-                action_history=history_text,
-                prompt_history_text=prompt_history_text,
-                a_next=prompt_a_next,
-                reason=reason,
-                skills_text=skills_text,
-                hints_text=hints_text,
-                script_analysis_text=script_analysis_text,
-                skip_l3_hints=skip_l3_hints,
-                path_context=path_context,
-            )
-            if max_prompt_tokens <= 0:
-                break
-            if self._estimate_tokens(judge_prompt) <= max_prompt_tokens:
-                break
-            # 超预算：历史条数 / 单条长度减半后重建
-            max_items = max(2, max_items // 2) if max_items > 0 else 2
-            max_chars = max(100, max_chars // 2) if max_chars > 0 else 100
-        else:
-            # 历史已压到最小仍超预算 → 截断当前动作详情
-            if max_prompt_tokens > 0:
-                estimated = self._estimate_tokens(judge_prompt)
-                ratio = estimated / max_prompt_tokens
-                allowed = max(200, int(len(action_detail) / ratio))
-                prompt_a_next = dict(a_next)
-                prompt_a_next["action_detail"] = self._truncate_detail(
-                    action_detail, allowed
-                )
-                history_text = self._format_action_history(
-                    action_history, max_items, max_chars
-                )
-                judge_prompt = get_security_judge_prompt(
-                    prompt_session=prompt_session,
-                    action_history=history_text,
-                    prompt_history_text=prompt_history_text,
-                    a_next=prompt_a_next,
-                    reason=reason,
-                    skills_text=skills_text,
-                    hints_text=hints_text,
-                    script_analysis_text=script_analysis_text,
-                    skip_l3_hints=skip_l3_hints,
-                    path_context=path_context,
-                )
-                logger.warning(
-                    "L3 prompt 超 token 预算（估 %d > %d），当前动作详情截断至 %d 字符",
-                    estimated,
-                    max_prompt_tokens,
-                    len(prompt_a_next["action_detail"]),
-                )
+            L3_BUDGET_EVENTS_TOTAL.inc(event=prepared.code)
+            if budget.mode == "hard":
+                raise LLMPromptBudgetExceeded(prepared.code)
 
-        if logger.isEnabledFor(logging.DEBUG):
-            action_count = len(action_history or ())
-            logger.debug(
-                "L3 prompt_size actions_in=%d actions_kept=%d prompt_chars=%d "
-                "estimated_tokens=%d token_budget=%d",
-                action_count, min(action_count, max_items) if max_items > 0 else action_count,
-                len(judge_prompt), self._estimate_tokens(judge_prompt), max_prompt_tokens,
+        try:
+            judgment = self._judge_prompt(
+                prepared.text, a_next, config, llm_config, llm_log_path, budget.max_prompt_tokens,
             )
+        except Exception as exc:
+            if prepared.code:
+                exc.l3_budget_degraded = prepared.code
+            raise
+        if prepared.code:
+            judgment.degraded.append(prepared.code)
+        if cache_key is not None:
+            if len(self._cache) >= self._cache_max:
+                self._cache.popitem(last=False)
+            self._cache[cache_key] = judgment
+        return judgment
 
+    def _judge_prompt(
+        self,
+        judge_prompt: str,
+        a_next: dict[str, str],
+        config: Config,
+        llm_config: dict | None,
+        llm_log_path: str | None,
+        max_prompt_tokens: int,
+    ) -> SecurityJudgment:
         # 4.5 打印 prompt 到日志文件（如果配置了 AGENT_MOSS_LOG_PATH）
         # 优先级：per-request 注入的 llm_log_path（来自调用方 env，bridge 子进程有
         # AGENT_MOSS_LOG_PATH 但服务进程不一定有，per-request 注入解决跨进程）>
@@ -387,20 +398,7 @@ class LLMAnalyzer:
                 except Exception:  # noqa: BLE001
                     pass
 
-                # 记录 token 用量（step="L3_security_judge"）
-                try:
-                    from ..infra.token_stats import record_token_usage
-                    record_token_usage(
-                        session_id="audit",
-                        step="L3_security_judge",
-                        model=llm_result.model,
-                        prompt_tokens=llm_result.prompt_tokens,
-                        completion_tokens=llm_result.completion_tokens,
-                        total_tokens=llm_result.total_tokens,
-                    )
-                except Exception:
-                    pass  # token 统计失败不影响主流程
-
+                _record_l3_usage(llm_result, max_prompt_tokens, attempt, count_empty=True)
                 try:
                     judgment = self._parse_llm_response(llm_result.content)
                 except Exception as parse_exc:
@@ -435,10 +433,6 @@ class LLMAnalyzer:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-                # 写入缓存（超出上限时淘汰最旧条目）
-                if len(self._cache) >= self._cache_max:
-                    self._cache.popitem(last=False)
-                self._cache[cache_key] = judgment
                 return judgment
 
             except FuturesTimeoutError:
@@ -490,14 +484,7 @@ class LLMAnalyzer:
                 # 空响应仍可能消耗推理 token；仅记录服务端明确报告的用量。
                 # 已成功返回但 JSON 解析失败的响应在上方已记过，不重复计数。
                 if isinstance(e, LLMResponseError) and e.result is not None:
-                    try:
-                        from ..infra.token_stats import record_token_usage
-                        record_token_usage(
-                            session_id="audit", step="L3_security_judge",
-                            **e.result.to_usage_dict(),
-                        )
-                    except Exception:
-                        pass  # 统计故障不能覆盖原始模型错误
+                    _record_l3_usage(e.result, max_prompt_tokens, attempt)
                 # API 错误（如并发限制 500006、400/500 错误等），非超时
                 error_type = type(e).__name__
                 # OpenAI SDK 的 APIStatusError 带 status_code / body：str(e) 往往
@@ -552,122 +539,10 @@ class LLMAnalyzer:
 
         return parse_security_judgment(response)
 
-    @staticmethod
-    def _truncate_detail(detail: str, max_chars: int) -> str:
-        """截断单条动作详情：保头 60% + 尾 40%，中间标注省略长度。
-
-        超长 tool call（写文件内容）对安全判定的价值集中在头部（命令/工具）
-        和尾部（结构），中间大段正文不需要逐字喂给模型。
-        """
-        if max_chars <= 0 or len(detail) <= max_chars:
-            return detail
-        head = max(1, int(max_chars * 0.6))
-        tail = max(0, max_chars - head)
-        omitted = len(detail) - max_chars
-        tail_part = detail[-tail:] if tail else ""
-        return f"{detail[:head]}...[省略 {omitted} 字符]...{tail_part}"
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """粗略估算 token 数（中英混合按 ~2.5 字符/token 保守估计）。
-
-        只用于「是否超过预算」的闸门判断，不追求精确 —— 精确计数需要
-        tokenizer 依赖，而这里只需避免 prompt 无限膨胀。
-        """
-        return int(len(text) / 2.5) + 1
-
-    @staticmethod
-    def _format_action_history(
-        action_history: list[dict[str, object]],
-        max_items: int = 0,
-        max_chars: int = 0,
-    ) -> str:
-        """格式化历史动作序列。
-
-        Args:
-            max_items: 最多保留最近多少条（0 = 不限）。更早的只计数量不展开。
-            max_chars: 单条 action_detail 最多保留多少字符（0 = 不截断）。
-        """
-        if not action_history:
-            return "（无历史动作）"
-
-        omitted_items = 0
-        items = action_history
-        if max_items > 0 and len(action_history) > max_items:
-            omitted_items = len(action_history) - max_items
-            items = action_history[-max_items:]
-
-        lines = []
-        if omitted_items:
-            lines.append(f"（更早的 {omitted_items} 条历史动作已省略）")
-        for i, action in enumerate(items, 1):
-            if isinstance(action, dict):
-                name = action.get("name", action.get("action_type", "未知"))
-                detail = action.get("action_detail", "")
-                if detail:
-                    detail = LLMAnalyzer._truncate_detail(str(detail), max_chars)
-                    lines.append(f"  {i}. {name}: {detail}")
-                else:
-                    lines.append(f"  {i}. {name}")
-            else:
-                lines.append(f"  {i}. {str(action)}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_prompt_history(
-        prompt_history: list[dict[str, object]] | None,
-        max_text_chars: int = 500,
-        max_turns: int | None = None,
-    ) -> str:
-        """格式化最近提交的历史轮次，保留原轮号。
-
-        窗口内的非空意图按字符截断，附带动作只显示类型。默认只保留最近
-        ``AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS``（20）轮，避免 prompt
-        随会话长度无限膨胀；0 表示不限制。空/None 返回占位。
-        """
-        if not prompt_history:
-            return "（未提供历史意图）"
-
-        if max_turns is None:
-            max_turns = get_llm_prompt_history_max_turns()
-        first_turn_index = (
-            max(0, len(prompt_history) - max_turns) if max_turns > 0 else 0
-        )
-        lines = []
-        longest_text_chars = 0
-        for i, turn in enumerate(prompt_history[first_turn_index:], start=first_turn_index + 1):
-            if not isinstance(turn, dict):
-                continue
-            text = turn.get("text", "")
-            if not isinstance(text, str):
-                text = ""
-            text = text.strip()
-            if not text:
-                continue
-            text = text[:max_text_chars]
-            longest_text_chars = max(longest_text_chars, len(text))
-            line = f"  第{i}轮用户意图: {text}"
-            actions = turn.get("actions")
-            if actions and isinstance(actions, list):
-                action_types = []
-                for a in actions:
-                    if isinstance(a, dict):
-                        at = a.get("action_type", "")
-                        detail = a.get("action_detail", "")
-                        if isinstance(at, str) and at:
-                            action_types.append(at if not detail or not isinstance(detail, str) else f"{at}")
-                if action_types:
-                    line += f"  → 动作: {', '.join(action_types)}"
-            lines.append(line)
-
-        logger.debug(
-            "L3 prompt_history turns_in=%d turns_kept=%d window=%d longest_text_chars=%d",
-            len(prompt_history), len(lines), max_turns or len(prompt_history),
-            longest_text_chars,
-        )
-        if not lines:
-            return "（未提供历史意图）"
-        return "\n".join(lines)
+    _truncate_detail = staticmethod(truncate_detail)
+    _estimate_tokens = staticmethod(estimate_tokens)
+    _format_action_history = staticmethod(format_action_history)
+    _format_prompt_history = staticmethod(format_prompt_history)
 
     @staticmethod
     def _format_hints(
@@ -692,6 +567,9 @@ class LLMAnalyzer:
                 f"   类型: {logic_result.risk_type}\n"
                 f"   原因: {logic_result.reason}"
             )
+        elif getattr(logic_result, "l3_hint", ""):
+            # L2 不确定、没有拦截，但保留了结构化观察给 L3，不能丢。
+            hints.append(f"ℹ️ {logic_result.l3_hint}")
 
         if not hints:
             return "特征匹配检测和逻辑规则检测均未发现风险。"

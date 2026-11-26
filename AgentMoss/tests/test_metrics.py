@@ -38,6 +38,15 @@ def test_counter_l3_outcome_dimension():
     assert 'l3_outcome="circuit_open"' in out
 
 
+def test_l3_budget_event_counter_is_rendered_and_reset():
+    metrics.L3_BUDGET_EVENTS_TOTAL.inc(event="l3_budget_floor_exceeds")
+    series = 'agent_moss_l3_budget_events_total{event="l3_budget_floor_exceeds"}'
+    assert f"{series} 1.0" in metrics.render_prometheus()
+
+    metrics.reset_for_tests()
+    assert series not in metrics.render_prometheus()
+
+
 def test_histogram_buckets():
     metrics.ANALYZE_DURATION.observe(0.02, decision="Deny")
     out = metrics.render_prometheus()

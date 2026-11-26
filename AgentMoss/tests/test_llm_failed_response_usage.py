@@ -7,7 +7,7 @@ import pytest
 
 from agent_moss.engine.llm_analyzer import LLMAnalyzer, LLMAnalysisFailure
 from agent_moss.engine.types import HeuristicResult, LogicRuleResult
-from agent_moss.infra.config import CacheConfig, Config, LLMConfig, RetryConfig, SecurityConfig
+from agent_moss.infra.config import CacheConfig, Config, LLMConfig, RetryConfig
 from agent_moss.infra.token_stats import get_token_stats
 
 
@@ -135,12 +135,29 @@ def test_invalid_json_response_does_not_double_count_usage(local_model):
     assert stats["total_tokens"] == 36
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_invalid_json_retry_counts_both_responses_when_usage_is_missing(local_model, streaming):
+    responses, settings, config = local_model
+    settings["stream_only"] = streaming
+    config.retry.max_retries = 2
+    responses.extend([{"content": "not valid JSON"}, {"content": SUCCESS["content"]}])
+
+    assert analyze(config).allowed is True
+
+    stats = get_token_stats()
+    assert stats["total_calls"] == 2
+    assert stats["total_tokens"] == 0
+    assert stats["total_prompt_tokens"] == 0
+    assert stats["by_step"]["L3_security_judge"]["calls"] == 2
+
+
 def test_failed_policy_response_records_usage(local_model, monkeypatch):
     from agent_moss.engine.analyzer import analyze as run_analysis
     from agent_moss.infra.policy_cache import PolicyCache
     responses, _, config = local_model
-    config.security = SecurityConfig(llm_analysis_enabled=False)
     config.timeout.step_interval = 0
+    # Reserve the mock response for policy generation by disabling the L3 judge.
+    monkeypatch.setenv("AGENT_MOSS_DISABLE_LLM", "1")
     monkeypatch.setenv("AGENT_MOSS_ENABLE_POLICY_GEN", "1")
     monkeypatch.setenv("AGENT_MOSS_SAVE_POLICY", "0")
     responses.append({"content": None, "finish_reason": "length", "usage": USED})

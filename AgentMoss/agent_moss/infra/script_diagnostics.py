@@ -34,6 +34,14 @@ _next_capture = 0.0
 _next_write = 0.0
 
 
+def capture_reachable_content(details: dict, source: str, reachable_content: str) -> None:
+    details["reachable_content_matches_source"] = reachable_content == source
+    if len(reachable_content) <= _MAX_EVENT_BYTES:
+        details["reachable_content"] = reachable_content
+    else:
+        details["reachable_content_omitted"] = True
+
+
 def start_script_diagnostics_writer() -> bool:
     """Start one daemon writer per process before accepting diagnostic requests."""
     global _writer_started
@@ -120,6 +128,15 @@ class ScriptDiagnostics:
         }
         try:
             line = _encode(event)
+            if len(line) > _MAX_EVENT_BYTES:
+                nodes = event.get("nodes", [])
+                if any("reachable_content" in node for node in nodes):
+                    # Keep scan evidence if the optional text exceeds the record budget.
+                    event["nodes"] = [node.copy() for node in nodes]
+                    for node in event["nodes"]:
+                        if node.pop("reachable_content", None) is not None:
+                            node["reachable_content_omitted"] = True
+                    line = _encode(event)
             if len(line) > _MAX_EVENT_BYTES:
                 event.pop("nodes", None)
                 event["details_omitted"] = True

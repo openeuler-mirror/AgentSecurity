@@ -203,6 +203,11 @@ LLM_DURATION = Histogram(
     "LLM API call duration in seconds.",
     labelnames=("result",),
 )
+L3_BUDGET_EVENTS_TOTAL = Counter(
+    "agent_moss_l3_budget_events_total",
+    "L3 prompt budget events, by event code.",
+    ("event",),
+)
 POOL_INFLIGHT = Gauge(
     "agent_moss_pool_inflight",
     "Current in-flight requests per concurrency pool.",
@@ -252,6 +257,7 @@ def render_prometheus() -> str:
         REJECTED_TOTAL,
         LLM_CALLS_TOTAL,
         LLM_DURATION,
+        L3_BUDGET_EVENTS_TOTAL,
         POOL_INFLIGHT,
         CHAIN_NODES,
         CHAIN_DB_BYTES,
@@ -320,6 +326,7 @@ def reset_for_tests() -> None:
             REJECTED_TOTAL,
             LLM_CALLS_TOTAL,
             LLM_DURATION,
+            L3_BUDGET_EVENTS_TOTAL,
             POOL_INFLIGHT,
             CHAIN_NODES,
             CHAIN_DB_BYTES,

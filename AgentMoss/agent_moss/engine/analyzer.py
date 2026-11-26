@@ -81,6 +81,8 @@ def analyze(
     session_history: list[dict[str, object]] | None = None,
     instance_id: str = "",
     script_diagnostics: "ScriptDiagnostics | None" = None,
+    *,
+    include_l3_diagnostics: bool = False,
 ) -> dict[str, str]:
     """
     分析 agent 的下一步动作是否在安全范围内，并在允许时生成最小 policy。
@@ -128,7 +130,16 @@ def analyze(
         """
         if judgment is not None:
             res.setdefault("source", judgment.source)
-            res.setdefault("l3_outcome", derive_l3_outcome(judgment))
+            l3_outcome = derive_l3_outcome(judgment)
+            res.setdefault("l3_outcome", l3_outcome)
+            if judgment.degraded:
+                res.setdefault("degraded", list(judgment.degraded))
+            if judgment.ask_recommended:
+                res.setdefault("ask_recommended", True)
+                res.setdefault("ask_reason", judgment.ask_reason)
+            if include_l3_diagnostics and l3_outcome == "circuit_open":
+                # 策略生成可能有自己的失败原因，保留原判定的熔断原因供路由使用。
+                res["_l3_circuit_reason"] = judgment.reason
         else:
             res.setdefault("l3_outcome", "")
         return res

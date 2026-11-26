@@ -16,6 +16,7 @@ Language Backend（Shell/Python/Node...）把源脚本解析成统一的 IR：
 
 import hashlib
 from dataclasses import dataclass, field
+from enum import Enum
 
 
 def scan_fingerprint(content: str) -> tuple[int, str]:
@@ -29,6 +30,12 @@ def scan_fingerprint(content: str) -> tuple[int, str]:
     return length, digest.hexdigest()
 
 
+class WorkingDirectory(Enum):
+    """运行目录未知时，仍可读取绝对路径指定的脚本。"""
+
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class ScriptCall:
     """子脚本调用（路径 + 参数）。由 RecursiveTracker 消费。"""
@@ -36,6 +43,8 @@ class ScriptCall:
     path: str                       # 子脚本路径（可相对/绝对/~）
     args: list[str] = field(default_factory=list)  # 调用参数（如 bash child.py backup → ["backup"]）
     interpreter: str = "bash"       # 调用解释器（bash/python3/node...）
+    # 子进程的工作目录，相对于当前进程 cwd。None 沿用从源文件目录解析的规则。
+    launch_cwd: str | WorkingDirectory | None = None
 
 
 @dataclass

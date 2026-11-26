@@ -28,7 +28,7 @@ from .types import HeuristicResult
 
 # _is_write_operation 留在 logic_rules.py 作为单一事实源（read_before_write 也用），
 # 此处复用避免读写判定逻辑漂移。
-from .logic_rules import _is_write_operation, _SensitivePathMatcher, _is_directory_delete_action, _is_archive_read_of_dir, _is_ssh_keygen_generate
+from .logic_rules import _is_write_operation, _SensitivePathMatcher, _is_directory_delete_action, _is_archive_read_of_dir, _is_ssh_keygen_generate, is_build_artifact_cleanup
 from .logic_rules import has_exec_bypass_chain, ALL_QUOTES_RE
 # 引号感知命令段切分同样下沉 logic_rules（NEW-FN-M 起含单管道切分），单一事实源：
 from .logic_rules import _SEPARATOR_SEGMENTS, _split_shell_segments
@@ -36,6 +36,7 @@ from .logic_rules import _SEPARATOR_SEGMENTS, _split_shell_segments
 from .written_content_analyzer import (
     is_file_write_action,
     analyze_written_content,
+    is_data_document,
     strip_shell_docs_only,
 )
 
@@ -428,7 +429,11 @@ class DangerousPatternChecker:
             r"|rm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+\S*[*?]",
             re.IGNORECASE,
         )
-        if not is_temp_path and _wildcard_delete_re.search(_scan):
+        if (
+            not is_temp_path
+            and not is_build_artifact_cleanup(action_detail)
+            and _wildcard_delete_re.search(_scan)
+        ):
             return HeuristicResult(
                 hit=True,
                 matched_patterns=["wildcard+delete"],
@@ -1202,6 +1207,70 @@ _COMMAND_PREFIX_WORDS = frozenset({"sudo", "command", "nohup", "time"})
 _QUOTED_CONTENT_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 
+#: 会吞掉一个参数的检索选项（其后是文件过滤条件，不是检索模式本身）。
+_SEARCH_OPTION_WITH_ARG = frozenset({
+    "-m", "--max-count", "-A", "--after-context", "-B", "--before-context",
+    "-C", "--context", "-d", "--directories", "-D", "--devices",
+    "--include", "--exclude", "--exclude-dir", "--glob", "--iglob",
+    "--type", "--type-add", "--type-not",
+})
+
+
+def _join_shell_tokens(tokens: list[str]) -> str:
+    """重组 token，保留 &&/||/|/;/& 为裸操作符，避免 shlex.join 给管道加引号。"""
+    return " ".join(
+        token if token in ("&&", "||", "|", ";", "&") else shlex.quote(token)
+        for token in tokens
+    )
+
+
+def _strip_search_pattern_argument(seg: str) -> str:
+    """只摘掉检索命令的**模式参数**，保留文件操作数（含引号包裹的真实路径）。
+
+    不能像 ``_QUOTED_CONTENT_RE`` 那样整段剥引号：``grep -n "foo" "/etc/passwd"``
+    的第二个引号参数是真实文件，剥掉会把路径访问一并隐藏。这里按 shell token
+    定位 grep 家族的模式参数（``-e/--regexp`` 或首个非选项 token），只删它。
+    """
+    try:
+        tokens = shlex.split(seg)
+    except ValueError:
+        return seg
+    if not tokens:
+        return seg
+    idx = 0
+    while idx < len(tokens) and tokens[idx] in _COMMAND_PREFIX_WORDS:
+        idx += 1
+    if idx >= len(tokens) or tokens[idx] not in _TEXT_SEARCH_COMMANDS:
+        return seg
+    pattern_idx: int | None = None
+    i = idx + 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--":
+            pattern_idx = i + 1 if i + 1 < len(tokens) else None
+            break
+        if token in ("-e", "--regexp"):
+            pattern_idx = i + 1 if i + 1 < len(tokens) else None
+            break
+        if token.startswith("--regexp="):
+            pattern_idx = i
+            break
+        if token in ("-f", "--file") or token.startswith("--file="):
+            break  # 模式来自文件，没有可摘的内联模式
+        if token.startswith("-") and token != "-":
+            i += 2 if token in _SEARCH_OPTION_WITH_ARG else 1
+            continue
+        pattern_idx = i
+        break
+    if pattern_idx is None or pattern_idx >= len(tokens):
+        return seg
+    tokens.pop(pattern_idx)
+    try:
+        return _join_shell_tokens(tokens)
+    except Exception:  # noqa: BLE001
+        return seg
+
+
 def strip_search_pattern_literals(action_detail: str) -> str:
     """剥离文本检索命令段里的引号内容（搜索模式/glob 是数据，不是命令）。
 
@@ -1218,6 +1287,9 @@ def strip_search_pattern_literals(action_detail: str) -> str:
     """
     parts: list[str] = []
     for seg in _split_command_segments(action_detail):
+        if seg.strip() in ("&&", "||", ";", "|", "&", "\n"):
+            parts.append(seg)
+            continue
         low = seg.strip().lower()
         words = low.split()
         idx = 0
@@ -1225,7 +1297,7 @@ def strip_search_pattern_literals(action_detail: str) -> str:
             idx += 1
         is_search = idx < len(words) and words[idx] in _TEXT_SEARCH_COMMANDS
         if is_search and "--pre" not in low:
-            parts.append(_QUOTED_CONTENT_RE.sub(" ", seg))
+            parts.append(_strip_search_pattern_argument(seg))
         else:
             parts.append(seg)
     return "".join(parts)
@@ -1464,7 +1536,13 @@ class CommandPatternScanner:
             scan_texts.append(_deob)
         if getattr(self._profile, "os_type", "") == "windows":
             scan_texts.append(scan_text.replace("/", "\\"))
-        candidates = self._accel_candidates(active, scan_texts)
+        # 场景/agent 专属规则里常有路径白名单（如 bank 的“只允许 /home/sandbox”）。
+        # grep/sed/awk 的引号内是搜索模式，不是路径访问：`grep -n "/" file.js`
+        # 不能因为模式里有一个 `/` 就被判成访问根目录。只对**追加规则**使用剥离
+        # 后的文本；通用危险命令规则保持原文，避免改变既有判定。
+        extra_start = len(active) - len(self._agent_extra_compiled)
+        extra_scan_texts = [strip_search_pattern_literals(t) for t in scan_texts]
+        candidates = self._accel_candidates(active, scan_texts + extra_scan_texts)
         # ssh-keygen 生成模式豁免：生成新私钥时 -f 后的私钥路径是写目标，不应命中
         # 「访问私钥」命令正则（如 .ssh/id_rsa）。读模式（-y/-l/-p）不受豁免。
         exempt_keygen = _is_ssh_keygen_generate(action_detail)
@@ -1475,7 +1553,10 @@ class CommandPatternScanner:
         hits = [
             p for index, p in enumerate(active)
             if (candidates is None or index in candidates)
-            and any(p["regex"].search(t) for t in scan_texts)
+            and any(
+                p["regex"].search(t)
+                for t in (extra_scan_texts if index >= extra_start else scan_texts)
+            )
             and not (exempt_keygen and p["risk_type"] == "file_access")
             and (
                 p["pattern"] not in QUOTED_SAFE_PASSWORD_PATTERNS
@@ -1981,6 +2062,11 @@ class HeuristicDetector:
         injection_text = combined_text
         python_walk_onerror_only = False
         if _is_search_action_type(action_type):
+            injection_text = f"{action_type} {reason} {prompt_session}".lower()
+        elif handled_write and is_data_document(action_type, action_detail_raw):
+            # 普通报告/数据文档的正文是数据，不是给当前 agent 的指令。
+            # 只跳过“正文关键词”检测；prompt/reason/工具名仍然检测，写
+            # prompt.txt / AGENTS.md / skill/记忆/配置等指令源也仍然检测。
             injection_text = f"{action_type} {reason} {prompt_session}".lower()
         elif (
             action_type in ("bash", "executebash", "terminal-executebash")

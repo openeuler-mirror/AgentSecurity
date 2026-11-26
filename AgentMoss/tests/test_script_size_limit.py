@@ -116,3 +116,60 @@ def test_benign_oversize_script_is_allowed_when_limit_raised(big_scripts):
 def test_nonexistent_script_is_not_flagged(big_scripts):
     """**关键区分**：「脚本不存在」不算风险（跑也跑不起来），不能被 fail-closed 误伤。"""
     assert _decide(f"bash {big_scripts}/nope.sh", big_scripts) == "Allow"
+
+
+def test_host_role_defers_script_content_to_sandbox(big_scripts):
+    """host 角色不尝试读沙箱脚本内容，响应标记 deferred_to_sandbox。"""
+    env = dict(os.environ)
+    env["AGENT_MOSS_DISABLE_LLM"] = "1"
+    env["AGENT_MOSS_DATA_DIR"] = tempfile.mkdtemp(prefix="sz-host-")
+    env["AGENT_MOSS_DEPLOY_ROLE"] = "host"
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    code = f"""
+import json, os, tempfile
+os.environ['AGENT_MOSS_DATA_DIR'] = tempfile.mkdtemp()
+from agent_moss.engine.analyzer import analyze
+from agent_moss.profiles import get_profile
+r = analyze(session_id='sz-host', prompt_session='', action_history=[],
+            a_next={{'action_type': 'bash', 'action_detail': 'bash {big_scripts}/nope-host.sh'}},
+            reason='', config=None, cache=None, profile=get_profile('linux'),
+            llm_config=None, cwd={big_scripts!r}, agent_id='', scenario_id='',
+            llm_log_path=None, prompt_history=[], session_history=[])
+print(json.dumps({{'decision': r['decision'], 'degraded': r.get('degraded', [])}}))
+"""
+    out = subprocess.run([sys.executable, "-c", code], env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[-800:]
+    import json
+
+    payload = json.loads(out.stdout.strip().splitlines()[-1])
+    assert payload["decision"] == "Allow"
+    assert any("script_content_deferred_to_sandbox" in x for x in payload["degraded"])
+
+
+def test_missing_script_reports_degraded(big_scripts):
+    """脚本读不到时放行，但必须带 degraded 说明，调用方才知道内容未扫描。"""
+    env = dict(os.environ)
+    env["AGENT_MOSS_DISABLE_LLM"] = "1"
+    env["AGENT_MOSS_DATA_DIR"] = tempfile.mkdtemp(prefix="sz-deg-")
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    code = f"""
+import json, os, tempfile
+os.environ['AGENT_MOSS_DATA_DIR'] = tempfile.mkdtemp()
+from agent_moss.engine.analyzer import analyze
+from agent_moss.profiles import get_profile
+r = analyze(session_id='sz-deg', prompt_session='', action_history=[],
+            a_next={{'action_type': 'bash', 'action_detail': 'bash {big_scripts}/nope-deg.sh'}},
+            reason='', config=None, cache=None, profile=get_profile('linux'),
+            llm_config=None, cwd={big_scripts!r}, agent_id='', scenario_id='',
+            llm_log_path=None, prompt_history=[], session_history=[])
+print(json.dumps({{'decision': r['decision'], 'degraded': r.get('degraded', [])}}))
+"""
+    out = subprocess.run([sys.executable, "-c", code], env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[-800:]
+    import json
+
+    payload = json.loads(out.stdout.strip().splitlines()[-1])
+    assert payload["decision"] == "Allow"
+    assert any("script_content_unavailable" in x for x in payload["degraded"])

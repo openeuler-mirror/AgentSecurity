@@ -43,6 +43,7 @@ from ..infra.runtime_config import (
 from ..infra.rules_mode import (
     get_rules_mode, is_builtin_only, is_runtime_config_disabled,
 )
+from ..infra.edition_scope import is_allowed
 from ..engine.skill_engine import default_skills_dir
 from ..infra.token_stats import (
     get_token_stats,
@@ -585,15 +586,32 @@ def get_skill_content(skill_id: str):
 # ==================== agent 定制规则 ====================
 
 
+def _ensure_agent_in_scope(agent_id: str) -> None:
+    """交付范围外的 agent 不允许通过 Console 读写（防止隐藏分区被绕过编辑）。"""
+    if not is_allowed("agents", agent_id):
+        raise HTTPException(status_code=404, detail=f"agent {agent_id} 不在本交付范围内")
+
+
+def _ensure_scenario_in_scope(scenario_id: str) -> None:
+    if not is_allowed("scenarios", scenario_id):
+        raise HTTPException(status_code=404, detail=f"scenario {scenario_id} 不在本交付范围内")
+
+
 @router.get("/api/agents", dependencies=[Depends(auth_dependency)])
 def get_agents():
-    """获取所有 agent 定制规则（含 enabled 状态，供 console 展示）。"""
-    return {"agents": get_agent_rules(_runtime_for_view())}
+    """获取当前交付范围内、且已启用的 agent 定制规则（含 enabled 状态）。"""
+    agents = {
+        agent_id: rules
+        for agent_id, rules in get_agent_rules(_runtime_for_view()).items()
+        if is_allowed("agents", agent_id)
+    }
+    return {"agents": agents}
 
 
 @router.put("/api/agents/rules/enabled", dependencies=[Depends(auth_dependency)])
 def toggle_agent_rule(body: AgentRuleToggle):
     """切换某 agent 某条规则的 enabled。"""
+    _ensure_agent_in_scope(body.agent_id)
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
         "keyword": body.keyword, "path": body.path,
@@ -605,6 +623,7 @@ def toggle_agent_rule(body: AgentRuleToggle):
 @router.post("/api/agents/rules", dependencies=[Depends(auth_dependency)])
 def create_agent_rule(body: NewAgentRule):
     """向某 agent 的某类别新增规则条目。"""
+    _ensure_agent_in_scope(body.agent_id)
     rule = {k: v for k, v in body.model_dump().items()
             if k not in ("agent_id", "category") and v is not None}
     runtime = add_agent_rule(body.agent_id, body.category, rule)
@@ -614,6 +633,7 @@ def create_agent_rule(body: NewAgentRule):
 @router.delete("/api/agents/rules", dependencies=[Depends(auth_dependency)])
 def remove_agent_rule(body: DeleteAgentRule):
     """删除某 agent 某条规则。"""
+    _ensure_agent_in_scope(body.agent_id)
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
         "keyword": body.keyword, "path": body.path,
@@ -625,6 +645,7 @@ def remove_agent_rule(body: DeleteAgentRule):
 @router.put("/api/agents/categories/enabled", dependencies=[Depends(auth_dependency)])
 def toggle_agent_category(body: AgentCategoryToggle):
     """切换某 agent 某类别的整类开关（category_enabled）。"""
+    _ensure_agent_in_scope(body.agent_id)
     runtime = update_agent_category_enabled(body.agent_id, body.category, body.enabled)
     return {"agents": get_agent_rules(runtime)}
 
@@ -651,7 +672,7 @@ def get_scenarios():
     也不启用（部署级场景未配置）；有 env（如 AGENT_MOSS_SCENARIO=bank）时显示该场景。
     """
     all_scenarios = get_scenario_rules(_runtime_for_view())
-    enabled = _enabled_scenario_ids()
+    enabled = [sid for sid in _enabled_scenario_ids() if is_allowed("scenarios", sid)]
     if not enabled:
         return {"scenarios": {}, "enabled": []}
     shown = {sid: all_scenarios[sid] for sid in enabled if sid in all_scenarios}
@@ -661,6 +682,7 @@ def get_scenarios():
 @router.put("/api/scenarios/rules/enabled", dependencies=[Depends(auth_dependency)])
 def toggle_scenario_rule(body: ScenarioRuleToggle):
     """切换某场景某条规则的 enabled。"""
+    _ensure_scenario_in_scope(body.scenario_id)
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
         "keyword": body.keyword, "path": body.path,
@@ -672,6 +694,7 @@ def toggle_scenario_rule(body: ScenarioRuleToggle):
 @router.post("/api/scenarios/rules", dependencies=[Depends(auth_dependency)])
 def create_scenario_rule(body: NewScenarioRule):
     """向某场景的某类别新增规则条目。"""
+    _ensure_scenario_in_scope(body.scenario_id)
     rule = {k: v for k, v in body.model_dump().items()
             if k not in ("scenario_id", "category") and v is not None}
     runtime = add_scenario_rule(body.scenario_id, body.category, rule)
@@ -681,6 +704,7 @@ def create_scenario_rule(body: NewScenarioRule):
 @router.delete("/api/scenarios/rules", dependencies=[Depends(auth_dependency)])
 def remove_scenario_rule(body: DeleteScenarioRule):
     """删除某场景某条规则。"""
+    _ensure_scenario_in_scope(body.scenario_id)
     fp = {k: v for k, v in {
         "value": body.value, "pattern": body.pattern,
         "keyword": body.keyword, "path": body.path,
@@ -692,6 +716,7 @@ def remove_scenario_rule(body: DeleteScenarioRule):
 @router.put("/api/scenarios/categories/enabled", dependencies=[Depends(auth_dependency)])
 def toggle_scenario_category(body: ScenarioCategoryToggle):
     """切换某场景某类别的整类开关（category_enabled）。"""
+    _ensure_scenario_in_scope(body.scenario_id)
     runtime = update_scenario_category_enabled(body.scenario_id, body.category, body.enabled)
     return {"scenarios": get_scenario_rules(runtime), "enabled": _enabled_scenario_ids()}
 

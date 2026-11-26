@@ -467,13 +467,32 @@ def create_app() -> FastAPI:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        gate_call_id = None
+        gate_required = request.headers.get(sp.GATE_IDENTITY_HEADER)
+        gate_path = path.rstrip("/")
+        if method == "POST" and gate_required is not None and gate_path in (
+            "/api/v1/analyze", "/api/v1/review",
+        ):
+            if principal != sp.GATE_PRINCIPAL:
+                return JSONResponse(status_code=403, content={"detail": "AgentGate 专用身份校验失败"})
+            if gate_required != "1":
+                return JSONResponse(status_code=422, content={"detail": "AgentGate 专用请求头无效"})
+        if method == "POST" and gate_path == "/api/v1/analyze" and principal == sp.GATE_PRINCIPAL:
+            gate_call_id = request.headers.get(sp.GATE_CALL_ID_HEADER)
+            if gate_required != "1" or not sp.valid_gate_call_id(gate_call_id):
+                return JSONResponse(status_code=422, content={"detail": "AgentGate 专用请求头无效"})
+            request.state.gate_call_id = gate_call_id
+
         # 4) 限流（0 = 不限，默认）
         if _limiter.enabled and path.startswith("/api/"):
             if not await _limiter.allow(_rate_key(request, principal)):
+                headers = {"Retry-After": "1"}
+                if gate_call_id is not None:
+                    headers[sp.GATE_RATE_LIMIT_HEADER] = gate_call_id
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "请求过于频繁，请稍后重试"},
-                    headers={"Retry-After": "1"},
+                    headers=headers,
                 )
 
         # 5) 分层并发闸门（快速拒绝，不排队）
@@ -513,7 +532,10 @@ def create_app() -> FastAPI:
                         "⚠️ 疑似恶意并发占用: key=%s 窗口内被拒 %d 次（阈值 %d）",
                         _qkey, _q_n, sp.queue_abuse_threshold(),
                     )
-                return _busy("服务繁忙（并发已满），请稍后重试")
+                response = _busy("服务繁忙（并发已满），请稍后重试")
+                if gate_call_id is not None:
+                    response.headers[sp.GATE_BUSY_HEADER] = gate_call_id
+                return response
 
             return await call_next(request)
         finally:

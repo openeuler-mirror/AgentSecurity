@@ -286,31 +286,47 @@ def cmd_status(args):
     # 期望 instance：从 env AGENT_MOSS_INSTANCE 读（systemd/install.sh 注入），默认空串。
     # status 命令要避免「systemd 已死但 9090 上有别的 agent 的 agentmoss（instance 不匹配）
     # 却误报运行中」——只认 instance 匹配的实例；若仅有不匹配实例，明确提示归属错配。
+    #
+    # 2026-11 修三处（同机多实例时严重误导）：
+    #  1. `degraded` 也是活着：此前只认 status=="healthy"，服务降级（链状态触顶 /
+    #     LLM 熔断）时 status 直接报"未运行"，运维会去重启一个根本没死的服务。
+    #  2. Instance 行总是打印：此前只在设了 AGENT_MOSS_INSTANCE 时显示，shell 里
+    #     通常没设 → 匹配到**任意 instance 为空**的实例却不说明，在同时装了
+    #     Windows 版/WSL 版的机器上会显示另一个系统的服务（实测：Windows 的
+    #     9092 被当成 WSL 的本实例）。
+    #  3. 扫到的实例全部列出，而不是命中第一个就 break —— 用户要能看见"还有哪些"。
     expect_instance = os.getenv("AGENT_MOSS_INSTANCE", "")
     found_port = None
     version = ""
-    # 记录探测到的所有 healthy 实例（instance 可能不匹配，用于错配提示）
-    other_instances: list[tuple[int, str]] = []
+    # 扫到的全部实例（端口, instance, 版本），无论是否匹配
+    seen: list[tuple[int, str, str]] = []
     for port in range(9090, 9096):
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/health", method="GET")
             with urllib.request.urlopen(req, timeout=2) as resp:
                 data = _json.loads(resp.read().decode("utf-8"))
-                if data.get("status") != "healthy":
+                # degraded = 活着但某项能力降级，仍然算"运行中"
+                if data.get("status") not in ("healthy", "degraded"):
                     continue
                 inst = data.get("instance", "")
-                if inst == expect_instance:
+                ver = data.get("version", "")
+                seen.append((port, inst, ver))
+                if found_port is None and inst == expect_instance:
                     found_port = port
-                    version = data.get("version", "")
-                    break
-                other_instances.append((port, inst))
+                    version = ver
         except Exception:
             continue
 
+    other_instances = [s for s in seen if s[0] != found_port]
+
     if found_port:
         print(f"✅ AgentMoss 服务运行中")
-        if expect_instance:
-            print(f"   Instance: {expect_instance}")
+        print(f"   Instance: {expect_instance or '(未指定)'}")
+        if not expect_instance and len(seen) > 1:
+            print(
+                "   ⚠️  未设置 AGENT_MOSS_INSTANCE，上面显示的是第一个 instance 为空的实例；"
+                "同机的其它实例见下方清单"
+            )
         print(f"   版本:     {version or '?'}")
         print(f"   端口:     {found_port}")
         print(f"   Console:  http://127.0.0.1:{found_port}/console")
@@ -336,6 +352,18 @@ def cmd_status(args):
                 print(f"   L3 LLM 分析: {l3}")
         except Exception:
             pass
+        # 同机其它实例全部列出（2026-11）：此前命中第一个就 break，用户看不到
+        # 「9092 是 Windows 版、9091 才是这台 WSL 的」这类信息。
+        if other_instances:
+            print()
+            print(f"   ⚠️  同机另有 {len(other_instances)} 个实例（未计入上面的状态）：")
+            for p, i, v in other_instances:
+                # 同名实例：同一个 AGENT_MOSS_INSTANCE 起了多份（常见于升级时旧进程
+                # 没退干净）。端口小的先被选中，所以这里要明确标出来，否则运维会
+                # 以为看到的就是最新的那份。
+                tag = "  ← 与本实例同名（可能是升级后未退出的旧/新进程）" if i == expect_instance else ""
+                print(f"     端口 {p}  instance={i or '(空)'}  v{v or '?'}{tag}")
+            print("     查看指定实例：AGENT_MOSS_INSTANCE=<名字> agent-moss status")
         print()
         print("   启停命令：")
         print("     systemctl start agent-moss   启动")
@@ -345,14 +373,17 @@ def cmd_status(args):
         print("     journalctl -u agent-moss -f  日志")
     elif other_instances:
         # 有 healthy 实例但都不匹配期望 instance —— 明确提示归属错配，不误报运行中
-        print(f"❌ AgentMoss 服务未运行（instance={expect_instance or '(空)'}）")
+        print(f"❌ AgentMoss 服务未运行（instance={expect_instance or '(未指定)'}）")
         print(f"   Systemd:  {'active' if systemd_active else 'inactive'}")
-        detail = "; ".join(f"端口 {p} (instance={i or '(空)'})" for p, i in other_instances)
+        detail = "; ".join(
+            f"端口 {p} (instance={i or '(空)'}, v{v or '?'})"
+            for p, i, v in other_instances
+        )
         print(f"   ⚠️ 检测到其他 agent 的 agentmoss 实例: {detail}")
         print(f"   这些不属于本实例（instance={expect_instance or '(空)'}），未计入运行状态。")
         print(f"   启动本实例: AGENT_MOSS_INSTANCE={expect_instance or 'xiaoo'} agent-moss server")
     else:
-        print(f"❌ AgentMoss 服务未运行")
+        print(f"❌ AgentMoss 服务未运行（instance={expect_instance or '(未指定)'}）")
         if systemd_active:
             print(f"   Systemd:  active 但端口探测不到")
             print(f"   检查日志：journalctl -u agent-moss -n 20 --no-pager")
