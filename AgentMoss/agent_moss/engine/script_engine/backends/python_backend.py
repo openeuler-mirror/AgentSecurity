@@ -700,10 +700,14 @@ def _extract_calls_ast(
             calls.extend(analysis.found.get(node, ()))
         elif isinstance(node, ast.ImportFrom) and node.level:
             if node.module:
-                import_calls.append(ScriptCall(path=node.module.replace(".", "/") + ".py", interpreter="python3"))
+                import_calls.append(ScriptCall(
+                    path=node.module.replace(".", "/") + ".py", interpreter="python3", is_import=True,
+                ))
             for alias in node.names:
                 if alias.name != "*":
-                    import_calls.append(ScriptCall(path=alias.name.replace(".", "/") + ".py", interpreter="python3"))
+                    import_calls.append(ScriptCall(
+                        path=alias.name.replace(".", "/") + ".py", interpreter="python3", is_import=True,
+                    ))
 
     calls.extend(import_calls)
 
@@ -2008,7 +2012,8 @@ class PythonBackend(LanguageBackend):
     ]
 
     def parse(
-        self, content: str, entry_args: list[str] | None, *, diagnostics: dict | None = None,
+        self, content: str, entry_args: list[str] | None, *,
+        diagnostics: dict | None = None, args_known: bool = True,
     ) -> ScriptIR:
         """解析 python 脚本：ast 控制流剪枝 + 子脚本调用提取；失败回退全文本。
 
@@ -2051,6 +2056,15 @@ class PythonBackend(LanguageBackend):
                 reachable_content=content,
                 control_flow_resolved=False,
                 calls=calls,
+                language=self.language,
+            )
+
+        if not args_known:
+            if diagnostics is not None:
+                diagnostics.update(parser="python_full", fallback_reason="unknown_args", child_extractor="ast")
+            return ScriptIR(
+                reachable_content=content,
+                calls=_extract_calls_ast(tree, content),
                 language=self.language,
             )
 

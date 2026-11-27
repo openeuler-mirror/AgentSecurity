@@ -575,8 +575,9 @@ def get_llm_prompt_history_max_turns() -> int:
 
 
 def get_llm_max_prompt_tokens() -> int:
-    """L3 输入 prompt 的估算 token 预算（0 = 不启用）。"""
-    return max(0, _get_int_setting("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", 0))
+    """L3 输入 Prompt 的估算预算。非正数关闭预算，正数最低为 1200。"""
+    configured = _get_int_setting("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", 0)
+    return max(1200, configured) if configured > 0 else 0
 
 
 @dataclass(frozen=True)

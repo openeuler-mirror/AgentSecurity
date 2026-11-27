@@ -2,7 +2,7 @@
 
 跨脚本调用链的递归追踪。独立于语言（消费 IR 的 calls[]）：
 - 深度预算（默认 14，可配置），替代旧版固定 max_depth=3。
-- 循环检测（调用图 DFS，visited 路径集合），防 A→B→A 死循环。
+- 循环检测按当前 DFS 路径，扫描去重按路径、参数和工作目录。
 - **跨脚本参数传递**：每个子脚本用自己的调用参数(args[])做分支感知，
   不再透传入口参数（修复旧版 `bash child.sh backup` 仍误报的 bug）。
 - 字节/节点预算，防内存爆炸（保持峰值 RSS 与现状持平）。
@@ -118,7 +118,7 @@ class RecursiveTracker:
         self._max_total_size = max_total_size
         self._result = ScriptChainAnalysisResult()
         self._visiting: set[str] = set()   # 当前 DFS 路径（循环检测）
-        self._visited: set[str] = set()    # 已处理集合
+        self._visited: dict[str, set[tuple[bool, tuple[str, ...] | None, Path | None]]] = {}
         self._diagnostics = diagnostics
         self._diagnostic_nodes: list[dict] = []
         self._budget_skips = {"depth": 0, "nodes": 0, "total_bytes": 0}
@@ -174,6 +174,9 @@ class RecursiveTracker:
         depth: int,
         process_cwd: Path | None,
         args: list[str] | None,
+        *,
+        is_import: bool = False,
+        args_known: bool = True,
     ) -> None:
         """递归处理单个脚本节点及其子脚本。"""
         path_str = str(Path(path_str).resolve())
@@ -182,7 +185,13 @@ class RecursiveTracker:
         if path_str in self._visiting:
             logger.debug("检测到调用循环，跳过: %s", path_str)
             return
-        if path_str in self._visited:
+        if not args_known:
+            args = None
+        invocation = (args_known, tuple(args) if args is not None else None, process_cwd)
+        seen = self._visited.get(path_str)
+        # 不能因为“是 import”就跳过：同一脚本可能先以带参直接调用扫描过，
+        # import 时以无参上下文执行，sys.argv 分支可能完全不同（会漏掉危险分支）。
+        if seen is not None and invocation in seen:
             return
 
         # 预算
@@ -219,7 +228,7 @@ class RecursiveTracker:
             return
 
         self._visiting.add(path_str)
-        self._visited.add(path_str)
+        self._visited.setdefault(path_str, set()).add(invocation)
 
         details = None
         if self._diagnostics is not None and len(self._diagnostic_nodes) < DIAGNOSTIC_NODE_LIMIT:
@@ -249,7 +258,9 @@ class RecursiveTracker:
 
         # 解析 IR（按语言分派 backend）
         backend = _pick_backend(path_str)
-        if details is not None and type(backend) in (ShellBackend, PythonBackend):
+        if not args_known:
+            ir = backend.parse(content, None, args_known=False, diagnostics=details)
+        elif details is not None and type(backend) in (ShellBackend, PythonBackend):
             ir = backend.parse(content, args, diagnostics=details)
         else:
             ir = backend.parse(content, args)
@@ -329,6 +340,8 @@ class RecursiveTracker:
                 depth=depth + 1,
                 process_cwd=child_cwd,
                 args=call.args,  # 关键：子脚本用自己的调用参数
+                is_import=call.is_import,
+                args_known=call.args_known,
             )
             if self._stop_on_critical and self._result.has_critical:
                 break

@@ -169,13 +169,13 @@ def _history_omission(intents: int, actions_only: int) -> str:
 
 
 def _oldest_turns_to_omit(
-    turns: list[_HistoryTurn], lines: list[str], render: Callable[..., str], token_limit: int,
+    turns: list[_HistoryTurn], lines: list[str], render: Callable[..., str], token_limit: int, window_prefix: str,
 ) -> int:
     # Count the history suffix and its notices without rendering the full prompt
     # at every step for unlimited histories.
     current_chars = len(render())
-    base_chars = len(render(prompt_history_text=""))
-    with_guidance_chars = len(render(prompt_history_text="", history_authorization=_HISTORY_AUTHORIZATION))
+    base_chars = len(render(prompt_history_text=window_prefix))
+    with_guidance_chars = len(render(prompt_history_text=window_prefix, history_authorization=_HISTORY_AUTHORIZATION))
     remaining_chars = sum(len(line) + 1 for line in lines)
     shortest_chars = current_chars
     best = 0
@@ -237,8 +237,8 @@ def prepare_l3_prompt(
     turns, window_omitted = _visible_turns(prompt_history, settings.prompt_history_max_turns)
     turn_chars = settings.prompt_turn_max_chars
     lines, truncated = _history_lines(turns, turn_chars, turn_chars, len(turns))
-    if window_omitted:
-        lines.insert(0, _history_window_omission(window_omitted))
+    window_notice = _history_window_omission(window_omitted) if window_omitted else ""
+    window_prefix = f"{window_notice}\n" if window_notice else ""
     needs_authorization = truncated or bool(window_omitted)
     max_items = settings.history_max_items
     initial_detail_chars = settings.action_detail_max_chars
@@ -247,7 +247,7 @@ def prepare_l3_prompt(
     values = {
         "prompt_session": _truncate(prompt_session, settings.prompt_session_max_chars, _SESSION_SIZE_MARKER),
         "action_history": format_action_history(action_history, max_items, detail_chars),
-        "prompt_history_text": "\n".join(lines) if lines else _NO_PROMPT_HISTORY,
+        "prompt_history_text": window_prefix + "\n".join(lines) if lines else window_notice or _NO_PROMPT_HISTORY,
         "history_authorization": _HISTORY_AUTHORIZATION if needs_authorization else "",
         "a_next": a_next,
         "reason": reason,
@@ -274,7 +274,7 @@ def prepare_l3_prompt(
         floor = render(
             prompt_session=min(values["prompt_session"], required_session, key=len),
             action_history="",
-            prompt_history_text=omission_summary,
+            prompt_history_text=window_prefix + omission_summary if omission_summary else window_notice,
             a_next={"action_type": "", "action_detail": ""},
             reason="",
             skills_text="",
@@ -314,7 +314,7 @@ def prepare_l3_prompt(
             for before, after in zip(lines, stage_lines, strict=True)
         ]
         if shorter_lines != lines:
-            history = "\n".join(shorter_lines)
+            history = window_prefix + "\n".join(shorter_lines)
             candidate = render(prompt_history_text=history, history_authorization=_HISTORY_AUTHORIZATION)
             if len(candidate) >= len(prompt):
                 continue
@@ -326,7 +326,7 @@ def prepare_l3_prompt(
                 return PreparedL3Prompt(prompt, "historical_intent_text")
 
     before_omission = None
-    omitted = _oldest_turns_to_omit(turns, lines, render, token_limit) if lines else 0
+    omitted = _oldest_turns_to_omit(turns, lines, render, token_limit, window_prefix) if lines else 0
     if omitted:
         before_omission = {
             "prompt_history_text": values["prompt_history_text"],
@@ -334,7 +334,7 @@ def prepare_l3_prompt(
         }
         omitted_intents = sum(bool(turn.text) for turn in turns[:omitted])
         omission_summary = _history_omission(omitted_intents, omitted - omitted_intents)
-        values["prompt_history_text"] = "\n".join([omission_summary, *lines[omitted:]])
+        values["prompt_history_text"] = window_prefix + "\n".join([omission_summary, *lines[omitted:]])
         if omitted_intents:
             values["history_authorization"] = _HISTORY_AUTHORIZATION
         prompt = render()

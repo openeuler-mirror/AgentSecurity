@@ -45,6 +45,8 @@ class ScriptCall:
     interpreter: str = "bash"       # 调用解释器（bash/python3/node...）
     # 子进程的工作目录，相对于当前进程 cwd。None 沿用从源文件目录解析的规则。
     launch_cwd: str | WorkingDirectory | None = None
+    is_import: bool = False  # 导入依赖只用于补充尚未扫描的文件。
+    args_known: bool = True  # False 表示运行时实参未知，需要扫描所有分支。
 
 
 @dataclass
