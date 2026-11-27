@@ -10,18 +10,19 @@
   - SVal 统一表示具体值 / 未解析的符号 / 表达式（可折叠为 concrete）。
   - 顺序执行脚本，维护 `env` 符号环境（变量名 → SVal）。
   - case/if 分支：selector/条件先查环境折叠成 concrete → 精确匹配；无法折叠 → 保留全部分支（fail-closed）。
-  - glob 匹配：glob → 正则（Python `re`），只对 concrete 值匹配；符号不匹配 → fail-closed。
+  - case 模式匹配：P1 与 LiteSE 共用，无法建模时保留全文。
   - 数值比较：只对 concrete 整数值比较；符号 → fail-closed。
   - 三重预算（行/分支/约束）+ 全局行数上限，超限回退（None → 调用方做 fail-closed 全文本）。
   - 全是线性/确定性算法，无路径枚举，无回溯。
 
-与 TS `symbolic.ts` 100% 镜像（字段、算法、返回值语义对齐）。
+与 TS 端共享符号执行约定。
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Optional
 
 # ==================== 预算（P5 熔断） ====================
@@ -75,12 +76,6 @@ def fold(val: SVal) -> SVal:
 # ==================== 分词：从脚本文本提取最小语句集 ====================
 
 
-def _strip_comments(content: str) -> str:
-    return "\n".join(
-        line for line in content.split("\n") if not line.lstrip().startswith("#")
-    )
-
-
 _ASGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
@@ -90,7 +85,7 @@ def tokenize(content: str) -> list["Stmt"]:
     'Stmt' 定义见下。不可建模语句（循环/管道/子 shell/函数/重定向/命令替换）
     标记为 NotModeled，作用域内后续一切保守。
     """
-    return _split_statements(_strip_comments(content))
+    return _split_statements(content)
 
 
 # ==================== 语句模型 ====================
@@ -114,8 +109,8 @@ class AssignStmt(Stmt):
 
 
 class CaseStmt(Stmt):
-    def __init__(self, line: str, selector: str, branches: list[tuple[str, str, str]]):
-        """branches: [(pattern, body, body_end)] 各分支 pattern 原文与 body/text。"""
+    def __init__(self, line: str, selector: str, branches: list[tuple[str, str]]):
+        """branches 中保存每个分支的原始模式和分支体。"""
         super().__init__(line)
         self.selector = selector
         self.branches = branches
@@ -136,14 +131,32 @@ class NotModeledStmt(Stmt):
 
 
 # ==================== 嵌套深度配对 ====================
-# 修复：_split_statements/_parse_case_stmt/_parse_if_stmt 原先用
+# 修复：_split_statements/parse_case_statement/_parse_if_stmt 原先用
 # `find("esac")` / `rfind("fi")` / `"esac" in line` 简单匹配，嵌套 case/if 时
 # 取到内层关键字导致外层提前结束（切错分支）。这里用深度计数做真正的配对：
 # 逐行扫描，open_keyword 出现深度+1、close_keyword 出现深度-1，深度归零才结束。
 # 线性复杂度 O(行数)，无嵌套遍历开销。
 
-_CASE_OPEN_RE = re.compile(r"\bcase\b")
-_CASE_CLOSE_RE = re.compile(r"\besac\b")
+CASE_HEADER_RE = re.compile(r"^[ \t]*case[ \t]+", re.MULTILINE)
+_CASE_COMMAND_START = (
+    r"(?:^|(?<=[;|&()]))[ \t]*"
+    r"(?:(?:if|then|elif|else|while|until|do|\{|!|time(?:[ \t]+-p)?(?:[ \t]+--)?)[ \t]+)*"
+)
+_COPROC_PREFIX = r"coproc[ \t]+(?:[^\s;&|()<>]+[ \t]+)?"
+_CASE_OPEN_RE = re.compile(
+    _CASE_COMMAND_START + rf"(?:{_COPROC_PREFIX})?case[ \t]+(?=[^\s;&|()<>])"
+)
+_COPROC_GROUP_RE = re.compile(
+    _CASE_COMMAND_START + _COPROC_PREFIX
+    + r"(?:(?:\{|if|for|while|until|select)(?=$|[\s;&|()<>])|\()"
+)
+_CASE_FUNCTION_RE = re.compile(
+    _CASE_COMMAND_START
+    + r"(?:function[ \t]+[^\s;&|()<>]+|(?P<name>[^\s;&|()<>]+)[ \t]*\([ \t]*\))"
+)
+_CASE_ARRAY_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.+\])?\+?=")
+_CASE_CLOSE_RE = re.compile(r"(?:^|(?<=[;&]))[ \t]*esac(?=$|[ \t;&|])")
+_CASE_HEADER_LINE_RE = re.compile(r"[ \t]*case[ \t]+([^\s;&|()<>]+)(?:[ \t]+(in))?[ \t]*")
 _IF_OPEN_RE = re.compile(r"\bif\b")
 _IF_CLOSE_RE = re.compile(r"\bfi\b")
 
@@ -171,8 +184,36 @@ def _find_block_end(
     return -1
 
 
-def _find_case_end(lines: list[str], start_line: int) -> int:
-    return _find_block_end(lines, start_line, _CASE_OPEN_RE, _CASE_CLOSE_RE)
+def _case_depth_delta(line: str, raw_line: str) -> int | None:
+    """在已遮蔽的语法行中识别命令边界；无法可靠配对时返回 None。"""
+    if _COPROC_GROUP_RE.search(line):
+        return None  # coproc 命令组可能在同一行开启内层 case。
+    for function in _CASE_FUNCTION_RE.finditer(line):
+        start, end = function.span("name")
+        # 遮蔽后的函数名可能看起来像赋值，按原始文本识别空数组。
+        if (
+            start < 0
+            or raw_line[end] != "("
+            or not _CASE_ARRAY_ASSIGNMENT_RE.fullmatch(raw_line[start:end])
+        ):
+            return None  # 函数体可能在同一行开启内层 case。
+    opens = len(_CASE_OPEN_RE.findall(line))
+    closes = list(_CASE_CLOSE_RE.finditer(line))
+    if opens + len(closes) > 1 or (closes and closes[0].start() != 0):
+        return None  # 行内 esac 或同一行的多层边界需要更完整的语法分析。
+    return opens - len(closes)
+
+
+def _find_case_end(lines: list[str], syntax_lines: list[str], start_line: int) -> int:
+    depth = 0
+    for index in range(start_line, len(lines)):
+        delta = _case_depth_delta(syntax_lines[index], lines[index])
+        if delta is None or (index == start_line and delta != 1):
+            return -1
+        depth += delta
+        if depth == 0:
+            return index
+    return -1
 
 
 def _find_if_end(lines: list[str], start_line: int) -> int:
@@ -225,6 +266,7 @@ def _split_statements(content: str) -> list[Stmt]:
     不处理嵌套 case/if（识别到嵌套 marker 直接整体 NotModeled 保守）。
     """
     lines = content.split("\n")
+    syntax_lines = case_syntax_lines(content) if CASE_HEADER_RE.search(content) else lines
     stmts: list[Stmt] = []
     i = 0
     n = len(lines)
@@ -238,7 +280,7 @@ def _split_statements(content: str) -> list[Stmt]:
     while i < n:
         ln = lines[i]
         stripped = ln.strip()
-        if not stripped:
+        if not syntax_lines[i].strip() or stripped.startswith("#"):
             i += 1
             continue
 
@@ -269,16 +311,10 @@ def _split_statements(content: str) -> list[Stmt]:
             i += 1
             continue
 
-        # case ... esac 块（嵌套深度配对，不再按行含 esac 提前结束）
-        if re.match(r"^\s*case\s+", stripped):
-            end_line = _find_case_end(lines, i)
-            if end_line == -1:
-                stmts.append(NotModeledStmt(ln, "case_syntax"))
-                i += 1
-                continue
-            block_text = "\n".join(lines[i:end_line + 1])
-            stmts.append(_parse_case_stmt(block_text) or NotModeledStmt(ln, "case_syntax"))
-            i = end_line + 1
+        if CASE_HEADER_RE.match(syntax_lines[i]):
+            case = parse_case_statement(lines, syntax_lines, i)
+            stmts.append(case if case is not None else NotModeledStmt(ln, "case_syntax"))
+            i += 1 if case is None else case.line.count("\n") + 1
             continue
 
         # if ... fi 块（嵌套深度配对）
@@ -316,63 +352,92 @@ def _split_statements(content: str) -> list[Stmt]:
     return stmts
 
 
-def _parse_case_stmt(block: str) -> Optional[CaseStmt]:
-    # selector 放宽容忍任意表达式（$1 / $MODE / "prefix${1}suffix" / ${1}${2}），
-    # 实际求值交给 eval_expr（P2）；这里只负责提取分支结构。
-    m = re.match(r"\s*case\s+(\S[^;]*?)\s*\bin\b", block, re.DOTALL)
-    if not m:
+_CASE_QUOTED_PART = r"""'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]"""
+_CASE_QUOTED_RE = re.compile(_CASE_QUOTED_PART)
+_CASE_SYNTAX_TOKEN_RE = re.compile(
+    r"\#[^\n]*"
+    rf"""|(?:{_CASE_QUOTED_PART}|[^\s;&|()<>'"\\\x60])+"""
+    r"""|<<|['"\\\x60]"""
+)
+_CASE_LABEL_END_RE = re.compile(r"\s*\(?([^()]+)\)\s*")
+_CASE_TERMINATOR_RE = re.compile(r";;&|;&|;;")
+
+
+def case_syntax_lines(content: str) -> list[str]:
+    """遮蔽注释和 shell 字面文本，保留控制符、换行及原始偏移。"""
+    def mask_word(token: re.Match[str]) -> str:
+        text = token[0]
+        if text.startswith("#"):
+            return " " * len(text)
+        if text in ("<<", "'", '"', "\\", '`'):
+            return "\0" * len(text)
+
+        def mask_literal(part: re.Match[str]) -> str:
+            literal = part[0]
+            unsupported = literal == "\\\n" or (
+                literal.startswith('"') and ("$(" in literal or '`' in literal)
+            )
+            mask = "\0" if unsupported else "x"
+            return "".join("\n" if ch == "\n" else mask for ch in literal)
+
+        return _CASE_QUOTED_RE.sub(mask_literal, text)
+
+    return _CASE_SYNTAX_TOKEN_RE.sub(mask_word, content).split("\n")
+
+
+def parse_case_statement(lines: list[str], syntax_lines: list[str], start: int) -> CaseStmt | None:
+    """切分逐行 case 块，保留原始模式和嵌套分支。"""
+    header = _CASE_HEADER_LINE_RE.fullmatch(syntax_lines[start])
+    if header is None:
         return None
-    sel = m.group(1).strip()
-    # 用深度配对找本层 esac（嵌套 case 时不能 find 第一个）
-    block_lines = block.split("\n")
-    body_start_idx = _find_body_start_line(block_lines, m)
-    end_line = _find_case_end(block_lines, 0)
-    if end_line == -1:
+    body_start = start + 1
+    if header[2] is None:
+        while body_start < len(syntax_lines) and not syntax_lines[body_start].strip():
+            body_start += 1
+        if body_start == len(syntax_lines) or syntax_lines[body_start].strip() != "in":
+            return None
+        body_start += 1
+
+    end = _find_case_end(lines, syntax_lines, start)
+    if end < body_start or not re.fullmatch(r"\s*esac\s*;?\s*", syntax_lines[end]):
         return None
-    # body = header("... in") 之后到 esac 之前
-    body_text = "\n".join(block_lines[body_start_idx:end_line])
-    body = body_text
-    # 深度感知切分：内层 case 的 `pattern)` 不能当成外层分支。
-    branches: list[tuple[str, str, str]] = []
-    cur_pat: str | None = None
-    cur_body: list[str] = []
+    if any("\0" in line or "$(" in line for line in syntax_lines[start:end + 1]):
+        return None
+
+    selector = lines[start][header.start(1):header.end(1)]
+    branches: list[tuple[str, str]] = []
+    label: str | None = None
+    body: list[str] = []
     depth = 0
-    for ln in body.split("\n"):
-        stripped = ln.strip()
-        if depth == 0:
-            bm = re.match(r"^([^()]+?)\s*\)\s*(.*)$", stripped)
-            if bm:
-                if cur_pat is not None:
-                    branches.append((cur_pat, "\n".join(cur_body), cur_pat))
-                cur_pat = bm.group(1).strip().strip("\"'")
-                cur_body = [bm.group(2).strip()] if bm.group(2).strip() else []
+    for index in range(body_start, end):
+        line, syntax = lines[index], syntax_lines[index]
+        if label is None:
+            if not syntax.strip():
                 continue
-        if re.search(r"\bcase\b", stripped):
-            depth += 1
-        elif re.search(r"\besac\b", stripped):
-            depth = max(0, depth - 1)
-        if cur_pat is not None:
-            cur_body.append(ln)
-            if depth == 0 and stripped.endswith(";;"):
-                branches.append((cur_pat, "\n".join(cur_body), cur_pat))
-                cur_pat = None
-                cur_body = []
-    if cur_pat is not None and cur_body:
-        branches.append((cur_pat, "\n".join(cur_body), cur_pat))
-    return CaseStmt(block, sel, branches)
+            branch = _CASE_LABEL_END_RE.match(syntax)
+            if branch is None:
+                return None
+            label = line[branch.start(1):branch.end(1)].strip()
+            line, syntax = line[branch.end():], syntax[branch.end():]
 
+        delta = _case_depth_delta(syntax, line)
+        if delta is None or depth + delta < 0:
+            return None
+        depth += delta
 
-def _find_body_start_line(block_lines: list[str], header_match) -> int:
-    """定位 case 头（... in）之后再 body 的第一行索引。"""
-    start = 0
-    for i, ln in enumerate(block_lines):
-        if "in" in ln and ("case " in ln or ln.lstrip().startswith("case")):
-            start = i
-            break  # 只认最外层 case 头；嵌套 case 的头不能覆盖它
-    # body 从含 in 的行之后开始
-    for j in range(start + 1, len(block_lines)):
-        return j
-    return start + 1
+        body.append(line)
+        if depth == 0 and (terminator := _CASE_TERMINATOR_RE.search(syntax)):
+            # ;& 和 ;;& 会继续执行或重新匹配后续分支，必须保留全文。
+            if terminator[0] != ";;" or syntax[terminator.end():].strip():
+                return None
+            branches.append((label, "\n".join(body)))
+            label, body = None, []
+
+    if depth:
+        return None
+    if label is not None:
+        branches.append((label, "\n".join(body)))
+    return CaseStmt("\n".join(lines[start:end + 1]), selector, branches)
 
 
 def _parse_if_stmt(block: str) -> Optional[IfStmt]:
@@ -457,51 +522,40 @@ def eval_expr(text: str, env: dict[str, SVal]) -> SVal:
     return fold(SVal.expr(result))
 
 
-# ==================== glob→正则（P4） ====================
+# ==================== case 模式匹配 ====================
+
+# 只用 fnmatchcase 处理与 shell 语义一致的子集。
+# shortcut: ^ 取反、复杂字符类、混合引号和展开交回全文，扩充语法时再建模。
+_CASE_BARE_PATTERN = r"(?:[A-Za-z0-9_./:+,@%=-]|\*|\?|\[!?(?:[0-9]-[0-9]|[A-Za-z0-9_.])+\])+"
+_CASE_PATTERN = rf"""(?:{_CASE_BARE_PATTERN}|'[^']*'|"[^"\\$\x60]*")"""
+_CASE_PATTERN_RE = re.compile(_CASE_PATTERN)
+_CASE_LABEL_RE = re.compile(rf"{_CASE_PATTERN}(?:[ \t]*\|[ \t]*{_CASE_PATTERN})*")
 
 
-def glob_to_regex(pattern: str) -> re.Pattern:
-    """把 shell glob 转成正则（仅当 pattern 含 glob 元字符时）。
-    * → .*, ? → ., [abc] → 字符类, [!a] → 取反。其余转义。"""
-    out = ["^"]
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            out.append(".*")
-        elif c == "?":
-            out.append(".")
-        elif c == "[":
-            j = i + 1
-            neg = False
-            if j < len(pattern) and pattern[j] in "!^":
-                neg = True
-                j += 1
-            cls = ""
-            while j < len(pattern) and pattern[j] != "]":
-                cls += pattern[j]
-                j += 1
-            if j >= len(pattern):
-                frac = re.compile(r"^(.*)$").match(pattern[i:])
-                out.append(re.escape(frac.group(1)))
-                break
-            out.append("[" + ("^" if neg else "") + re.escape(cls) + "]")
-            i = j
-        else:
-            out.append(re.escape(c))
-        i += 1
-    out.append("$")
-    return re.compile("".join(out), re.DOTALL)
+def match_glob(pattern: str, value: str) -> bool | None:
+    """匹配已建模的单个 glob；返回 None 时不能安全剪枝。"""
+    if _CASE_PATTERN_RE.fullmatch(pattern) is None:
+        return None
+    if pattern.startswith(("'", '"')):
+        return pattern[1:-1] == value
+    if not value.isascii() and ("?" in pattern or "[" in pattern):
+        return None  # 字符宽度和字符类受 shell locale 影响。
+    return fnmatchcase(value, pattern)
 
 
-_HAS_GLOB = re.compile(r"[*?[]")
-
-
-def match_glob(pattern: str, value: str) -> bool:
-    """glob 模式对具体值匹配；值含符号/非确定性 → False（调用方 fail-closed）。"""
-    if not _HAS_GLOB.search(pattern):
-        return pattern == value  # 无元字符 → 字面相等，与现有 P1 语义一致
-    return bool(glob_to_regex(pattern).match(value))
+def select_case_branch(case: CaseStmt, value: str) -> tuple[int, str] | None:
+    """按源代码顺序返回首个匹配；较早的分支无法判定时保留全文。"""
+    for index, (label, _) in enumerate(case.branches):
+        if _CASE_LABEL_RE.fullmatch(label) is None:
+            return None
+        for match in _CASE_PATTERN_RE.finditer(label):
+            pattern = match[0]
+            matched = match_glob(pattern, value)
+            if matched is None:
+                return None
+            if matched:
+                return index, "default" if pattern == "*" else "match"
+    return None
 
 
 # ==================== 数值比较（P4） ====================
@@ -542,14 +596,26 @@ def eval_condition(
         diagnostics.pop("condition_failure", None)
     inner = cond.strip()
     # 剥外层 [ ] 或 [[ ]]（test 结构）
+    double_bracket = inner.startswith("[[")
     inner = re.sub(r"^\[\[?|\]\]?$", "", inner).strip()
     # 文件谓词 / 非比较：返回 None
     if re.match(r"^-[A-Za-z]\s", inner) or inner.startswith("-d") or inner.startswith("-f"):
         if diagnostics is not None:
             diagnostics["condition_failure"] = "unsupported_predicate"
         return None
-    # 剥引号
     inner_q = inner.replace('"', "").replace("'", "")
+
+    def _unquote(tok: str) -> tuple[str, bool] | None:
+        tok = tok.strip()
+        if len(tok) >= 2 and tok[0] in "\"'" and tok[-1] == tok[0]:
+            tok = tok[1:-1]
+            quoted = True
+        else:
+            quoted = False
+        # 交错引号/未成对转义会改变 shell 语义；交给 fail-closed。
+        if '"' in tok or "'" in tok or "\\" in tok:
+            return None
+        return tok, quoted
 
     def _resolve_var_side(tok: str) -> Optional[str]:
         """把 token 解析为具体字符串；无法解析返回 None。"""
@@ -583,7 +649,7 @@ def eval_condition(
         return result
 
     # 字符串相等/不等/匹配
-    m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner_q)
+    m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner)
     if not m:
         if diagnostics is not None:
             diagnostics["condition_failure"] = "unsupported_comparison"
@@ -591,31 +657,52 @@ def eval_condition(
     op = m.group(2)
     if diagnostics is not None:
         diagnostics["condition_operator"] = op
-    left = m.group(1).strip()
-    right = m.group(3).strip()
+    left_pair = _unquote(m.group(1))
+    right_pair = _unquote(m.group(3))
+    if left_pair is None or right_pair is None:
+        if diagnostics is not None:
+            diagnostics["condition_failure"] = "unsupported_quoting"
+        return None
+    left, _ = left_pair
+    right, right_quoted = right_pair
     lv = _resolve_var_side(left)
+    if lv is None:
+        if diagnostics is not None:
+            diagnostics["condition_failure"] = "unbound_operand"
+        return None
     if op == "=~":
-        # 正则匹配：右侧为正则
-        if right.startswith("/") and right.endswith("/"):
-            right = right[1:-1]
-        if lv is None:
+        if not double_bracket:
+            if diagnostics is not None:
+                diagnostics["condition_failure"] = "unsupported_operator"
+            return None
+        rv = _resolve_var_side(right)
+        if rv is None:
             if diagnostics is not None:
                 diagnostics["condition_failure"] = "unbound_operand"
             return None
+        if rv.startswith("/") and rv.endswith("/") and len(rv) > 1:
+            rv = rv[1:-1]
+        pattern = re.escape(rv) if right_quoted or right.startswith("$") else rv
         try:
-            return bool(re.search(right, lv))
+            return bool(re.search(pattern, lv))
         except re.error:
             if diagnostics is not None:
                 diagnostics["condition_failure"] = "invalid_regex"
             return None
     rv = _resolve_var_side(right)
-    if lv is None or rv is None:
+    if rv is None:
         if diagnostics is not None:
             diagnostics["condition_failure"] = "unbound_operand"
         return None
-    if "*" in rv or "?" in rv or "[" in rv:
+    # 未加引号的变量/通配符在单括号 [ ] 里还可能发生 pathname expansion。
+    glob = ("*" in rv or "?" in rv or "[" in rv)
+    if not right_quoted and (glob or right.startswith("$")):
+        if not double_bracket:
+            if diagnostics is not None:
+                diagnostics["condition_failure"] = "pathname_expansion"
+            return None
         import fnmatch
-        matched = fnmatch.fnmatchcase(lv, rv)
+        matched = fnmatch.fnmatchcase(lv, rv) if glob else lv == rv
     else:
         matched = lv == rv
     return (not matched) if op == "!=" else matched
@@ -735,36 +822,15 @@ def symbolic_process(
                 # 符号 selector → 无法选择 → fail-closed
                 record_result("unbound_selector", budget, len(env))
                 return None
-            concrete = check_val.value or ""
-            selected_body: str | None = None
-            fallback_body: str = ""
-            selected_index = 0
-            selected_is_default = False
-            fallback_index = 0
-            for index, (pat, body, _end) in enumerate(s.branches, start=1):
-                pat_stripped = pat.strip()
-                if "*" in pat_stripped and not _HAS_GLOB.search(pat_stripped):
-                    # 纯 * → 兜底
-                    if not fallback_body:
-                        fallback_index = index
-                        fallback_body = body
-                    continue
-                if match_glob(pat_stripped, concrete):
-                    selected_body = body
-                    selected_index = index
-                    selected_is_default = pat_stripped == "*"
-                    break
-            final = selected_body if selected_body is not None else (fallback_body or None)
-            if final is None:
-                record_result("no_case_match", budget, len(env))
-                return None  # 未命中任何 → fail-closed
+            selection = select_case_branch(s, check_val.value or "")
+            if selection is None:
+                record_result("case_unresolved", budget, len(env))
+                return None
+            index, kind = selection
             if choices is not None and len(choices) < 4:
-                if selected_body is None:
-                    choices.append(f"case_default:{fallback_index}")
-                else:
-                    label = "case_default" if selected_is_default else "case"
-                    choices.append(f"{label}:{selected_index}")
-            out.append(f"case {s.selector} in\n{final}\nesac")
+                label = "case_default" if kind == "default" else "case"
+                choices.append(f"{label}:{index + 1}")
+            out.append(f"case {s.selector} in\n{s.branches[index][1]}\nesac")
             continue
 
         if isinstance(s, IfStmt):

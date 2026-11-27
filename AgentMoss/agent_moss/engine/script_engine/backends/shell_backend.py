@@ -18,44 +18,222 @@ shell（bash/sh/zsh）脚本的静态解析后端，产出 IR。
 """
 
 import re
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from enum import Enum, auto
 
-from ..ir import BranchInfo, ScriptCall, ScriptIR, scan_fingerprint
+from ..ir import ScriptCall, ScriptIR, scan_fingerprint
 from .base import LanguageBackend
+from .symbolic import (
+    CASE_HEADER_RE,
+    case_syntax_lines,
+    parse_case_statement,
+    select_case_branch,
+)
 
 
 # ==================== 参数绑定 ====================
-# 把 entry_args 绑到 $1/$2/${1}/${@}/$*，支持 ${1:-default}
+_POSITIONAL_RE = re.compile(r"\$(?:([1-9@*])|\{([1-9][0-9]*|[@*])(?:(:-|-)|\}))")
+_QUOTED_WORD_PART_RE = re.compile(r"""\$\{|\\[\s\S]|\$[1-9@*]""")
+_SHELL_WORD_PART_RE = re.compile(rf"""'[^']*'|"|{_QUOTED_WORD_PART_RE.pattern}""")
+_SHELL_SOURCE_PART_RE = re.compile(rf"\#|{_SHELL_WORD_PART_RE.pattern}")
+_SUBSTITUTION_START = r"\$\(|\x60"
+_DEFAULT_WORD_PART_RE = re.compile(rf"{_SUBSTITUTION_START}|{_SHELL_WORD_PART_RE.pattern}")
+_QUOTED_DEFAULT_PART_RE = re.compile(rf'{_SUBSTITUTION_START}|"|{_QUOTED_WORD_PART_RE.pattern}')
+_DOUBLE_QUOTE_END_RE = re.compile(rf'\\[\s\S]|\$\{{|{_SUBSTITUTION_START}|"')
+_DEFAULT_BOUNDARY_RE = re.compile(
+    rf"""\\[\s\S]|'[^']*'|"|\$\{{|{_SUBSTITUTION_START}|[}}']"""
+)
+_SUBSTITUTION_BOUNDARY_RE = re.compile(
+    rf"""\\[\s\S]|'[^']*'|"|\$\{{|{_SUBSTITUTION_START}|[()']|<<"""
+    r"|(?<![^\s;&|()<>])(?:\#[^\n]*|case(?=[ \t]))"
+)
+_BACKTICK_RE = re.compile(r"\x60(?:\\[\s\S]|[^\x60\\])*\x60")
+_IFS_RE = re.compile(r"([ \t\n]+)")
+_MAX_DEFAULT_DEPTH = 32
+
+
+
+class _ExpansionStatus(Enum):
+    UNRESOLVED = auto()
+
+
+def _substitution_end(text: str, start: int, opening: str, level: int) -> int | None:
+    """Locate a command substitution without interpreting its output."""
+    if level >= _MAX_DEFAULT_DEPTH:
+        return None
+    if opening == "`":
+        match = _BACKTICK_RE.match(text, start - 1)
+        return match.end() if match else None
+
+    depth = 1
+    while token := _SUBSTITUTION_BOUNDARY_RE.search(text, start):
+        part = token[0]
+        start = token.end()
+        if part in ("(", "$("):
+            depth += 1
+        elif part == ")":
+            depth -= 1
+            if not depth:
+                return start
+        elif part == '"':
+            start = _double_quote_end(text, start, level + 1)
+        elif part == "${":
+            start = _braced_word_end(text, start, level + 1)
+        elif part == "`":
+            start = _substitution_end(text, start, part, level + 1)
+        elif part in ("'", "<<", "case"):
+            return None  # These can change the meaning of a closing parenthesis.
+        if start is None:
+            return None
+    return None
+
+
+def _braced_word_end(text: str, start: int, level: int = 0) -> int | None:
+    if level >= _MAX_DEFAULT_DEPTH:
+        return None
+    depth = 1
+    while token := _DEFAULT_BOUNDARY_RE.search(text, start):
+        part = token[0]
+        start = token.end()
+        if part == "${":
+            depth += 1
+        elif part == "}":
+            depth -= 1
+            if not depth:
+                return start
+        elif part in ("$(", "`"):
+            start = _substitution_end(text, start, part, level + 1)
+        elif part == '"':
+            start = _double_quote_end(text, start, level + 1)
+        elif part == "'":
+            return None
+        if start is None:
+            return None
+    return None
+
+
+def _double_quote_end(text: str, start: int, level: int = 0) -> int | None:
+    if level >= _MAX_DEFAULT_DEPTH:
+        return None
+    while token := _DOUBLE_QUOTE_END_RE.search(text, start):
+        part = token[0]
+        if part == '"':
+            return token.end()
+        start = token.end()
+        if part == "${":
+            start = _braced_word_end(text, start, level + 1)
+        elif part in ("$(", "`"):
+            start = _substitution_end(text, start, part, level + 1)
+        if start is None:
+            return None
+    return None
+
+
+def _shell_word_parts(
+    text: str, quoted: bool = False, *,
+    syntax: str | None = None, default_text: bool = False,
+) -> Iterator[tuple[int, int]]:
+    if default_text:
+        pattern = _QUOTED_DEFAULT_PART_RE if quoted else _DEFAULT_WORD_PART_RE
+    elif quoted:
+        pattern = _QUOTED_WORD_PART_RE
+    else:
+        pattern = _SHELL_SOURCE_PART_RE if syntax is not None else _SHELL_WORD_PART_RE
+    offset = 0
+    while token := pattern.search(text, offset):
+        part = token[0]
+        end = token.end()
+        if part == "#" and syntax is not None and syntax[token.start()] == " ":
+            end = text.find("\n", end)
+            if end < 0:
+                return
+            offset = end + 1
+            continue
+        if part == "${":
+            end = _braced_word_end(text, end)
+        elif part == '"':
+            end = _double_quote_end(text, end)
+        elif part in ("$(", "`"):
+            end = _substitution_end(text, end, part, 0)
+        if end is None:
+            if syntax is None:
+                return
+            # Keep the unsupported command as text and resume on the next line.
+            newline = text.find("\n", token.end())
+            if newline < 0:
+                return
+            offset = newline + 1
+            continue
+        yield token.start(), end
+        offset = end
+
+
+def _default_has_substitution(text: str, quoted: bool) -> bool:
+    for start, end in _shell_word_parts(text, quoted, default_text=True):
+        part = text[start:end]
+        if part.startswith(("$(", "`")):
+            return True
+        if part.startswith('"') and _default_has_substitution(part[1:-1], True):
+            return True
+    return False
+
+
+def _positional_value(token: str, args: list[str]) -> tuple[str | list[str], bool]:
+    """返回可用的实参，或尚未求值的默认项。"""
+    part = _POSITIONAL_RE.match(token)
+    if part is None:
+        return token, False
+    bare, braced, operator = part.groups()
+    name = bare or braced
+    if name == "@":
+        return args, False
+    if name == "*":
+        return " ".join(args), False
+    # 先按长度筛选不可到达的索引，避免超长数字影响分析。
+    index = int(name) - 1 if len(name) <= len(str(len(args))) else len(args)
+    if index < len(args) and (operator != ":-" or args[index]):
+        return args[index], False
+    return (token[part.end():-1], True) if operator else ("", False)
 
 
 def bind_positional_args(content: str, args: list[str]) -> str:
-    """把脚本位置参数 $1/$2/${1}/${@}/${*} 替换为实际参数值。"""
-    if not args:
+    """为文本扫描展开位置参数，保留单引号和转义字面量。"""
+    if not args or "$" not in content:
         return content
-    all_args = " ".join(args)
 
-    def _repl_num(kind: str, default_val: str | None = None) -> str:
-        idx = int(kind)
-        if 1 <= idx <= len(args):
-            return args[idx - 1]
-        if default_val is not None:
-            return default_val
-        return ""
+    def bind_text(text: str, *, quoted: bool = False) -> str:
+        output: list[str] = []
+        offset = 0
+        syntax = None
+        if not quoted:
+            syntax = "\n".join(case_syntax_lines(text)) if "#" in text else text
+        for start, end in _shell_word_parts(text, quoted, syntax=syntax):
+            token = text[start:end]
+            output.append(text[offset:start])
+            offset = end
+            if token.startswith('"'):
+                output.append('"' + bind_text(token[1:-1], quoted=True) + '"')
+            elif _POSITIONAL_RE.match(token):
+                value, use_default = _positional_value(token, args)
+                values = value if isinstance(value, list) else [value]
+                if use_default:
+                    if _default_has_substitution(values[0], quoted):
+                        output.append(token)
+                        continue
+                    expanded = _expand_shell_word(values[0], args, quoted_default=quoted)
+                    if expanded is None:
+                        output.append(token)
+                        continue
+                    values = expanded
+                if quoted:
+                    values = [re.sub(r'([\\$"\x60])', r"\\\1", item) for item in values]
+                output.append(('" "' if quoted else " ").join(values))
+            else:
+                output.append(token)
+        output.append(text[offset:])
+        return "".join(output)
 
-    # ${n} / ${n:-default} / ${@} / ${*}
-    content = re.sub(
-        r"\$\{(\d+|@|\*)(?::?[-]?([^}]*))?\}",
-        lambda m: (
-            all_args
-            if m.group(1) in ("@", "*")
-            else _repl_num(m.group(1), m.group(2) if m.group(2) is not None else None)
-        ),
-        content,
-    )
-    # 裸 $1 $2（不含 ${...}）
-    content = re.sub(r"\$(\d+)", lambda m: _repl_num(m.group(1)), content)
-    content = re.sub(r"\$[@*]", lambda m: all_args, content)
-    return content
+    return bind_text(content)
 
 
 # ==================== case 分支解析 ====================
@@ -78,163 +256,35 @@ def _find_selector_value(selector: str, args: list[str] | None) -> str | None:
     return None  # $MODE 等命名变量不可静态绑定
 
 
-def _split_case_body(body: str) -> list[BranchInfo]:
-    """把 case 分支体切分成 BranchInfo 列表（含单行/多行分支）。"""
-    lines = body.split("\n")
-    branches: list[BranchInfo] = []
-    cur: BranchInfo | None = None
-    for ln in lines:
-        stripped = ln.strip()
-        # 跳过函数定义 name() {
-        if re.match(r"^[\w:-]+\s*\(\)\s*\{", stripped):
-            continue
-        m = re.match(r"^([^()]+?)\)\s*(.*)$", stripped)
-        if m:
-            pat = m.group(1).strip().strip("\"'")
-            inline = m.group(2).strip()
-            if pat:
-                # 收割上一个分支
-                if cur is not None:
-                    branches.append(cur)
-                cur = BranchInfo(kind="case", label=pat, body=inline, reachable=False)
-            continue
-        if cur is not None:
-            # 多行分支体累积；;; 结束当前分支
-            if stripped.strip(";") == "" and stripped.strip() == "":
-                pass
-            cur.body += (("\n" + ln) if cur.body else ln)
-            if stripped.endswith(";;"):
-                if cur is not None:
-                    branches.append(cur)
-                    cur = None
-                cur = None
-    if cur is not None and cur.body.strip() and not any(b is cur for b in branches):
-        branches.append(cur)
-    return branches
-
-
-def _split_nested_case_branches(
-    body_lines: list[str],
-    selector_val: str,
-    *,
-    diagnostics: dict | None = None,
-) -> str | None:
-    """嵌套 case 的外层分支切分：选中的分支整体保留，未选中剔除。
-
-    在 body_lines（外层 in 之后、外层 esac 之前的行）上做深度感知扫描：
-    - `pattern)` 行（depth 0）开启一个新外层分支；
-    - depth 0 的 `;;` 结束当前外层分支（内层 case 的 `;;` 因 depth>0 被跳过）；
-    - 匹配 selector_val 的分支被选中，返回其 body（含嵌套原样）。
-    意外返 None = 未命中任何外层分支（fail-closed 回退全文）。
-
-    Args:
-        body_lines: 外层 case 分支体各行
-        selector_val: 外层 selector 已绑定的具体值
-    Returns:
-        选中分支的 body 文本；无法确定时 None。
-    """
-    depth = 0
-    cur_pat: str | None = None
-    cur_body: list[str] = []
-    selected: str | None = None
-    fallback: str | None = None
-
-    def _flush_as_selected(body_text: str, pat: str | None) -> None:
-        nonlocal selected, fallback
-        if pat is None:
-            return
-        pat_values = [v.strip() for v in pat.split("|") if v.strip()]
-        if "*" in pat_values:
-            if fallback is None:
-                fallback = body_text
-        elif selector_val in pat_values:
-            ordered_vals = pat_values
-            if selector_val in ordered_vals:
-                selected = body_text
-
-    for ln in body_lines:
-        stripped = ln.strip()
-        # depth 0 且是 `pattern)` 行 → 新分支
-        if depth == 0:
-            bm = re.match(r"^([^()]+?)\s*\)\s*(.*)$", stripped)
-            if bm:
-                if cur_pat is not None:
-                    _flush_as_selected("\n".join(cur_body), cur_pat)
-                cur_pat = bm.group(1).strip().strip("\"'")
-                cur_body = [bm.group(2).strip()] if bm.group(2).strip() else []
-                continue
-        if re.search(r"\bcase\b", stripped):
-            depth += 1
-        elif re.search(r"\besac\b", stripped):
-            depth = max(0, depth - 1)
-        elif cur_pat is not None:
-            cur_body.append(ln)
-            if depth == 0 and stripped.endswith(";;"):
-                _flush_as_selected("\n".join(cur_body), cur_pat)
-                cur_pat = None
-                cur_body = []
-    if cur_pat is not None and cur_body:
-        _flush_as_selected("\n".join(cur_body), cur_pat)
-
-    if diagnostics is not None and (selected is not None or fallback is not None):
-        diagnostics["p1_case"] = "match" if selected is not None else "default"
-    return selected if selected is not None else fallback
-
-
 def parse_case(
     content: str, args: list[str] | None, *, diagnostics: dict | None = None,
 ) -> str | None:
-    """解析 case 结构，返回可达分支内容（None = 未识别/fail-closed）。
-
-    识别 `case <selector> in ... esac`。selector 由 args 绑定，
-    命中分支 (显式 / *) 保留，未命中剔除。完全未命中 → None（继续走全文本）。
-    """
-    m = re.search(r"\bcase\s+(\$\{?\d+\}?|[A-Za-z_]\w*|\$[A-Za-z_]\w*)\s+in", content)
-    if not m:
+    """用已知的入口参数选择 case 分支；无法确定时交给 LiteSE。"""
+    if not args or not CASE_HEADER_RE.search(content):
         return None
-    selector = m.group(1).strip()
-    val = _find_selector_value(selector, args)
-    if val is None:
-        return None  # selector 无法绑定 → fail-closed
-
-    # 深度配对找本层 esac（嵌套 case 时不能 find 第一个）
-    from .symbolic import _find_case_end
-    content_lines = content.split("\n")
-    end_match = _find_case_end(content_lines, 0)
-    if end_match == -1:
-        return None
-    # body = "in" 之后到本层 esac 之前的行
-    body_lines = content_lines[1:end_match]
-    body = "\n".join(body_lines)
-
-    has_nested = bool(re.search(r"\bcase\s+", body)) or bool(re.search(r"\bif\s+", body))
-
-    if has_nested:
-        # 嵌套：外层仍剪枝（选中的分支整体保留，未选中的剔除），内层候选不细化。
-        # 用深度感知的分支切分：`pattern)` 行 + `;;` 结束，但 `;;` 属于外层分支时才算
-        # 分支结束（内层 case 的 `;;` 不结束外层）。
-        selected = _split_nested_case_branches(body_lines, val, diagnostics=diagnostics)
-        if selected is None:
-            return None
+    lines = content.split("\n")
+    syntax_lines = case_syntax_lines(content)
+    for index, line in enumerate(syntax_lines):
+        if CASE_HEADER_RE.match(line):
+            break
     else:
-        branches = _split_case_body(body)
-        selected = None
-        fallback = ""
-        for b in branches:
-            values = [v.strip() for v in b.label.split("|") if v.strip()]
-            if "*" in values:
-                fallback = b.body
-            elif val in values:
-                selected = b.body
-        if diagnostics is not None and (selected is not None or fallback):
-            diagnostics["p1_case"] = "match" if selected is not None else "default"
-        selected = selected if selected is not None else (fallback or None)
-        if selected is None:
-            return None
+        return None
 
-    prefix = content[: m.start()]
-    suffix = "\n".join(content_lines[end_match + 1:])
-    return f"{prefix}\n{selected}\n{suffix}"
+    case = parse_case_statement(lines, syntax_lines, index)
+    if case is None:
+        return None
+    value = _find_selector_value(case.selector, args)
+    if value is None:
+        return None
+    selection = select_case_branch(case, value)
+    if selection is None:
+        return None
+
+    branch, kind = selection
+    if diagnostics is not None:
+        diagnostics["p1_case"] = kind
+    end = index + case.line.count("\n") + 1
+    return "\n".join([*lines[:index], case.branches[branch][1], *lines[end:]])
 
 
 # ==================== if 分支解析 ====================
@@ -245,20 +295,42 @@ def _eval_if_condition(cond: str, args: list[str] | None) -> bool | None:
 
     支持：
       [ "$1" = "clean" ] / [ "$1" == "clean" ] / [ "$1" != "x" ]
-      [ "$1" = bak* ]（glob 通配符）
-      [[ "$1" =~ ^ba.* ]]（正则）
+      [ "$1" = bak* ]（未加引号 → glob 通配符）
+      [[ "$1" =~ ^ba.* ]]（未加引号 → 正则）
       [ -f /tmp/x ]（文件存在性 → None，运行期）
     条件变量里 $1 替换为 args[0] 后比较；操作符按最长优先匹配，`=~` 不会被 `=` 截断。
+
+    引号语义必须保留：`[ "$1" = "a*b" ]` 是字面量比较，不能当 glob；
+    `[[ "$1" =~ "a.*" ]]` 的 RHS 被引号包住时也是字面量，不能当正则。
+    复杂引号/转义无法可靠求值时返回 None（fail-closed）。
     """
     if not args:
         return None
+    double_bracket = cond.lstrip().startswith("[[")
     inner = re.sub(r"^\[\[?|\]\]?$", "", cond).strip()
-    inner = inner.replace('"', "").replace("'", "")
     m = re.search(r"(.*?)\s*(=~|==|!=|=)\s*(.*)", inner)
     if not m:
         return None  # 非字符串条件（-f 等）无法静态判定
     op = m.group(2)
-    left, right = m.group(1).strip(), m.group(3).strip()
+
+    def _unquote(tok: str) -> tuple[str, bool] | None:
+        tok = tok.strip()
+        if len(tok) >= 2 and tok[0] in "\"'" and tok[-1] == tok[0]:
+            tok = tok[1:-1]
+            quoted = True
+        else:
+            quoted = False
+        # 交错引号/未成对转义会改变 shell 语义；交给 fail-closed。
+        if '"' in tok or "'" in tok or "\\" in tok:
+            return None
+        return tok, quoted
+
+    left_pair = _unquote(m.group(1))
+    right_pair = _unquote(m.group(3))
+    if left_pair is None or right_pair is None:
+        return None
+    left, _ = left_pair
+    right, right_quoted = right_pair
 
     def _resolve(tok: str) -> str | None:
         rm = re.match(r"^\$(\d+)$", tok)
@@ -273,13 +345,20 @@ def _eval_if_condition(cond: str, args: list[str] | None) -> bool | None:
     if lv is None or rv is None:
         return None
     if op == "=~":
+        if not double_bracket:
+            return None  # [ ... =~ ... ] 不是 bash 正则匹配
         if rv.startswith("/") and rv.endswith("/") and len(rv) > 1:
             rv = rv[1:-1]
+        pattern = re.escape(rv) if right_quoted else rv
         try:
-            return bool(re.search(rv, lv))
+            return bool(re.search(pattern, lv))
         except re.error:
             return None
-    if "*" in rv or "?" in rv or "[" in rv:
+    if not right_quoted and ("*" in rv or "?" in rv or "[" in rv):
+        if not double_bracket:
+            # `[ "$1" = bak* ]` 的 * 会先做 pathname expansion，结果依赖工作目录；
+            # 不能按 glob 静态判定，否则可能选错分支造成漏报。
+            return None
         import fnmatch
         matched = fnmatch.fnmatchcase(lv, rv)
     else:
@@ -381,29 +460,150 @@ def _mark_loops_reachable(content: str) -> str:
 
 # ==================== 子脚本调用提取（含参数） ====================
 
-# bash x.sh param → (x.sh, [param])；整体覆盖含 |/引号的后缀参数
+_CHILD_INTERPRETER_RE = re.compile(r"\b(?:bash|sh|zsh|python(?:3(?:\.[0-9]+)?)?|node|ruby|perl|php|lua)\b")
 _CHILD_CALL_RE = re.compile(
-    r"(?:^|\s|&&|\|\|)\s*"
-    r"((?:/bin/)?bash|sh|zsh|(?:python|python3|node|ruby|perl|php|lua))\s+"
-    r"(\S+(?:\.(?:sh|shrc|py|js|rb|pl|php|lua))?)"
-    r"([^\n;|&]*?)$",
-    re.MULTILINE | re.IGNORECASE,
+    r"(?:^[ \t]*(?:\(?[^()\n;&<>]+\)[ \t]*)?|(?<=[;&|])(?<![<>][&|]))[ \t]*"
+    r"(?:(?:if|then|elif|else|while|until|do|!|\{)[ \t]+|\([ \t]*"
+    r"|command(?:[ \t]+-p)?(?:[ \t]+--)?[ \t]+"
+    r"|exec(?:[ \t]+(?:-[cl]+|-a[ \t]+[^ \t\n;&|<>()\x00]+))*(?:[ \t]+--)?[ \t]+"
+    r"|(?:(?:/usr)?/bin/)?time(?:[ \t]+-p)?(?:[ \t]+--)?[ \t]+"
+    r"|(?:(?:/usr)?/bin/)?env(?:[ \t]+(?:-i|--ignore-environment"
+    r"|(?:-u[ \t]*|--unset(?:[ \t]+|=))[^ \t\n;&|<>()\x00]+"
+    r"))*(?:[ \t]+--)?[ \t]+"
+    r"|[A-Za-z_][A-Za-z0-9_]*=[^ \t\n;&|<>()\x00]*[ \t]+)*"
+    r"((?:(?:/usr)?(?:/local)?/bin/)?(?:bash|sh|zsh|python(?:3(?:\.[0-9]+)?)?|node|ruby|perl|php|lua))[ \t]+"
+    r"([^\n;|&<>()\x00]+)",
+    re.MULTILINE,
 )
 
 
-def extract_calls_from_content(content: str) -> list[ScriptCall]:
-    """提取脚本内容里的子脚本调用（含参数）。Python/Node 等解释器子调用也可识别。"""
+def _split_fields(text: str) -> Iterator[str | None]:
+    # shortcut: use default IFS; pathname expansion and custom IFS are runtime-dependent.
+    for index, field in enumerate(_IFS_RE.split(text)):
+        if index % 2:
+            yield None
+        elif field:
+            yield field
+
+
+def _argument_parts(
+    word: str, args: list[str] | None, *, quoted: bool = False,
+    default_text: bool = False, default_depth: int = 0,
+) -> Iterator[str | None | _ExpansionStatus]:
+    """产出单词的字面片段、字段边界或未求值状态。"""
+    field_split = not quoted
+    offset = 0
+    for start, end in _shell_word_parts(word, quoted, default_text=default_text):
+        if start > offset:
+            literal = word[offset:start]
+            yield from _split_fields(literal) if field_split else (literal,)
+        offset = end
+        text = word[start:end]
+        if not quoted and text.startswith("'"):
+            yield text[1:-1]
+        elif text.startswith('"'):
+            if text == '""':
+                yield ""
+            else:
+                yield from _argument_parts(
+                    text[1:-1], args, quoted=True, default_depth=default_depth,
+                )
+        elif text.startswith("\\"):
+            escaped = text[1:]
+            if escaped != "\n":
+                specials = '$"\\`}' if default_text else '$"\\`'
+                yield escaped if not quoted or escaped in specials else text
+        elif _POSITIONAL_RE.match(text) is None:
+            yield text
+        elif args is None:
+            yield _ExpansionStatus.UNRESOLVED
+        else:
+            value, use_default = _positional_value(text, args)
+            if use_default:
+                if default_depth >= _MAX_DEFAULT_DEPTH or _default_has_substitution(value, quoted):
+                    yield _ExpansionStatus.UNRESOLVED
+                    continue
+                yield from _argument_parts(
+                    value, args, quoted=quoted, default_text=True, default_depth=default_depth + 1,
+                )
+                if not value and not field_split:
+                    yield ""
+            elif not field_split and isinstance(value, list):
+                for index, item in enumerate(value):
+                    if index:
+                        yield None
+                    yield item
+            elif not field_split:
+                yield value
+            else:
+                yield from _split_fields(" ".join(value) if isinstance(value, list) else value)
+    if offset < len(word):
+        literal = word[offset:]
+        yield from _split_fields(literal) if field_split else (literal,)
+
+
+def _expand_shell_word(
+    word: str, args: list[str] | None, *, quoted_default: bool = False,
+) -> list[str] | None:
+    fields: list[str] = []
+    pieces: list[str] = []
+    for part in _argument_parts(word, args, quoted=quoted_default, default_text=quoted_default):
+        if part is _ExpansionStatus.UNRESOLVED:
+            return None
+        if part is not None:
+            pieces.append(part)
+        elif pieces:
+            fields.append("".join(pieces))
+            pieces.clear()
+    if pieces:
+        fields.append("".join(pieces))
+    return fields
+
+
+def extract_calls_from_content(content: str, entry_args: list[str] | None = None) -> list[ScriptCall]:
+    """基于原始单词边界提取子脚本参数，展开后的值不再作为 Shell 语法解析。"""
+    if not _CHILD_INTERPRETER_RE.search(content):
+        return []
+    syntax = "\n".join(case_syntax_lines(content))
+    # 默认项可以包含空格或控制字符，整段仍只属于原来的一个单词。
+    if "${" in content:
+        parts: list[str] = []
+        offset = 0
+        for start, end in _shell_word_parts(content, syntax=syntax):
+            token = content[start:end]
+            if "${" not in token or syntax[start] == " ":
+                continue
+            # A quoted substitution may itself contain a braced parameter.
+            if token.startswith('"') and _default_has_substitution(token[1:-1], True):
+                continue
+            parts.append(syntax[offset:start])
+            parts.append("".join("\n" if ch == "\n" else "x" for ch in token))
+            offset = end
+        parts.append(syntax[offset:])
+        syntax = "".join(parts)
     calls: list[ScriptCall] = []
-    for m in _CHILD_CALL_RE.finditer(content):
-        interp, path, rest = m.group(1), m.group(2).strip(), m.group(3).strip()
-        if path.startswith("-") or path.startswith("$") or "/dev/" in path:
-            continue
-        # 参数切分（剥引号，按空白/管道断）
-        rest = re.split(r"[;|&<>]", rest)[0].strip()
-        args = []
-        for tm in re.finditer(r"""(["'])(.*?)\1|(\S+)""", rest):
-            args.append(tm.group(2) if tm.group(1) else tm.group(3))
-        calls.append(ScriptCall(path=path, args=args, interpreter=interp))
+    for match in _CHILD_CALL_RE.finditer(syntax):
+        start, end = match.span(2)
+        words = list(re.finditer(r"[^ \t]+", syntax[start:end]))
+        truncated = (
+            (syntax[end:end + 1] == "\0" and not content.startswith("<<", end))
+            or syntax.startswith("$(", end - 1)  # Unquoted substitution stops the match at '('.
+        )
+        if truncated and words and words[-1].end() == end - start:
+            words.pop()  # The unknown fragment may be part of this word.
+        argv: list[str] = []
+        args_known = not truncated
+        for word in words:
+            fields = _expand_shell_word(content[start + word.start():start + word.end()], entry_args)
+            if fields is None:
+                args_known = False
+                break
+            argv.extend(fields)
+        if argv and argv[0] and not argv[0].startswith(("-", "$")) and "/dev/" not in argv[0]:
+            calls.append(ScriptCall(
+                path=argv[0], args=argv[1:] if args_known else [],
+                interpreter=match[1], args_known=args_known,
+            ))
     return calls
 
 
@@ -424,13 +624,14 @@ class ShellBackend(LanguageBackend):
     ]
 
     def parse(
-        self, content: str, entry_args: list[str] | None, *, diagnostics: dict | None = None,
+        self, content: str, entry_args: list[str] | None, *,
+        diagnostics: dict | None = None, args_known: bool = True,
     ) -> ScriptIR:
         """解析 shell 脚本：P1 → P2/P3/P4 升级 → fail-closed 回退。
 
         逐级责任链：
-          P1 现有 case/if 字面量匹配 → 能选分支就用
-          P2/P3/P4 符号环境执行器 → P1 处理不了时升级（变量拼接/内部变量/glob/数值）
+          P1 基于入口参数匹配 case/if → 能选分支就用
+          P2/P3/P4 符号环境执行器 → P1 处理不了时升级（变量拼接/内部变量/数值）
           都处理不了 → fail-closed 全文本（loop_marked）
 
         漏报防护（NEW-FN）：脚本含 shift / set -- / read / 函数定义 时，
@@ -447,34 +648,33 @@ class ShellBackend(LanguageBackend):
         # 位置参数/变量绑定安全性检测：命中则跳过 P1 的 $1 绑定剪枝。
         # `set --` 后是空格，`--` 末尾不能用 \b（- 非词字符，后无词边界）
         _P1_UNSAFE_RE = re.compile(r"\bshift\b|\bset\s+--(?:\s|$)|[\s;|&]read\b|^\s*read\b|\(\)\s*\{|function\s+\w+")
-        p1_safe = not _P1_UNSAFE_RE.search(content)
+        p1_safe = args_known and not _P1_UNSAFE_RE.search(content)
 
         if p1_safe:
-            # P1: 现有 case/if 字面量裁剪（bind_positional_args + parse_case/parse_if）
             case_out = parse_case(candidate, entry_args, diagnostics=diagnostics)
             if case_out is not None and case_out != candidate:
                 resolved = True
                 candidate = case_out
-            if_out = parse_if(candidate, entry_args, diagnostics=diagnostics)
-            if if_out is not None and if_out != candidate:
-                resolved = True
-                candidate = if_out
-            bound = bind_positional_args(candidate, entry_args or [])
-        else:
-            # $1 语义不可靠 → 不做绑定/裁剪，保持原文（fail-closed，交 symbolic）
-            bound = candidate
+            # case 尚未解析时，不能用 if 剪枝绕过 LiteSE 的 case 判定。
+            if not CASE_HEADER_RE.search(candidate):
+                if_out = parse_if(candidate, entry_args, diagnostics=diagnostics)
+                if if_out is not None and if_out != candidate:
+                    resolved = True
+                    candidate = if_out
 
         # P2/P3/P4 升级：LiteSE 顺序执行器（只在 P1 未能裁剪时尝试，避免双实现）
         if diagnostics is not None:
             diagnostics.update(parser="shell_p1", p1_safe=p1_safe, child_extractor="regex")
-        if not resolved:
+        if not args_known:
+            if diagnostics is not None:
+                diagnostics.update(parser="shell_full", fallback_reason="unknown_args")
+        elif not resolved:
             from .symbolic import symbolic_process
             symbolic_diagnostics = {} if diagnostics is not None else None
             sym_out = symbolic_process(content, entry_args, diagnostics=symbolic_diagnostics)
             if sym_out is not None and sym_out != content:
                 resolved = True
                 candidate = sym_out
-                bound = candidate  # bind 已在 symbolic 内完成
             if diagnostics is not None and symbolic_diagnostics is not None:
                 diagnostics["parser"] = "shell_litese" if resolved else "shell_full"
                 diagnostics["symbolic"] = symbolic_diagnostics
@@ -486,13 +686,13 @@ class ShellBackend(LanguageBackend):
 
         # 剔除不会执行的行（shebang / 整行注释）—— 见函数 docstring：
         # 否则 shebang 里的 /bin/bash 会被当"访问白名单外路径"，整脚本被误拦。
-        bound = strip_non_executable_lines(bound)
+        candidate = strip_non_executable_lines(candidate)
+        bind_args = entry_args if p1_safe else None
+        calls = extract_calls_from_content(candidate, bind_args)
+        bound = bind_positional_args(candidate, bind_args or [])
 
         # 循环体保守标记（保留，不剔除）
         loop_marked = _mark_loops_reachable(bound)
-
-        # 子脚本调用提取
-        calls = extract_calls_from_content(loop_marked)
 
         if resolved:
             ir = ScriptIR(

@@ -130,6 +130,7 @@ def budget_model(monkeypatch, default_config):
     monkeypatch.setenv("AGENT_MOSS_ENABLE_POLICY_GEN", "0")
     monkeypatch.setenv("AGENT_MOSS_SAVE_POLICY", "0")
     monkeypatch.setenv("AGENT_MOSS_LLM_MAX_PROMPT_TOKENS", "500")
+    monkeypatch.setenv("AGENT_MOSS_LLM_PROMPT_SESSION_MIN_CHARS", "2000")
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "hard")
     monkeypatch.setattr(analyzer, "get_default_config", lambda: default_config)
     monkeypatch.setattr(analyzer, "get_default_cache", lambda: PolicyCache(CacheConfig(enabled=False)))
@@ -147,7 +148,7 @@ def test_hard_budget_skip_reaches_python_and_http(monkeypatch, budget_model, fai
     monkeypatch.setenv("AGENT_MOSS_LLM_FAIL_MODE", fail_mode)
     payload = {
         "session_id": "hard-budget",
-        "prompt_session": "检查测试输出",
+        "prompt_session": "检查测试输出。" * 500,
         "a_next": {"action_type": "fixture_tool", "action_detail": "生成摘要"},
         "action_history": [],
         "reason": "测试",
@@ -170,7 +171,7 @@ def test_soft_budget_degradation_survives_model_failure(monkeypatch, budget_mode
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "soft")
     monkeypatch.setenv("AGENT_MOSS_LLM_FAIL_MODE", "fail_closed")
     result = analyzer.analyze(
-        session_id="soft-budget", prompt_session="检查测试输出", action_history=[],
+        session_id="soft-budget", prompt_session="检查测试输出。" * 500, action_history=[],
         a_next={"action_type": "fixture_tool", "action_detail": "生成摘要"}, reason="测试",
     )
 

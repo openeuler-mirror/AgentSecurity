@@ -8,14 +8,23 @@ import pytest
 
 from agent_moss.engine import llm_analyzer
 from agent_moss.engine.types import HeuristicResult, LogicRuleResult
-from agent_moss.infra import metrics, token_stats
-from agent_moss.infra.config import Config, RetryConfig
+from agent_moss.infra import config as moss_config, metrics, token_stats
+from agent_moss.infra.config import Config, RetryConfig, get_llm_max_prompt_tokens
 from agent_moss.infra.llm_client import LLMResponseError, LLMResult
 from agent_moss.infra.prompt_templates import get_security_judge_prompt
 
 
 _DECISION = '{"allowed": true, "reason": "reviewed"}'
 _BUDGET = "AGENT_MOSS_LLM_MAX_PROMPT_TOKENS"
+
+
+@pytest.mark.parametrize(("configured", "effective"), [
+    ("-1", 0), ("0", 0), ("1", 1200), ("500", 1200), ("1199", 1200),
+    ("1200", 1200), ("1201", 1201), ("1299", 1299), ("5000", 5000), ("abc", 0),
+])
+def test_configured_prompt_budget(monkeypatch, configured, effective):
+    monkeypatch.setenv(_BUDGET, configured)
+    assert get_llm_max_prompt_tokens() == effective
 
 
 @pytest.fixture
@@ -70,9 +79,14 @@ def _estimate(prompt):
     return llm_analyzer.LLMAnalyzer._estimate_tokens(prompt)
 
 
+def _set_test_budget(monkeypatch, budget):
+    # Exercise exact rendering thresholds independently of environment defaults.
+    monkeypatch.setattr(moss_config, "get_llm_max_prompt_tokens", lambda: budget)
+
+
 def _set_hard_budget(monkeypatch, estimated_limit):
     budget = (estimated_limit * 115 + 99) // 100 + 1
-    monkeypatch.setenv(_BUDGET, str(budget))
+    _set_test_budget(monkeypatch, budget)
     return int(budget / 1.15)
 
 
@@ -187,7 +201,7 @@ def test_action_history_keeps_detail_when_its_own_marker_costs_more(llm, monkeyp
     expected = llm.prompts[-1].replace(long_detail, llm_analyzer.LLMAnalyzer._truncate_detail(long_detail, 100))
     target = _estimate(expected)
     budget = (target * 115 + 99) // 100
-    monkeypatch.setenv(_BUDGET, str(budget))
+    _set_test_budget(monkeypatch, budget)
 
     result = llm.analyze(action_history=history)
 
@@ -201,7 +215,7 @@ def test_short_action_history_is_kept_when_omission_marker_would_grow_prompt(llm
     action_history = [{"action_type": action} for action in ("A", "B", "C")]
     llm.analyze(action_history=action_history)
     original_prompt = llm.prompts[-1]
-    monkeypatch.setenv(_BUDGET, str(_estimate(original_prompt) - 1))
+    _set_test_budget(monkeypatch, _estimate(original_prompt) - 1)
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "soft")
 
     result = llm.analyze(action_history=action_history)
@@ -211,8 +225,10 @@ def test_short_action_history_is_kept_when_omission_marker_would_grow_prompt(llm
     assert "l3_budget_unreachable" in result.degraded
 
 
-def test_historical_intents_compress_older_rows_before_deleting_them(llm, monkeypatch):
-    history = [{"text": f"历史-{index}:" + "H" * 480} for index in range(6)]
+@pytest.mark.parametrize("window_omitted", [0, 1])
+def test_historical_intents_compress_older_rows_before_deleting_them(llm, monkeypatch, window_omitted):
+    monkeypatch.setenv("AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS", "6")
+    history = [{"text": f"历史-{index}:" + "H" * 480} for index in range(6 + window_omitted)]
     llm.analyze(prompt_history=history)
     limit = _set_hard_budget(monkeypatch, _estimate(llm.prompts[-1]) - 90)
 
@@ -220,10 +236,11 @@ def test_historical_intents_compress_older_rows_before_deleting_them(llm, monkey
 
     prompt = llm.prompts[-1]
     assert _estimate(prompt) <= limit
-    assert "第1轮用户意图: 历史-0:" in prompt
-    assert history[0]["text"] not in prompt
+    assert f"第{window_omitted + 1}轮用户意图: 历史-{window_omitted}:" in prompt
+    assert history[window_omitted]["text"] not in prompt
     assert "本段已按 token 预算截断" in prompt
     assert "不能作为授权依据" in prompt
+    assert prompt.count("因历史窗口上限省略 1 轮更早历史意图") == window_omitted
     assert "因 token 预算已省略" not in prompt
     assert all(turn["text"] in prompt for turn in history[-3:])
 
@@ -233,7 +250,7 @@ def test_intent_above_minimum_is_kept_when_truncation_marker_would_grow_prompt(l
     history = [{"text": "甲" * 101}]
     llm.analyze(prompt_history=history)
     original_prompt = llm.prompts[-1]
-    monkeypatch.setenv(_BUDGET, str(_estimate(original_prompt) - 1))
+    _set_test_budget(monkeypatch, _estimate(original_prompt) - 1)
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "soft")
 
     result = llm.analyze(prompt_history=history)
@@ -301,8 +318,12 @@ def test_removing_action_only_history_is_marked_without_intent_guidance(llm, mon
     assert "不能作为授权依据" not in prompt
 
 
-def test_history_deletion_keeps_original_ordinals_and_ignores_empty_rows(llm, monkeypatch):
-    history = [{"text": "最早意图：" + "A" * 475}, {"text": " \t "}, {"text": "较近意图"}]
+@pytest.mark.parametrize("window_omitted", [0, 1])
+def test_history_deletion_keeps_original_ordinals_and_ignores_empty_rows(llm, monkeypatch, window_omitted):
+    monkeypatch.setenv("AGENT_MOSS_LLM_PROMPT_HISTORY_MAX_TURNS", "3")
+    history = [{"text": "窗口外的意图"}] * window_omitted + [
+        {"text": "最早意图：" + "A" * 475}, {"text": " \t "}, {"text": "较近意图"},
+    ]
     llm.analyze(prompt_history=history)
     limit = _set_hard_budget(monkeypatch, _estimate(llm.prompts[-1]) - 110)
 
@@ -310,8 +331,10 @@ def test_history_deletion_keeps_original_ordinals_and_ignores_empty_rows(llm, mo
 
     prompt = llm.prompts[-1]
     assert _estimate(prompt) <= limit
-    assert "第1轮用户意图" not in prompt and "第2轮用户意图" not in prompt
-    assert "第3轮用户意图: 较近意图" in prompt
+    assert "窗口外的意图" not in prompt and "最早意图" not in prompt
+    assert prompt.count("轮用户意图:") == 1
+    assert f"第{window_omitted + 3}轮用户意图: 较近意图" in prompt
+    assert prompt.count("因历史窗口上限省略 1 轮更早历史意图") == window_omitted
     assert "因 token 预算已省略 1 轮历史意图" in prompt
     assert "不能作为授权依据" in prompt
 
@@ -334,7 +357,7 @@ def test_short_history_kept_if_its_omission_would_cost_more(llm, monkeypatch):
     history = [{"text": "继续"}]
     llm.analyze(prompt_history=history)
     original_prompt = llm.prompts[-1]
-    monkeypatch.setenv(_BUDGET, str(_estimate(original_prompt) - 1))
+    _set_test_budget(monkeypatch, _estimate(original_prompt) - 1)
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "soft")
 
     result = llm.analyze(prompt_history=history)
@@ -351,7 +374,7 @@ def test_soft_keeps_history_if_omission_saves_no_estimated_token(llm, monkeypatc
     request = {"prompt_session": "继续", "prompt_history": history}
     llm.analyze(**request)
     original_prompt = llm.prompts[-1]
-    monkeypatch.setenv(_BUDGET, "500")
+    _set_test_budget(monkeypatch, 500)
     monkeypatch.setenv("AGENT_MOSS_LLM_BUDGET_MODE", "soft")
 
     result = llm.analyze(**request)
@@ -377,7 +400,7 @@ def test_omission_search_continues_after_removing_a_short_history_turn(llm, monk
 
 
 def test_omission_saving_below_one_token_helps_the_next_action_trim(llm, monkeypatch):
-    monkeypatch.setenv(_BUDGET, "1093")  # Effective budget of 950 tokens.
+    _set_test_budget(monkeypatch, 1093)  # Effective budget of 950 tokens.
     # Replacing the history with its omission notice and authorization guidance
     # saves one character. The action trim then reaches the last fitting character.
     detail = "Z" * 250
@@ -453,11 +476,14 @@ def test_current_request_shrinks_only_as_needed_and_keeps_hints(llm, monkeypatch
     assert "应保留的逻辑线索" in prompt and "HINT-RULE" in prompt
 
 
-def test_hard_budget_below_floor_never_invokes_model(llm, monkeypatch):
+@pytest.mark.parametrize("history_turns", [0, 25])
+def test_hard_budget_below_floor_never_invokes_model(llm, monkeypatch, history_turns):
     monkeypatch.setenv(_BUDGET, "500")
+    history = [{"text": "历史意图" * 151} for _ in range(history_turns)]
+    hints = LogicRuleResult(hit=True, reason="风险线索" * 200)
 
     with pytest.raises(llm_analyzer.LLMPromptBudgetExceeded) as raised:
-        llm.analyze(prompt_session="甲" * 4000)
+        llm.analyze(prompt_session="当前意图" * 1000, prompt_history=history, logic_result=hints)
 
     assert raised.value.code == "l3_budget_floor_exceeds"
     assert llm.prompts == []
@@ -468,9 +494,10 @@ def test_hard_budget_below_floor_never_invokes_model(llm, monkeypatch):
 def test_cached_verdict_does_not_bypass_new_positive_budget(llm, monkeypatch):
     assert llm.analyze().allowed is True
     monkeypatch.setenv(_BUDGET, "500")
+    hints = LogicRuleResult(hit=True, reason="风险线索" * 200)
 
     with pytest.raises(llm_analyzer.LLMPromptBudgetExceeded):
-        llm.analyze(prompt_session="改用另一项请求")
+        llm.analyze(prompt_session="改用另一项请求", logic_result=hints)
 
     assert len(llm.prompts) == 1
     llm.events.assert_called_once_with(event="l3_budget_floor_exceeds")
@@ -526,7 +553,7 @@ def test_soft_budget_below_floor_invokes_model_with_degraded_result(llm, monkeyp
     )
 
     [prompt] = llm.prompts
-    assert 500 < _estimate(prompt) < 4000
+    assert 1200 < _estimate(prompt) < 4000
     assert hints.reason in prompt
     assert "当前动作开头" in prompt and "当前动作结尾" in prompt
     assert "历史动作 00" not in prompt and "历史动作 19" in prompt
@@ -542,9 +569,10 @@ def test_soft_budget_below_floor_invokes_model_with_degraded_result(llm, monkeyp
 
 @pytest.mark.parametrize(
     ("budget", "used", "exceeded"),
-    [(2000, 2001, True), (2000, 2000, False), (2000, 1900, False), (0, 2001, False)],
+    [(2000, 2001, True), (2000, 2000, False), (2000, 1900, False), (0, 2001, False),
+     (500, 1200, False), (500, 1201, True)],
 )
-def test_reported_usage_compares_against_configured_budget(llm, monkeypatch, budget, used, exceeded):
+def test_reported_usage_compares_against_effective_budget(llm, monkeypatch, budget, used, exceeded):
     monkeypatch.setenv(_BUDGET, str(budget))
     llm.responses.append(LLMResult(content=_DECISION, prompt_tokens=used, total_tokens=used, model="test"))
 
